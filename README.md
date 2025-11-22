@@ -47,7 +47,7 @@ This first release introduces the core foundation of RxD Editor, including:
 
 # 📦 Installation
 
-Follow the []"Releases"](https://github.com/Digitzaki/RxD_Editor/releases) Tab.
+Follow the ["Releases"](https://github.com/Digitzaki/RxD_Editor/releases) Tab.
 
 Use Git:
 ```
