@@ -49,7 +49,7 @@ class PatternScanner(QThread):
         if not LIBMAGIC_AVAILABLE:
             self.results.append(PatternResult(
                 0, 0, "libmagic",
-                "libmagic not available (install python-magic)"
+                "N/A"
             ))
             return
 
@@ -3476,7 +3476,7 @@ class HexEditorQt(QMainWindow):
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Fill Selection")
-        dialog.setMinimumSize(450, 250)
+        dialog.setMinimumSize(450, 300)
 
         layout = QVBoxLayout()
 
@@ -3486,7 +3486,6 @@ class HexEditorQt(QMainWindow):
         pattern_layout.addWidget(QLabel("Fill pattern (hex values):"))
 
         pattern_input = QLineEdit()
-        pattern_input.setPlaceholderText("e.g., 00 or 31 32 33")
         pattern_input.setFont(QFont("Courier", 10))
         pattern_layout.addWidget(pattern_input)
 
@@ -3505,7 +3504,7 @@ class HexEditorQt(QMainWindow):
         # Random range
         random_group = QWidget()
         random_layout = QHBoxLayout()
-        random_layout.addWidget(QLabel("Range (decimal):"))
+        random_layout.addWidget(QLabel("Random byte range (decimal):"))
 
         range_min = QSpinBox()
         range_min.setMinimum(0)
@@ -3524,6 +3523,29 @@ class HexEditorQt(QMainWindow):
         random_group.setLayout(random_layout)
         random_group.setEnabled(False)
         layout.addWidget(random_group)
+
+        # Column range selection
+        layout.addSpacing(10)
+        col_range_group = QWidget()
+        col_range_layout = QHBoxLayout()
+        col_range_layout.addWidget(QLabel("Column range (hex, inclusive 00-0F):"))
+
+        col_start_input = QLineEdit()
+        col_start_input.setPlaceholderText("00")
+        col_start_input.setMaxLength(2)
+        col_start_input.setFixedWidth(40)
+        col_range_layout.addWidget(col_start_input)
+
+        col_range_layout.addWidget(QLabel("-"))
+
+        col_end_input = QLineEdit()
+        col_end_input.setPlaceholderText("0F")
+        col_end_input.setMaxLength(2)
+        col_end_input.setFixedWidth(40)
+        col_range_layout.addWidget(col_end_input)
+
+        col_range_group.setLayout(col_range_layout)
+        layout.addWidget(col_range_group)
 
         # Enable/disable controls based on random checkbox
         def on_random_toggled(checked):
@@ -3544,7 +3566,7 @@ class HexEditorQt(QMainWindow):
         preset_layout.addWidget(dod_btn)
         preset_layout.addStretch()
         layout.addWidget(QWidget())
-        layout.itemAt(layout.count()-1).widget().setLayout(preset_layout)
+        layout.itemAt(layout.count() - 1).widget().setLayout(preset_layout)
 
         # Preset button actions
         def set_zerobytes():
@@ -3552,7 +3574,7 @@ class HexEditorQt(QMainWindow):
             random_checkbox.setChecked(False)
 
         zerobytes_btn.clicked.connect(set_zerobytes)
-        dod_btn.clicked.connect(set_zerobytes)  # DoD also uses zeros for simplicity
+        dod_btn.clicked.connect(set_zerobytes)  # DoD uses zeros for simplicity
 
         layout.addStretch()
 
@@ -3577,25 +3599,40 @@ class HexEditorQt(QMainWindow):
 
                 self.save_undo_state()
 
+                # Parse column range
+                col_start_text = col_start_input.text().strip()
+                col_end_text = col_end_input.text().strip()
+                try:
+                    col_start = int(col_start_text, 16) if col_start_text else 0
+                    col_end = int(col_end_text, 16) if col_end_text else 15
+                    if not (0 <= col_start <= col_end <= 15):
+                        raise ValueError()
+                except:
+                    QMessageBox.warning(dialog, "Invalid Column Range",
+                                        "Please enter valid hex columns (00-0F).")
+                    return
+
+                import random
+
                 if random_checkbox.isChecked():
-                    # Fill with random bytes
-                    import random
                     min_val = range_min.value()
                     max_val = range_max.value()
                     if min_val > max_val:
                         min_val, max_val = max_val, min_val
 
-                    for i in range(length):
-                        current_file.file_data[start + i] = random.randint(min_val, max_val)
-                        current_file.modified_bytes.add(start + i)
+                    for offset in range(length):
+                        row = (start + offset) // 16
+                        col = (start + offset) % 16
+                        if col_start <= col <= col_end:
+                            current_file.file_data[start + offset] = random.randint(min_val, max_val)
+                            current_file.modified_bytes.add(start + offset)
                 else:
-                    # Fill with pattern
+                    # Parse hex pattern
                     pattern_text = pattern_input.text().strip()
                     if not pattern_text:
                         QMessageBox.warning(dialog, "Invalid Pattern", "Please enter a hex pattern.")
                         return
 
-                    # Parse hex pattern
                     pattern_parts = pattern_text.replace(',', ' ').split()
                     pattern_bytes = []
                     for part in pattern_parts:
@@ -3607,20 +3644,21 @@ class HexEditorQt(QMainWindow):
                                 raise ValueError()
                         except:
                             QMessageBox.warning(dialog, "Invalid Pattern",
-                                              f"Invalid hex value: {part}\nPlease use hex values 00-FF.")
+                                                f"Invalid hex value: {part}\nPlease use hex values 00-FF.")
                             return
 
                     if not pattern_bytes:
                         QMessageBox.warning(dialog, "Invalid Pattern", "Please enter at least one hex byte.")
                         return
 
-                    # Fill selection with pattern (repeat as needed)
-                    for i in range(length):
-                        current_file.file_data[start + i] = pattern_bytes[i % len(pattern_bytes)]
-                        current_file.modified_bytes.add(start + i)
+                    for offset in range(length):
+                        row = (start + offset) // 16
+                        col = (start + offset) % 16
+                        if col_start <= col <= col_end:
+                            current_file.file_data[start + offset] = pattern_bytes[offset % len(pattern_bytes)]
+                            current_file.modified_bytes.add(start + offset)
 
                 current_file.modified = True
-
                 # Update tab title
                 tab_text = os.path.basename(current_file.file_path) + " *"
                 self.tab_widget.setTabText(self.current_tab_index, tab_text)
