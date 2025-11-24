@@ -8,6 +8,309 @@ from PyQt5.QtGui import *
 from PyQt5.QtCore import *
 from editor_themes import THEMES, get_theme_stylesheet, get_theme_colors
 
+try:
+    import magic
+    LIBMAGIC_AVAILABLE = True
+except ImportError:
+    LIBMAGIC_AVAILABLE = False
+
+
+class PatternResult:
+    def __init__(self, offset: int, length: int, category: str, description: str, data: bytes = None, label: str = ""):
+        self.offset = offset
+        self.length = length
+        self.category = category
+        self.description = description
+        self.data = data
+        self.label = label
+
+
+class PatternScanner(QThread):
+    progress_updated = pyqtSignal(int)
+    scan_complete = pyqtSignal(list)
+
+    def __init__(self, file_data: bytearray):
+        super().__init__()
+        self.file_data = file_data
+        self.results = []
+        self.min_string_length = 3
+
+    def run(self):
+        self.results = []
+        self.detect_libmagic_signatures()
+        self.detect_ascii_strings()
+        self.detect_utf16le_strings()
+        self.detect_pointers()
+        self.detect_compression_signatures()
+        self.detect_image_signatures()
+        self.scan_complete.emit(self.results)
+
+    def detect_libmagic_signatures(self):
+        if not LIBMAGIC_AVAILABLE:
+            self.results.append(PatternResult(
+                0, 0, "libmagic",
+                "libmagic not available (install python-magic)"
+            ))
+            return
+
+        try:
+            mime = magic.Magic(mime=True)
+            mime_type = mime.from_buffer(bytes(self.file_data))
+            detailed = magic.Magic()
+            description = detailed.from_buffer(bytes(self.file_data))
+            self.results.append(PatternResult(
+                0, min(len(self.file_data), 512), "libmagic",
+                f"MIME: {mime_type} | {description}"
+            ))
+        except Exception as e:
+            self.results.append(PatternResult(
+                0, 0, "libmagic",
+                f"libmagic error: {str(e)}"
+            ))
+
+    def detect_ascii_strings(self):
+        pattern = rb'[\x20-\x7E]{' + str(self.min_string_length).encode() + rb',}'
+        matches = re.finditer(pattern, bytes(self.file_data))
+        for match in matches:
+            text = match.group().decode('ascii', errors='ignore')
+            if len(text) >= self.min_string_length:
+                self.results.append(PatternResult(
+                    match.start(), len(text),
+                    "ASCII String",
+                    f'"{text[:50]}{"..." if len(text) > 50 else ""}"'
+                ))
+
+    def detect_utf16le_strings(self):
+        offset = 0
+        while offset < len(self.file_data) - 6:
+            try:
+                char_count = 0
+                temp_offset = offset
+                chars = []
+                while temp_offset < len(self.file_data) - 1:
+                    low = self.file_data[temp_offset]
+                    high = self.file_data[temp_offset + 1]
+                    if high == 0 and 0x20 <= low <= 0x7E:
+                        chars.append(chr(low))
+                        char_count += 1
+                        temp_offset += 2
+                    else:
+                        break
+                if char_count >= self.min_string_length:
+                    text = ''.join(chars)
+                    self.results.append(PatternResult(
+                        offset, char_count * 2,
+                        "UTF-16LE String",
+                        f'"{text[:50]}{"..." if len(text) > 50 else ""}"'
+                    ))
+                    offset = temp_offset
+                else:
+                    offset += 2
+            except:
+                offset += 2
+
+    def detect_pointers(self):
+        file_size = len(self.file_data)
+        pointer_clusters = []
+        for offset in range(0, len(self.file_data) - 7, 4):
+            try:
+                ptr32 = struct.unpack('<I', self.file_data[offset:offset+4])[0]
+                if 0 < ptr32 < file_size:
+                    pointer_clusters.append((offset, 4, ptr32, "u32"))
+                if offset + 8 <= len(self.file_data):
+                    ptr64 = struct.unpack('<Q', self.file_data[offset:offset+8])[0]
+                    if 0 < ptr64 < file_size:
+                        pointer_clusters.append((offset, 8, ptr64, "u64"))
+            except:
+                continue
+        clusters = self._cluster_pointers(pointer_clusters)
+        for cluster in clusters:
+            if len(cluster) >= 3:
+                first_offset = cluster[0][0]
+                last_offset = cluster[-1][0]
+                length = last_offset - first_offset + cluster[-1][1]
+                self.results.append(PatternResult(
+                    first_offset, length,
+                    "Pointer Table",
+                    f"{len(cluster)} possible pointers ({cluster[0][3]})"
+                ))
+
+    def _cluster_pointers(self, pointers, max_gap: int = 16):
+        if not pointers:
+            return []
+        sorted_pointers = sorted(pointers, key=lambda x: x[0])
+        clusters = [[sorted_pointers[0]]]
+        for ptr in sorted_pointers[1:]:
+            if ptr[0] - clusters[-1][-1][0] <= max_gap:
+                clusters[-1].append(ptr)
+            else:
+                clusters.append([ptr])
+        return [c for c in clusters if len(c) >= 3]
+
+    def detect_compression_signatures(self):
+        signatures = [
+            (b'\x78\x9C', "zlib (default compression)"),
+            (b'\x78\x01', "zlib (no compression)"),
+            (b'\x78\xDA', "zlib (best compression)"),
+            (b'\x1F\x8B', "gzip"),
+            (b'\x04\x22\x4D\x18', "LZ4"),
+            (b'\x28\xB5\x2F\xFD', "Zstandard"),
+            (b'LZFSE', "LZFSE (Apple)"),
+        ]
+        for sig, desc in signatures:
+            offset = 0
+            while True:
+                pos = self.file_data.find(sig, offset)
+                if pos == -1:
+                    break
+                self.results.append(PatternResult(pos, len(sig), "Compression", desc))
+                offset = pos + 1
+
+    def detect_image_signatures(self):
+        signatures = [
+            (b'\x89PNG\r\n\x1a\n', "PNG Image"),
+            (b'\xFF\xD8\xFF', "JPEG Image"),
+            (b'GIF87a', "GIF Image (87a)"),
+            (b'GIF89a', "GIF Image (89a)"),
+            (b'BM', "Bitmap Image"),
+            (b'DDS ', "DirectDraw Surface (DDS)"),
+            (b'\x00\x00\x01\x00', "ICO Image"),
+            (b'RIFF', "RIFF Container (WebP/WAV)"),
+        ]
+        for sig, desc in signatures:
+            offset = 0
+            while True:
+                pos = self.file_data.find(sig, offset)
+                if pos == -1:
+                    break
+                if sig == b'RIFF' and pos + 12 <= len(self.file_data):
+                    riff_type = self.file_data[pos+8:pos+12]
+                    if riff_type == b'WEBP':
+                        desc = "WebP Image"
+                    elif riff_type == b'WAVE':
+                        desc = "WAV Audio"
+                self.results.append(PatternResult(pos, len(sig), "Image/Media", desc))
+                offset = pos + 1
+
+
+class PatternScanWidget(QWidget):
+    result_clicked = pyqtSignal(int, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.scanner = None
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(5, 5, 5, 5)
+        header_layout = QHBoxLayout()
+        title = QLabel("Pattern Scan")
+        title.setFont(QFont("Arial", 11, QFont.Bold))
+        header_layout.addWidget(title)
+        self.scan_button = QPushButton("Scan")
+        self.scan_button.clicked.connect(self.start_scan)
+        header_layout.addWidget(self.scan_button)
+        header_layout.addStretch()
+        layout.addLayout(header_layout)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Label", "Offset", "Length", "Description"])
+        self.tree.setColumnWidth(0, 150)
+        self.tree.setColumnWidth(1, 80)
+        self.tree.setColumnWidth(2, 60)
+        self.tree.setColumnWidth(3, 250)
+        self.tree.itemClicked.connect(self.on_item_clicked)
+        layout.addWidget(self.tree)
+        self.label_editors = {}  # Track QLineEdit widgets for labels
+        self.status_label = QLabel("No scan performed")
+        self.status_label.setFont(QFont("Arial", 9))
+        layout.addWidget(self.status_label)
+        self.setLayout(layout)
+
+    def start_scan(self):
+        if hasattr(self, 'file_data') and self.file_data:
+            self.scan_button.setEnabled(False)
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 0)
+            self.tree.clear()
+            self.status_label.setText("Scanning...")
+            self.scanner = PatternScanner(self.file_data)
+            self.scanner.scan_complete.connect(self.on_scan_complete)
+            self.scanner.start()
+
+    def on_scan_complete(self, results):
+        self.progress_bar.setVisible(False)
+        self.scan_button.setEnabled(True)
+        self.tree.clear()
+        categories = {}
+        for result in results:
+            if result.category not in categories:
+                categories[result.category] = []
+            categories[result.category].append(result)
+        category_order = ["libmagic", "Compression", "Image/Media", "ASCII String", "UTF-16LE String", "Pointer Table"]
+        for category in category_order:
+            if category in categories:
+                self._add_category(category, categories[category])
+        for category, results_list in categories.items():
+            if category not in category_order:
+                self._add_category(category, results_list)
+        total_results = len(results)
+        self.status_label.setText(f"Scan complete: {total_results} patterns found")
+        self.tree.expandAll()
+
+        # Load saved pattern labels
+        if hasattr(self, 'parent_editor') and self.parent_editor:
+            self.parent_editor.load_pattern_labels_to_widget()
+
+    def _add_category(self, category_name, results):
+        category_item = QTreeWidgetItem(self.tree)
+        category_item.setText(0, category_name)
+        category_item.setText(3, f"({len(results)} items)")
+        for result in results:
+            item = QTreeWidgetItem(category_item)
+
+            # Create editable label widget
+            label_edit = QLineEdit()
+            label_edit.setText(result.label)
+            label_edit.setPlaceholderText("Enter label...")
+            label_edit.setFrame(False)
+            label_edit.setStyleSheet("QLineEdit { background: transparent; }")
+            label_edit.returnPressed.connect(lambda r=result, le=label_edit: self.on_label_changed(r, le))
+            label_edit.editingFinished.connect(lambda r=result, le=label_edit: self.on_label_changed(r, le))
+
+            # Set other columns
+            item.setText(1, f"0x{result.offset:X}")
+            item.setText(2, str(result.length) if result.length > 0 else "—")
+            item.setText(3, result.description)
+            item.setData(0, Qt.UserRole, result)
+
+            # Add the label editor widget to column 0
+            self.tree.setItemWidget(item, 0, label_edit)
+            self.label_editors[result.offset] = label_edit
+
+    def on_label_changed(self, result, line_edit):
+        new_label = line_edit.text().strip()
+        result.label = new_label
+        self.save_labels_to_notebook()
+
+    def on_item_clicked(self, item, column):
+        result = item.data(0, Qt.UserRole)
+        if isinstance(result, PatternResult):
+            self.result_clicked.emit(result.offset, result.length)
+
+    def save_labels_to_notebook(self):
+        if hasattr(self, 'parent_editor') and self.parent_editor:
+            self.parent_editor.update_notebook_with_labels()
+
+    def set_file_data(self, file_data: bytearray):
+        self.file_data = file_data
+        self.tree.clear()
+        self.status_label.setText("Ready to scan")
+        self.scan_button.setEnabled(True)
+
 
 class FileTab:
     def __init__(self, file_path, file_data):
@@ -22,6 +325,7 @@ class FileTab:
         self.pattern_highlights = []  # Pattern-based highlights that auto-search: [{pattern, color, message, underline}]
         self.snapshots = []  # Version control snapshots for this file
         self.last_snapshot_data = None  # Last snapshot data to detect changes
+        self.pattern_labels = {}  # Pattern scan labels: {offset: label}
 
 
 class NotesWindow(QWidget):
@@ -112,7 +416,7 @@ class NotesWindow(QWidget):
         # Track current format for new text
         self.current_char_format = QTextCharFormat()
 
-    def apply_theme(self):
+    def apply_theme(self, dark=bool):
         # Apply theme from hex editor
         if self.hex_editor:
             self.setStyleSheet(get_theme_stylesheet(self.hex_editor.current_theme))
@@ -376,10 +680,13 @@ class NotesWindow(QWidget):
 
     def save_notes(self):
         file_path, selected_filter = QFileDialog.getSaveFileName(
-            self, "Save Notes", "", "Rich Text Format (*.rtf);;Text Files (*.txt);;All Files (*)"
+            self, "Save Notes", "", "Text Files (*.txt);;Rich Text Format (*.rtf);;All Files (*)"
         )
         if file_path:
             try:
+                # Update notebook with current labels before saving
+                self.hex_editor.update_notebook_with_labels()
+
                 # Save as RTF if .rtf extension or RTF filter selected
                 if file_path.endswith('.rtf') or 'rtf' in selected_filter.lower():
                     # Use QTextDocumentWriter for RTF
@@ -389,16 +696,16 @@ class NotesWindow(QWidget):
                     else:
                         QMessageBox.critical(self, "Error", "Failed to write RTF file")
                 else:
-                    # Save as plain text
+                    # Save as plain text (includes {label, offset} commands)
                     with open(file_path, 'w') as f:
                         f.write(self.text_edit.toPlainText())
-                    QMessageBox.information(self, "Success", "Notes saved successfully!")
+                    QMessageBox.information(self, "Success", "Notes and labels saved successfully!")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to save notes: {str(e)}")
 
     def open_notes(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open Notes", "", "Rich Text Format (*.rtf);;Text Files (*.txt);;All Files (*)"
+            self, "Open Notes", "", "Text Files (*.txt);;Rich Text Format (*.rtf);;All Files (*)"
         )
         if file_path:
             try:
@@ -436,6 +743,10 @@ class NotesWindow(QWidget):
                     # Load as plain text
                     with open(file_path, 'r') as f:
                         self.text_edit.setPlainText(f.read())
+
+                # Parse labels from loaded notebook
+                self.hex_editor.parse_labels_from_notebook()
+                QMessageBox.information(self, "Success", "Notes and labels loaded successfully!")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to open notes: {str(e)}")
 
@@ -658,14 +969,14 @@ class HexEditorQt(QMainWindow):
         # Sync scrolling
         self.hex_display.verticalScrollBar().valueChanged.connect(self.on_hex_scroll)
 
-        # Right side: Data Inspector with scrollbar
+        # Right side: Tabbed panels with scrollbar
         self.inspector_widget = QWidget()
         self.inspector_widget.setMinimumWidth(320)
         self.inspector_widget.setMaximumWidth(450)
         self.inspector_widget.setObjectName("inspector_widget")
         self.inspector_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
-        # Main horizontal layout: scrollbar on left, inspector content on right
+        # Main horizontal layout: scrollbar on left, tabbed content on right
         inspector_main_layout = QHBoxLayout()
         inspector_main_layout.setContentsMargins(0, 0, 0, 0)
         inspector_main_layout.setSpacing(0)
@@ -676,12 +987,16 @@ class HexEditorQt(QMainWindow):
         self.hex_nav_scrollbar.setMaximumWidth(16)
         inspector_main_layout.addWidget(self.hex_nav_scrollbar)
 
-        # Inspector content container
-        inspector_content_widget = QWidget()
+        # Create tab widget for different panels
+        self.right_panel_tabs = QTabWidget()
+        self.right_panel_tabs.setTabPosition(QTabWidget.North)
+
+        # Data Inspector Tab (original inspector)
+        data_inspector_widget = QWidget()
         inspector_layout = QVBoxLayout()
         inspector_layout.setContentsMargins(5, 0, 5, 0)
 
-        # Inspector title
+        # Inspector title with navigation buttons
         inspector_title_widget = QWidget()
         inspector_title_layout = QHBoxLayout()
         inspector_title_layout.setContentsMargins(10, 5, 10, 5)
@@ -723,7 +1038,7 @@ class HexEditorQt(QMainWindow):
         inspector_title_widget.setLayout(inspector_title_layout)
         inspector_layout.addWidget(inspector_title_widget)
 
-        # Inspector content scroll area (hide its scrollbar)
+        # Inspector content scroll area
         self.inspector_scroll = QScrollArea()
         self.inspector_scroll.setWidgetResizable(True)
         self.inspector_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -764,9 +1079,16 @@ class HexEditorQt(QMainWindow):
         self.hex_basis_check.stateChanged.connect(self.toggle_hex_basis)
         inspector_layout.addWidget(self.hex_basis_check)
 
-        # Set the layout to the content widget and add it to main layout
-        inspector_content_widget.setLayout(inspector_layout)
-        inspector_main_layout.addWidget(inspector_content_widget)
+        data_inspector_widget.setLayout(inspector_layout)
+        self.right_panel_tabs.addTab(data_inspector_widget, "Inspector")
+
+        # Pattern Scan Tab
+        self.pattern_scan_widget = PatternScanWidget()
+        self.pattern_scan_widget.parent_editor = self
+        self.pattern_scan_widget.result_clicked.connect(self.on_pattern_result_clicked)
+        self.right_panel_tabs.addTab(self.pattern_scan_widget, "Pattern Scan")
+
+        inspector_main_layout.addWidget(self.right_panel_tabs)
 
         self.inspector_widget.setLayout(inspector_main_layout)
         content_splitter.addWidget(self.inspector_widget)
@@ -1108,6 +1430,8 @@ class HexEditorQt(QMainWindow):
                 self.rendered_start_byte = 0
                 self.rendered_end_byte = 0
 
+                self.pattern_scan_widget.set_file_data(file_tab.file_data)
+
                 self.display_hex()
 
             except Exception as e:
@@ -1167,9 +1491,40 @@ class HexEditorQt(QMainWindow):
             # Reset rendered range for new tab
             self.rendered_start_byte = 0
             self.rendered_end_byte = 0
+            current_file = self.open_files[index]
+            self.pattern_scan_widget.set_file_data(current_file.file_data)
             self.display_hex()
         else:
             self.clear_display()
+
+    def shift_pattern_labels(self, current_file, start_pos, shift_amount):
+        """Shift pattern labels after a position by shift_amount (positive for insert, negative for cut)"""
+        old_labels = dict(current_file.pattern_labels)
+        current_file.pattern_labels.clear()
+
+        for offset, label in old_labels.items():
+            if shift_amount < 0:  # Cut operation
+                end_pos = start_pos + abs(shift_amount) - 1
+                if offset < start_pos:
+                    # Before cut range - keep same position
+                    current_file.pattern_labels[offset] = label
+                elif offset > end_pos:
+                    # After cut range - shift backward
+                    new_offset = offset + shift_amount
+                    if new_offset >= 0:
+                        current_file.pattern_labels[new_offset] = label
+                # Labels within cut range are removed
+            else:  # Insert operation
+                if offset < start_pos:
+                    # Before insert position - keep same position
+                    current_file.pattern_labels[offset] = label
+                else:
+                    # At or after insert position - shift forward
+                    current_file.pattern_labels[offset + shift_amount] = label
+
+        # Update notebook with shifted labels
+        if self.notes_window:
+            self.update_notebook_with_labels()
 
     def shift_non_pattern_highlights(self, current_file, start_pos, shift_amount):
         """Shift non-pattern highlights after a position by shift_amount (positive for insert, negative for cut)"""
@@ -2555,6 +2910,109 @@ class HexEditorQt(QMainWindow):
 
         self.status_label.setText(status)
 
+    def on_pattern_result_clicked(self, offset, length):
+        if self.current_tab_index < 0:
+            return
+        current_file = self.open_files[self.current_tab_index]
+        if 0 <= offset < len(current_file.file_data):
+            self.cursor_position = offset
+            self.cursor_nibble = 0
+            if length > 0:
+                end_offset = min(offset + length - 1, len(current_file.file_data) - 1)
+                self.selection_start = offset
+                self.selection_end = end_offset
+            else:
+                self.selection_start = offset
+                self.selection_end = offset
+            self.display_hex()
+            self.scroll_to_offset(offset, center=True)
+
+    def save_pattern_labels_to_current_file(self):
+        if self.current_tab_index < 0:
+            return
+        current_file = self.open_files[self.current_tab_index]
+        current_file.pattern_labels.clear()
+
+        # Extract labels from pattern scan widget tree
+        root = self.pattern_scan_widget.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            category_item = root.child(i)
+            for j in range(category_item.childCount()):
+                item = category_item.child(j)
+                result = item.data(0, Qt.UserRole)
+                if isinstance(result, PatternResult) and result.label:
+                    current_file.pattern_labels[result.offset] = result.label
+
+    def load_pattern_labels_to_widget(self):
+        if self.current_tab_index < 0:
+            return
+        current_file = self.open_files[self.current_tab_index]
+
+        # Apply saved labels to pattern scan results
+        root = self.pattern_scan_widget.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            category_item = root.child(i)
+            for j in range(category_item.childCount()):
+                item = category_item.child(j)
+                result = item.data(0, Qt.UserRole)
+                if isinstance(result, PatternResult):
+                    if result.offset in current_file.pattern_labels:
+                        result.label = current_file.pattern_labels[result.offset]
+                        # Update the label editor widget
+                        if result.offset in self.pattern_scan_widget.label_editors:
+                            self.pattern_scan_widget.label_editors[result.offset].setText(result.label)
+
+    def update_notebook_with_labels(self):
+        if self.current_tab_index < 0 or not self.notes_window:
+            return
+
+        # Get all labels from pattern scan widget
+        labels_data = []
+        root = self.pattern_scan_widget.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            category_item = root.child(i)
+            for j in range(category_item.childCount()):
+                item = category_item.child(j)
+                result = item.data(0, Qt.UserRole)
+                if isinstance(result, PatternResult) and result.label:
+                    labels_data.append((result.label, result.offset))
+
+        # Get current notebook text
+        current_text = self.notes_window.text_edit.toPlainText()
+
+        # Remove existing label commands
+        import re
+        lines = current_text.split('\n')
+        filtered_lines = [line for line in lines if not re.match(r'^\{.+,\s*0x[0-9A-Fa-f]+\}$', line.strip())]
+
+        # Add new label commands at the end
+        new_lines = filtered_lines.copy()
+        for label, offset in labels_data:
+            new_lines.append(f"{{{label}, 0x{offset:X}}}")
+
+        # Update notebook
+        self.notes_window.text_edit.setPlainText('\n'.join(new_lines))
+
+    def parse_labels_from_notebook(self):
+        if self.current_tab_index < 0 or not self.notes_window:
+            return
+
+        current_file = self.open_files[self.current_tab_index]
+        current_file.pattern_labels.clear()
+
+        # Parse {label, offset} from notebook
+        import re
+        text = self.notes_window.text_edit.toPlainText()
+        pattern = r'\{(.+?),\s*0x([0-9A-Fa-f]+)\}'
+
+        for match in re.finditer(pattern, text):
+            label = match.group(1).strip()
+            offset = int(match.group(2), 16)
+            current_file.pattern_labels[offset] = label
+
+        # Update pattern scan widget
+        self.load_pattern_labels_to_widget()
+
     def first_byte(self):
         """Jump to the first byte of the file"""
         if self.cursor_position is not None and self.current_tab_index >= 0:
@@ -2869,6 +3327,9 @@ class HexEditorQt(QMainWindow):
             # Shift non-pattern highlights
             self.shift_non_pattern_highlights(current_file, start, -num_bytes)
 
+            # Shift pattern labels
+            self.shift_pattern_labels(current_file, start, -num_bytes)
+
             del current_file.file_data[start:end + 1]
             current_file.modified = True
 
@@ -2920,6 +3381,9 @@ class HexEditorQt(QMainWindow):
 
             # Shift non-pattern highlights
             self.shift_non_pattern_highlights(current_file, self.cursor_position, -1)
+
+            # Shift pattern labels
+            self.shift_pattern_labels(current_file, self.cursor_position, -1)
 
             del current_file.file_data[self.cursor_position]
             current_file.modified = True
@@ -2988,6 +3452,9 @@ class HexEditorQt(QMainWindow):
 
         # Shift non-pattern highlights
         self.shift_non_pattern_highlights(current_file, self.cursor_position, insert_count)
+
+        # Shift pattern labels
+        self.shift_pattern_labels(current_file, self.cursor_position, insert_count)
 
         # Insert bytes
         for i, byte in enumerate(self.clipboard):
@@ -5154,12 +5621,16 @@ class HexEditorQt(QMainWindow):
                         if current_file.file_path == file1_edit.text():
                             current_file.file_data = bytearray(file1_current_data)
                             current_file.modified = True
-                            # Mark the edited byte as modified (red) if it's not an inserted byte
+                            # Mark the edited byte as replaced (red) if it differs from original
                             if edited_position not in current_file.inserted_bytes:
                                 if edited_position < len(current_file.original_data):
                                     if new_value != current_file.original_data[edited_position]:
-                                        current_file.modified_bytes.add(edited_position)
+                                        # Byte was changed from original - mark as replaced (red)
+                                        current_file.replaced_bytes.add(edited_position)
+                                        current_file.modified_bytes.discard(edited_position)
                                     else:
+                                        # Byte matches original - remove all markings
+                                        current_file.replaced_bytes.discard(edited_position)
                                         current_file.modified_bytes.discard(edited_position)
                             self.display_hex()
 
@@ -5337,6 +5808,8 @@ class HexEditorQt(QMainWindow):
         if self.notes_window is None:
             self.notes_window = NotesWindow(self, self)
             self.notes_window.show()
+            # Parse any existing labels from notebook
+            self.parse_labels_from_notebook()
         else:
             if self.notes_window.isVisible():
                 self.notes_window.hide()
@@ -5344,6 +5817,8 @@ class HexEditorQt(QMainWindow):
                 self.notes_window.show()
                 # Update theme when showing
                 self.notes_window.apply_theme(self.is_dark_theme())
+                # Parse labels from notebook
+                self.parse_labels_from_notebook()
 
     def show_theme_selector(self):
         """Show theme selection dialog"""
