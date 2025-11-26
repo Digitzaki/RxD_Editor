@@ -358,19 +358,19 @@ class NotesWindow(QWidget):
         toolbar_layout.addWidget(self.font_size_spin)
 
         self.bold_check = QCheckBox("B")
-        self.bold_check.setFont(QFont("Arial", 10, QFont.Bold))
+        self.bold_check.setFont(QFont("Arial", 9, QFont.Bold))
         self.bold_check.stateChanged.connect(self.apply_text_style)
         toolbar_layout.addWidget(self.bold_check)
 
         self.italic_check = QCheckBox("I")
-        font = QFont("Arial", 10)
+        font = QFont("Arial", 9)
         font.setItalic(True)
         self.italic_check.setFont(font)
         self.italic_check.stateChanged.connect(self.apply_text_style)
         toolbar_layout.addWidget(self.italic_check)
 
         self.underline_check = QCheckBox("U")
-        font = QFont("Arial", 10)
+        font = QFont("Arial", 9)
         font.setUnderline(True)
         self.underline_check.setFont(font)
         self.underline_check.stateChanged.connect(self.apply_text_style)
@@ -842,7 +842,7 @@ class HexEditorQt(QMainWindow):
 
         # Set default size but allow resizing (10% thinner than before)
         self.resize(1474, 840)
-        self.setMinimumSize(1340, 800)  # Minimum usable size
+        self.setMinimumSize(400, 200)  # Minimum usable size
 
         # Enable drag and drop
         self.setAcceptDrops(True)
@@ -892,8 +892,8 @@ class HexEditorQt(QMainWindow):
 
         # Hex column header (00 01 02 ... 0F)
         self.hex_header = QLabel("  00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F")
-        self.hex_header.setFont(QFont("Courier", 10))
-        self.hex_header.setMinimumWidth(485)
+        self.hex_header.setFont(QFont("Courier", 9))
+        self.hex_header.setMinimumWidth(50)
         self.hex_header.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.hex_header.setStyleSheet("border-right: 1px solid #555; border-bottom: none; padding: 4px 0px 4px 4px; margin: 0px;")
         self.hex_header.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -902,7 +902,7 @@ class HexEditorQt(QMainWindow):
 
         # ASCII header
         self.ascii_header = QLabel("Decoded Text")
-        self.ascii_header.setFont(QFont("Courier", 10))
+        self.ascii_header.setFont(QFont("Courier", 9))
         self.ascii_header.setMinimumWidth(256)
         self.ascii_header.setAlignment(Qt.AlignLeft)
         self.ascii_header.setStyleSheet("border-right: 1px solid #555; border-bottom: none; padding: 4px 0px 4px 4px; margin: 0px;")
@@ -933,13 +933,13 @@ class HexEditorQt(QMainWindow):
         self.hex_display = HexTextEdit()
         self.hex_display.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.hex_display.setLineWrapMode(QTextEdit.NoWrap)
-        self.hex_display.setMinimumWidth(485)
+        self.hex_display.setMinimumWidth(50)
         self.hex_display.clicked.connect(self.on_hex_click)
         self.hex_display.rightClicked.connect(self.on_hex_right_click)
         self.hex_display.hovered.connect(self.on_hex_hover)
         self.hex_display.setFocusPolicy(Qt.StrongFocus)
         self.hex_display.setStyleSheet("border-right: 1px solid #555; padding: 2px 0px 2px 4px;")
-        self.hex_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.hex_display.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self.hex_display.setTextInteractionFlags(Qt.NoTextInteraction)  # Disable native text selection
         self.hex_display.verticalScrollBar().valueChanged.connect(self.on_scroll)
         hex_layout.addWidget(self.hex_display)
@@ -948,7 +948,6 @@ class HexEditorQt(QMainWindow):
         self.ascii_display = HexTextEdit()
         self.ascii_display.hovered.connect(self.on_ascii_hover)
         self.ascii_display.setMinimumWidth(250)
-        self.ascii_display.setMaximumWidth(400)
         self.ascii_display.setLineWrapMode(QTextEdit.NoWrap)
         self.ascii_display.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.ascii_display.clicked.connect(self.on_ascii_click)
@@ -963,7 +962,6 @@ class HexEditorQt(QMainWindow):
         hex_main_layout.addWidget(self.hex_ascii_container)
         hex_widget.setLayout(hex_main_layout)
         # Allow hex widget to stretch with window
-        hex_widget.setMinimumWidth(600)
         content_splitter.addWidget(hex_widget)
 
         # Sync scrolling
@@ -971,15 +969,15 @@ class HexEditorQt(QMainWindow):
 
         # Right side: Tabbed panels with scrollbar
         self.inspector_widget = QWidget()
-        self.inspector_widget.setMinimumWidth(320)
-        self.inspector_widget.setMaximumWidth(450)
+        self.inspector_widget.setMinimumWidth(5)
+        self.inspector_widget.setMaximumWidth(600)
         self.inspector_widget.setObjectName("inspector_widget")
         self.inspector_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
         # Main horizontal layout: scrollbar on left, tabbed content on right
         inspector_main_layout = QHBoxLayout()
         inspector_main_layout.setContentsMargins(0, 0, 0, 0)
-        inspector_main_layout.setSpacing(0)
+        inspector_main_layout.setSpacing(1)
 
         # Add vertical scrollbar for hex view navigation
         self.hex_nav_scrollbar = QScrollBar(Qt.Vertical)
@@ -994,7 +992,7 @@ class HexEditorQt(QMainWindow):
         # Data Inspector Tab (original inspector)
         data_inspector_widget = QWidget()
         inspector_layout = QVBoxLayout()
-        inspector_layout.setContentsMargins(5, 0, 5, 0)
+        inspector_layout.setContentsMargins(2, 0, 2, 0)
 
         # Inspector title with navigation buttons
         inspector_title_widget = QWidget()
@@ -3948,7 +3946,7 @@ class HexEditorQt(QMainWindow):
         type_layout = QHBoxLayout()
         type_layout.addWidget(QLabel("Search type:"))
         self.search_type_btn = QPushButton("Hex")
-        self.search_type_btn.setFont(QFont("Arial", 10, QFont.Bold))
+        self.search_type_btn.setFont(QFont("Arial", 9, QFont.Bold))
         self.search_type_btn.setCheckable(True)
         self.search_type_btn.setChecked(True)
         self.search_type_btn.setMaximumWidth(100)
@@ -4009,7 +4007,7 @@ class HexEditorQt(QMainWindow):
 
             overlay_layout = QVBoxLayout()
             overlay_layout.setContentsMargins(10, 5, 10, 5)
-            overlay_layout.setSpacing(2)
+            overlay_layout.setSpacing(0)
 
             # Title row with close button
             title_row = QHBoxLayout()
@@ -4240,7 +4238,7 @@ class HexEditorQt(QMainWindow):
         type_layout = QHBoxLayout()
         type_layout.addWidget(QLabel("Search type:"))
         self.replace_type_btn = QPushButton("Hex")
-        self.replace_type_btn.setFont(QFont("Arial", 10, QFont.Bold))
+        self.replace_type_btn.setFont(QFont("Arial", 9, QFont.Bold))
         self.replace_type_btn.setCheckable(True)
         self.replace_type_btn.setChecked(True)
         self.replace_type_btn.setMaximumWidth(100)
@@ -4658,7 +4656,7 @@ class HexEditorQt(QMainWindow):
         result_layout = QVBoxLayout()
 
         little_label = QLabel("Little Endian:")
-        little_label.setFont(QFont("Arial", 10, QFont.Bold))
+        little_label.setFont(QFont("Arial", 9, QFont.Bold))
         result_layout.addWidget(little_label)
         little_edit = QLineEdit()
         little_edit.setFont(QFont("Courier", 10))
@@ -4667,7 +4665,7 @@ class HexEditorQt(QMainWindow):
         result_layout.addWidget(little_edit)
 
         big_label = QLabel("Big Endian:")
-        big_label.setFont(QFont("Arial", 10, QFont.Bold))
+        big_label.setFont(QFont("Arial", 9, QFont.Bold))
         result_layout.addWidget(big_label)
         big_edit = QLineEdit()
         big_edit.setFont(QFont("Courier", 10))
@@ -4866,7 +4864,7 @@ class HexEditorQt(QMainWindow):
         hex_layout = QVBoxLayout()
 
         values_title = QLabel("Hex Values:")
-        values_title.setFont(QFont("Arial", 10, QFont.Bold))
+        values_title.setFont(QFont("Arial", 9, QFont.Bold))
         values_title.setStyleSheet("color: #000000;")
         hex_layout.addWidget(values_title)
 
@@ -4935,7 +4933,7 @@ class HexEditorQt(QMainWindow):
         # R slider
         r_layout = QHBoxLayout()
         r_label = QLabel("R")
-        r_label.setFont(QFont("Arial", 10, QFont.Bold))
+        r_label.setFont(QFont("Arial", 9, QFont.Bold))
         r_label.setStyleSheet("color: #e74c3c;")
         r_layout.addWidget(r_label)
         r_slider = QSlider(Qt.Horizontal)
@@ -4950,7 +4948,7 @@ class HexEditorQt(QMainWindow):
         # G slider
         g_layout = QHBoxLayout()
         g_label = QLabel("G")
-        g_label.setFont(QFont("Arial", 10, QFont.Bold))
+        g_label.setFont(QFont("Arial", 9, QFont.Bold))
         g_label.setStyleSheet("color: #27ae60;")
         g_layout.addWidget(g_label)
         g_slider = QSlider(Qt.Horizontal)
@@ -4965,7 +4963,7 @@ class HexEditorQt(QMainWindow):
         # B slider
         b_layout = QHBoxLayout()
         b_label = QLabel("B")
-        b_label.setFont(QFont("Arial", 10, QFont.Bold))
+        b_label.setFont(QFont("Arial", 9, QFont.Bold))
         b_label.setStyleSheet("color: #3498db;")
         b_layout.addWidget(b_label)
         b_slider = QSlider(Qt.Horizontal)
@@ -5937,7 +5935,7 @@ class HexEditorQt(QMainWindow):
 
         # Tagline
         tagline_label = QLabel("Byte Editing, Visualized")
-        tagline_font = QFont("Arial", 10)
+        tagline_font = QFont("Arial", 9)
         tagline_label.setFont(tagline_font)
         tagline_label.setAlignment(Qt.AlignCenter)
         if self.is_dark_theme():
@@ -5955,7 +5953,7 @@ class HexEditorQt(QMainWindow):
         dev_layout.setSpacing(5)
 
         dev_label = QLabel("Main Developer: Akira Ryuzaki")
-        dev_font = QFont("Arial", 10)
+        dev_font = QFont("Arial", 9)
         dev_label.setFont(dev_font)
         dev_label.setAlignment(Qt.AlignCenter)
         dev_layout.addWidget(dev_label)
