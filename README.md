@@ -1,63 +1,141 @@
-# RxD Editor
+# RxD Hex Editor
 
-A modern, visual-focused editor designed for clear, efficient modification and editing. RxD Editor delivers all the essential features of a traditional editor while introducing enhanced visuals, highlighting, notes, integrated version control, and workflow-improving tools.
+A professional hex editor with advanced features for binary file analysis and editing.
 
-# ✨ Features
-Core Editing
+## Interface Overview
 
-- Byte highlighting
+### Menu Bar
 
-- File management
+**File Menu**
+- Open, Close, Close All - Manage files in tabs
+- Save, Save All - Save modifications
+- Exit
 
-- Multi-value Data Inspector
+**Edit Menu**
+- Undo/Redo - Full undo/redo support
+- Copy, Cut, Paste Write, Paste Insert - Advanced clipboard operations
+- Fill Selection - Fill selected bytes with a pattern
 
-- Multi-file editing
+**View Menu**
+- Search, Replace, Go to - Navigation and search tools
+- Hide Delimiters - Configure bytes to hide with padding
+- Segments - Configure visual byte grouping separators
 
-Visual Enhancements
+**Tools Menu**
+- Highlight - Create custom byte pattern highlights
+- Show Notes - Open persistent notes panel
+- Calculator - Built-in programmer's calculator
+- Color Picker - RGB/Hex color picker tool
+- Compare Data - Compare bytes between files or regions
 
-- Improved highlight systems
+**Options Menu**
+- Version Control - Manage file snapshots and restore points
+- Themes - Select from built-in themes or create custom ones
+- Save/Load JSON - Export/import highlights and annotations
+- Clear - Remove all highlights and annotations
 
-- Clean, modern UI
+### Main Display
 
-- Adjustable themes (16!)
+**Three-Column Layout:**
+- **Offset Column** (left) - Byte positions (click header to cycle: hex/decimal/octal)
+- **Hex Column** (center) - Hexadecimal byte values with editing support
+- **Decoded Text** (right) - ASCII representation with extended character support
 
-Productivity Tools
+**Features:**
+- Click any byte to position cursor
+- Type hex digits to edit bytes directly
+- Right-click for context menu
+- Multi-file tabs for working with multiple files
+- Column selection mode for rectangular selections
 
-- Integrated version control system
+### Right Panel Tabs
 
-- Built-in notes for quick references
+**Inspector Tab**
+- View selected bytes as different data types
+- Signed/unsigned integers (8, 16, 32, 64-bit)
+- Floating point (float, double)
+- Text encodings (ASCII, UTF-8, UTF-16)
+- Binary representation
+- Toggle byte order (little/big endian)
+- Choose integral display basis (hex/dec/oct)
+- Navigation buttons (first, prev, next, last byte)
 
-- Various Quality of Life improvements!
+**Pattern Scan Tab**
+- Automatic pattern detection in files
+- Identifies ASCII strings, UTF-16LE strings
+- Detects pointer tables and possible file offsets
+- Finds compression signatures (zlib, gzip, LZ4, etc.)
+- Discovers image format headers
+- Uses libmagic for MIME type detection
+- Click results to jump to location
 
-# 🚀 Initial Release
+**Pointers Tab**
+- Manage custom data signatures and pointers
+- Define data structures with types and labels
+- Visual overlays show pointer target values
+- Organize with categories
+- Save/load pointer definitions
 
-This first release introduces the core foundation of RxD Editor, including:
+**Statistics Tab**
+- Real-time file statistics
+- Byte frequency analysis
+- Byte distribution histogram
+- Entropy calculation
+- Magic number detection
+- Visual charts (requires matplotlib)
 
-- Stable editing environment
+### Status Bar
 
-- Visual enhancements
+Shows current file state:
+- Cursor position and selected byte range
+- File size and modification status
+- Ready state indicator
 
-- Notes system
+## Key Features
 
-- Version control integration
+**Multi-Tab Editing** - Work with multiple files simultaneously
 
-- Basic configuration options
+**Version Control** - Create snapshots and restore to previous states
 
-- More features and improvements are planned for future updates.
+**Custom Themes** - 25+ built-in themes (dark, light, gradient) plus custom theme editor
 
-# 📦 Installation
+**Advanced Selection** - Standard and column selection modes for precise byte operations
 
-Follow the ["Releases"](https://github.com/Digitzaki/RxD_Editor/releases) Tab.
+**Pattern Highlighting** - Define and colorize byte patterns with labels and categories
 
-Use Git:
-```
-git clone https://github.com/yourusername/RxDEditor.git
-cd RxDEditor
-```
+**Notes System** - Persistent notes that save with your workflow
 
-Or download the raw code and run RxD_Editor.py!
+**Delimiter Hiding** - Hide repeated delimiters (like null bytes) with padding indicators
 
-# 🛠 Development
+**Segment Separators** - Visual grouping of bytes (1, 2, 4, or 8 byte segments)
 
-Contributions, feature requests, and issue reports are welcome.
-Feel free to open a pull request or start a discussion.
+**Memory Mapped Files** - Efficient handling of large files (10MB+)
+
+**Smart Resolution Detection** - Automatically adjusts UI based on screen resolution (1080p/1440p+)
+
+## Keyboard Shortcuts
+
+- **Ctrl+S** - Save file
+- **Ctrl+Shift+S** - Save all files
+- **Ctrl+Z** - Undo
+- **Ctrl+Y** - Redo
+- **Ctrl+C** - Copy selection
+- **Ctrl+X** - Cut selection
+- **Ctrl+V** - Paste insert
+- **Ctrl+B** - Paste write (overwrite)
+- **Ctrl+F** - Search
+- **Ctrl+R** - Replace
+- **Ctrl+G** - Go to offset
+- **Ctrl+H** - Highlight dialog
+- **Ctrl+L** - Fill selection
+- **Arrow Keys** - Navigate bytes
+
+## Quick Start
+
+1. **Open a file** - File → Open or drag and drop
+2. **Navigate** - Click bytes or use arrow keys
+3. **Edit** - Type hex digits directly or use ASCII column
+4. **Inspect** - Right panel Inspector shows selected bytes as different data types
+5. **Scan** - Use Pattern Scan tab to analyze file structure
+6. **Highlight** - Mark important bytes with custom colors and labels (Ctrl+H)
+7. **Save** - Ctrl+S to save changes
