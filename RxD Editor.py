@@ -1,3 +1,75 @@
+"""
+RxD Hex Editor - Professional Binary File Editor
+=================================================
+
+A feature-rich, professional hex editor application built with PyQt5 for viewing
+and editing binary files with advanced visualization and analysis tools.
+
+Key Features:
+-------------
+Core Editing:
+- Multi-file tabs: Open and edit multiple files simultaneously
+- Smart editing: Insert/overwrite modes, column selection, smart paste with delimiters
+- Undo/Redo: Full undo/redo support with state snapshots
+- Search & Replace: Hex patterns, ASCII/UTF-16 strings with regex support
+- Copy/Paste formats: Hex, C array, Python bytes, Base64, and more
+
+Analysis Tools:
+- Pattern scanning: Automatic detection of strings, pointers, compression/image signatures
+- Data inspector: Interpret bytes as 25+ data types (integers, floats, timestamps, GUIDs, etc.)
+- Statistics: Byte frequency analysis, entropy calculation, and distribution visualizations
+- Signature tracking: Mark and track important offsets with custom labels and data types
+- Fields system: Define structured data fields with nested subfields and type interpretation
+
+Visual Enhancements:
+- Syntax highlighting: Color-coded display for modified/inserted bytes
+- Theme system: 16+ built-in themes plus custom theme editor with gradients
+- Segment boundaries: Visual column separators with customizable ranges
+- Edit box overlay: Visual indicator for active editing regions
+- Signature overlays: Inline value display for tracked pointers
+
+Productivity Tools:
+- Notes system: Attach searchable notes to specific byte ranges
+- Version control: Built-in snapshot system with timestamps and descriptions
+- Bookmarks: Quick navigation to important offsets
+- File comparison: Side-by-side comparison of two files
+- Debugging console: Real-time terminal output viewer
+
+File Operations:
+- Import/Export: Selected regions, multiple format support
+- Large file support: Memory-mapped I/O for files over 100MB
+- File metadata: Creation/modification dates, MD5/SHA256 hashing
+
+Architecture Overview:
+----------------------
+Main Components:
+- HexEditorQt: Main application window and core editor logic
+- FileTab: Individual file tabs with file data and metadata
+- FieldWidget: Structured data field management with type interpretation
+- PatternScanner/PatternScanWidget: Pattern detection and display
+- SignatureWidget: User-defined signature/pointer management
+- DataInspector: Multi-format byte interpretation
+- StatisticsWidget: Byte frequency and entropy analysis
+- NotesWindow: Searchable notes management
+- DebugWindow: Terminal output capture and display
+
+Display System:
+- Virtual scrolling: Efficient rendering for large files (only visible rows)
+- Configurable bytes per row: 8, 16, 32, or 64 bytes
+- Hex and ASCII side-by-side display with synchronized scrolling
+- Custom overlays: Segment boundaries, edit boxes, signature pointers
+- Dynamic highlighting: Selection, modified bytes, inserted bytes
+
+License:
+--------
+Open Source
+
+Author:
+-------
+Digitzaki [龍崎 明]
+https://digitzaki.github.io/
+"""
+
 import sys
 import os
 import re
@@ -12,6 +84,11 @@ from PyQt5.QtCore import *
 from editor_themes import (THEMES, get_theme_stylesheet, get_theme_colors,
                            get_all_themes, CustomThemeEditor, load_custom_themes,
                            save_custom_themes, get_theme_categories)
+from datainspect import DataInspector
+from datainspect.pattern_scan import PatternScanner, PatternScanWidget, PatternResult
+from datainspect.pointers import SignaturePointer, SignatureWidget, SignatureScanner, ClickableOverlay
+from datainspect.statistics import StatisticsWidget
+from datainspect.fields import FieldWidget
 
 try:
     import magic
@@ -29,1552 +106,37 @@ except ImportError:
     MATPLOTLIB_AVAILABLE = False
 
 
-class PatternResult:
-    def __init__(self, offset: int, length: int, category: str, description: str, data: bytes = None, label: str = ""):
-        self.offset = offset
-        self.length = length
-        self.category = category
-        self.description = description
-        self.data = data
-        self.label = label
-
-
-class PatternScanner(QThread):
-    progress_updated = pyqtSignal(int)
-    scan_complete = pyqtSignal(list)
-
-    def __init__(self, file_data: bytearray):
-        super().__init__()
-        self.file_data = file_data
-        self.results = []
-        self.min_string_length = 3
-
-    def run(self):
-        self.results = []
-        total_steps = 6
-        current_step = 0
-
-        self.detect_libmagic_signatures()
-        current_step += 1
-        self.progress_updated.emit(int((current_step / total_steps) * 100))
-
-        self.detect_ascii_strings()
-        current_step += 1
-        self.progress_updated.emit(int((current_step / total_steps) * 100))
-
-        self.detect_utf16le_strings()
-        current_step += 1
-        self.progress_updated.emit(int((current_step / total_steps) * 100))
-
-        self.detect_pointers()
-        current_step += 1
-        self.progress_updated.emit(int((current_step / total_steps) * 100))
-
-        self.detect_compression_signatures()
-        current_step += 1
-        self.progress_updated.emit(int((current_step / total_steps) * 100))
-
-        self.detect_image_signatures()
-        current_step += 1
-        self.progress_updated.emit(100)
-
-        self.scan_complete.emit(self.results)
-
-    def detect_libmagic_signatures(self):
-        if not LIBMAGIC_AVAILABLE:
-            self.results.append(PatternResult(
-                0, 0, "libmagic",
-                "N/A"
-            ))
-            return
-
-        try:
-            mime = magic.Magic(mime=True)
-            mime_type = mime.from_buffer(bytes(self.file_data))
-            detailed = magic.Magic()
-            description = detailed.from_buffer(bytes(self.file_data))
-            self.results.append(PatternResult(
-                0, min(len(self.file_data), 512), "libmagic",
-                f"MIME: {mime_type} | {description}"
-            ))
-        except Exception as e:
-            self.results.append(PatternResult(
-                0, 0, "libmagic",
-                f"libmagic error: {str(e)}"
-            ))
-
-    def detect_ascii_strings(self):
-        pattern = rb'[\x20-\x7E]{' + str(self.min_string_length).encode() + rb',}'
-        matches = re.finditer(pattern, bytes(self.file_data))
-        for match in matches:
-            text = match.group().decode('ascii', errors='ignore')
-            if len(text) >= self.min_string_length:
-                self.results.append(PatternResult(
-                    match.start(), len(text),
-                    "ASCII String",
-                    f'"{text[:50]}{"..." if len(text) > 50 else ""}"'
-                ))
-
-    def detect_utf16le_strings(self):
-        offset = 0
-        while offset < len(self.file_data) - 6:
-            try:
-                char_count = 0
-                temp_offset = offset
-                chars = []
-                while temp_offset < len(self.file_data) - 1:
-                    low = self.file_data[temp_offset]
-                    high = self.file_data[temp_offset + 1]
-                    if high == 0 and 0x20 <= low <= 0x7E:
-                        chars.append(chr(low))
-                        char_count += 1
-                        temp_offset += 2
-                    else:
-                        break
-                if char_count >= self.min_string_length:
-                    text = ''.join(chars)
-                    self.results.append(PatternResult(
-                        offset, char_count * 2,
-                        "UTF-16LE String",
-                        f'"{text[:50]}{"..." if len(text) > 50 else ""}"'
-                    ))
-                    offset = temp_offset
-                else:
-                    offset += 2
-            except:
-                offset += 2
-
-    def detect_pointers(self):
-        file_size = len(self.file_data)
-        pointer_clusters = []
-        for offset in range(0, len(self.file_data) - 7, 4):
-            try:
-                ptr32 = struct.unpack('<I', self.file_data[offset:offset+4])[0]
-                if 0 < ptr32 < file_size:
-                    pointer_clusters.append((offset, 4, ptr32, "u32"))
-                if offset + 8 <= len(self.file_data):
-                    ptr64 = struct.unpack('<Q', self.file_data[offset:offset+8])[0]
-                    if 0 < ptr64 < file_size:
-                        pointer_clusters.append((offset, 8, ptr64, "u64"))
-            except:
-                continue
-        clusters = self._cluster_pointers(pointer_clusters)
-        for cluster in clusters:
-            if len(cluster) >= 3:
-                first_offset = cluster[0][0]
-                last_offset = cluster[-1][0]
-                length = last_offset - first_offset + cluster[-1][1]
-                self.results.append(PatternResult(
-                    first_offset, length,
-                    "Pointer Table",
-                    f"{len(cluster)} possible pointers ({cluster[0][3]})"
-                ))
-
-    def _cluster_pointers(self, pointers, max_gap: int = 16):
-        if not pointers:
-            return []
-        sorted_pointers = sorted(pointers, key=lambda x: x[0])
-        clusters = [[sorted_pointers[0]]]
-        for ptr in sorted_pointers[1:]:
-            if ptr[0] - clusters[-1][-1][0] <= max_gap:
-                clusters[-1].append(ptr)
-            else:
-                clusters.append([ptr])
-        return [c for c in clusters if len(c) >= 3]
-
-    def detect_compression_signatures(self):
-        signatures = [
-            (b'\x78\x9C', "zlib (default compression)"),
-            (b'\x78\x01', "zlib (no compression)"),
-            (b'\x78\xDA', "zlib (best compression)"),
-            (b'\x1F\x8B', "gzip"),
-            (b'\x04\x22\x4D\x18', "LZ4"),
-            (b'\x28\xB5\x2F\xFD', "Zstandard"),
-            (b'LZFSE', "LZFSE (Apple)"),
-        ]
-        for sig, desc in signatures:
-            offset = 0
-            while True:
-                pos = self.file_data.find(sig, offset)
-                if pos == -1:
-                    break
-                self.results.append(PatternResult(pos, len(sig), "Compression", desc))
-                offset = pos + 1
-
-    def detect_image_signatures(self):
-        signatures = [
-            (b'\x89PNG\r\n\x1a\n', "PNG Image"),
-            (b'\xFF\xD8\xFF', "JPEG Image"),
-            (b'GIF87a', "GIF Image (87a)"),
-            (b'GIF89a', "GIF Image (89a)"),
-            (b'BM', "Bitmap Image"),
-            (b'DDS ', "DirectDraw Surface (DDS)"),
-            (b'\x00\x00\x01\x00', "ICO Image"),
-            (b'RIFF', "RIFF Container (WebP/WAV)"),
-        ]
-        for sig, desc in signatures:
-            offset = 0
-            while True:
-                pos = self.file_data.find(sig, offset)
-                if pos == -1:
-                    break
-                if sig == b'RIFF' and pos + 12 <= len(self.file_data):
-                    riff_type = self.file_data[pos+8:pos+12]
-                    if riff_type == b'WEBP':
-                        desc = "WebP Image"
-                    elif riff_type == b'WAVE':
-                        desc = "WAV Audio"
-                self.results.append(PatternResult(pos, len(sig), "Image/Media", desc))
-                offset = pos + 1
-
-
-class PatternScanWidget(QWidget):
-    result_clicked = pyqtSignal(int, int)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.scanner = None
-        self.setup_ui()
-
-    def setup_ui(self):
-        layout = QVBoxLayout()
-        layout.setContentsMargins(5, 5, 5, 5)
-        header_layout = QHBoxLayout()
-        title = QLabel("Pattern Scan")
-        title.setFont(QFont("Arial", 11, QFont.Bold))
-        header_layout.addWidget(title)
-        self.scan_button = QPushButton("Scan")
-        self.scan_button.clicked.connect(self.start_scan)
-        header_layout.addWidget(self.scan_button)
-        header_layout.addStretch()
-        layout.addLayout(header_layout)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
-        self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Label", "Offset", "Length", "Description"])
-        self.tree.setIndentation(15)  # Minimal indent to show dropdown arrows
-        self.tree.setColumnWidth(0, 150)
-        self.tree.setColumnWidth(1, 80)
-        self.tree.setColumnWidth(2, 60)
-        self.tree.setColumnWidth(3, 250)
-        self.tree.itemClicked.connect(self.on_item_clicked)
-        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.tree.customContextMenuRequested.connect(self.on_tree_context_menu)
-        layout.addWidget(self.tree)
-        self.label_editors = {}  # Track QLineEdit widgets for labels
-        self.status_label = QLabel("No scan performed")
-        self.status_label.setFont(QFont("Arial", 9))
-        layout.addWidget(self.status_label)
-        self.setLayout(layout)
-
-    def start_scan(self):
-        if hasattr(self, 'file_data') and self.file_data:
-            self.scan_button.setEnabled(False)
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setRange(0, 100)
-            self.progress_bar.setValue(0)
-            self.tree.clear()
-            self.status_label.setText("Scanning...")
-            self.scanner = PatternScanner(self.file_data)
-            self.scanner.progress_updated.connect(self.on_scan_progress)
-            self.scanner.scan_complete.connect(self.on_scan_complete)
-            self.scanner.start()
-
-    def on_scan_progress(self, value):
-        """Update progress bar during scan"""
-        try:
-            self.progress_bar.setValue(value)
-        except RuntimeError:
-            # Widget has been deleted, ignore
-            pass
-
-    def on_scan_complete(self, results):
-        try:
-            self.progress_bar.setVisible(False)
-            self.scan_button.setEnabled(True)
-            self.tree.clear()
-            categories = {}
-            for result in results:
-                if result.category not in categories:
-                    categories[result.category] = []
-                categories[result.category].append(result)
-            category_order = ["libmagic", "Compression", "Image/Media", "ASCII String", "UTF-16LE String", "Pointer Table"]
-            for category in category_order:
-                if category in categories:
-                    self._add_category(category, categories[category])
-            for category, results_list in categories.items():
-                if category not in category_order:
-                    self._add_category(category, results_list)
-            total_results = len(results)
-            self.status_label.setText(f"Scan complete: {total_results} patterns found")
-            self.tree.expandAll()
-
-            # Load saved pattern labels
-            if hasattr(self, 'parent_editor') and self.parent_editor:
-                self.parent_editor.load_pattern_labels_to_widget()
-        except RuntimeError:
-            # Widget has been deleted, ignore
-            pass
-
-    def populate_tree(self, results):
-        """Populate tree with saved results"""
-        try:
-            self.tree.clear()
-            self.label_editors.clear()
-            categories = {}
-            for result in results:
-                if result.category not in categories:
-                    categories[result.category] = []
-                categories[result.category].append(result)
-            category_order = ["libmagic", "Compression", "Image/Media", "ASCII String", "UTF-16LE String", "Pointer Table"]
-            for category in category_order:
-                if category in categories:
-                    self._add_category(category, categories[category])
-            for category, results_list in categories.items():
-                if category not in category_order:
-                    self._add_category(category, results_list)
-            total_results = len(results)
-            self.status_label.setText(f"Loaded {total_results} patterns")
-            self.tree.expandAll()
-        except RuntimeError:
-            # Widget has been deleted, ignore
-            pass
-
-    def _add_category(self, category_name, results):
-        category_item = QTreeWidgetItem(self.tree)
-        category_item.setText(0, category_name)
-        category_item.setTextAlignment(0, Qt.AlignCenter)
-        category_item.setText(3, f"({len(results)} items)")
-        for result in results:
-            item = QTreeWidgetItem(category_item)
-
-            # Create a container with color box and label editor
-            label_container = QWidget()
-            label_layout = QHBoxLayout()
-            label_layout.setContentsMargins(0, 0, 2, 0)
-            label_layout.setSpacing(4)
-
-            # Color box (clickable) - starts blank
-            color_box = QPushButton()
-            color_box.setFixedSize(16, 16)
-            if hasattr(result, 'highlight_color') and result.highlight_color:
-                color_box.setStyleSheet(f"background-color: {result.highlight_color}; border: 1px solid #555;")
-            else:
-                color_box.setStyleSheet("background-color: transparent; border: 1px solid #555;")
-            color_box.clicked.connect(lambda checked, r=result, cb=color_box, it=item: self.open_highlight_for_pattern(r, cb, it))
-            label_layout.addWidget(color_box)
-
-            # Create editable label widget
-            label_edit = QLineEdit()
-            label_edit.setText(result.label)
-            label_edit.setPlaceholderText("Enter label...")
-            label_edit.setFrame(False)
-            label_edit.setFont(QFont("Arial", 8))
-            label_edit.setStyleSheet("QLineEdit { background: transparent; }")
-            label_edit.returnPressed.connect(lambda r=result, le=label_edit: self.on_label_changed(r, le))
-            label_edit.editingFinished.connect(lambda r=result, le=label_edit: self.on_label_changed(r, le))
-            label_layout.addWidget(label_edit, 1)
-
-            label_container.setLayout(label_layout)
-
-            # Set other columns
-            item.setText(1, f"0x{result.offset:X}")
-            item.setText(2, str(result.length) if result.length > 0 else "—")
-            item.setText(3, result.description)
-
-            # Apply highlight color to description if it exists
-            if hasattr(result, 'highlight_color') and result.highlight_color:
-                item.setBackground(3, QColor(result.highlight_color))
-
-            item.setData(0, Qt.UserRole, result)
-
-            # Add the widgets
-            self.tree.setItemWidget(item, 0, label_container)
-            self.label_editors[result.offset] = label_edit
-
-    def on_label_changed(self, result, line_edit):
-        new_label = line_edit.text().strip()
-        result.label = new_label
-        self.save_labels_to_json()
-
-    def on_item_clicked(self, item, column):
-        result = item.data(0, Qt.UserRole)
-        if isinstance(result, PatternResult):
-            self.result_clicked.emit(result.offset, result.length)
-
-    def on_tree_context_menu(self, position):
-        item = self.tree.itemAt(position)
-        if item:
-            result = item.data(0, Qt.UserRole)
-            if isinstance(result, PatternResult):
-                menu = QMenu()
-                highlight_action = menu.addAction("Open Highlight Dialog")
-                action = menu.exec_(self.tree.viewport().mapToGlobal(position))
-
-                if action == highlight_action:
-                    # Find the color box for this item
-                    widget = self.tree.itemWidget(item, 0)
-                    if widget:
-                        color_box = widget.findChild(QPushButton)
-                        if color_box:
-                            self.open_highlight_for_pattern(result, color_box, item)
-
-    def open_highlight_for_pattern(self, result, color_box, tree_item):
-        """Open the highlight dialog with this pattern's bytes pre-selected"""
-        if hasattr(self, 'parent_editor') and self.parent_editor:
-            if self.parent_editor.current_tab_index < 0:
-                return
-
-            # Set selection to this pattern's range
-            self.parent_editor.selection_start = result.offset
-            self.parent_editor.selection_end = result.offset + result.length - 1
-            self.parent_editor.cursor_position = result.offset
-
-            # Store reference to update color box and tree item after highlighting
-            self.parent_editor.pattern_result_to_update = (result, color_box, tree_item)
-
-            # Open the highlight window (it will automatically use the selection)
-            self.parent_editor.show_highlight_window()
-
-    def get_color_for_category(self, category):
-        # Return different colors for different categories
-        category_colors = {
-            "libmagic": QColor(100, 200, 100),  # Light green
-            "Compression": QColor(100, 150, 255),  # Light blue
-            "Image/Media": QColor(255, 150, 100),  # Orange
-            "ASCII String": QColor(200, 200, 100),  # Yellow
-            "UTF-16LE String": QColor(200, 150, 255),  # Purple
-            "Pointer Table": QColor(255, 100, 150),  # Pink
-        }
-        return category_colors.get(category, QColor(150, 150, 150))  # Gray default
-
-    def save_labels_to_json(self):
-        if hasattr(self, 'parent_editor') and self.parent_editor:
-            self.parent_editor.save_pattern_labels_to_json()
-
-    def set_file_data(self, file_data: bytearray):
-        self.file_data = file_data
-        self.tree.clear()
-        self.status_label.setText("Ready to scan")
-        self.scan_button.setEnabled(True)
-
-
-class SignaturePointer:
-    """Represents a pointer/signature in the file"""
-    def __init__(self, offset: int, length: int, data_type: str, label: str = "", category: str = "Custom", pattern: bytes = None):
-        self.offset = offset
-        self.length = length
-        self.data_type = data_type  # e.g., "int8", "uint16", "float32", etc.
-        self.label = label
-        self.value = None
-        self.category = category  # Category for organizing pointers
-        self.custom_value = None  # Store custom user-entered value for string types
-        self.pattern = pattern  # The search pattern that found this pointer (for grouping/coloring)
-
-
-class ClickableOverlay(QLineEdit):
-    """Editable overlay for pointer values"""
-    value_changed = pyqtSignal(object, str)  # Emits pointer and new value
-    offset_jump = pyqtSignal(int)  # Emits offset to jump to
-
-    def __init__(self, pointer, parent=None):
-        super().__init__(parent)
-        self.pointer = pointer
-        self.hex_display_parent = parent  # Store reference to hex display for event forwarding
-        self.is_offset_type = pointer.data_type.lower().startswith("offset")
-
-        # Set cursor style based on type
-        if self.is_offset_type:
-            self.setCursor(Qt.PointingHandCursor)
-        else:
-            self.setCursor(Qt.IBeamCursor)
-
-        self.setReadOnly(False)
-        self.setFrame(False)
-        self.setAlignment(Qt.AlignCenter)
-
-        # Connect editing finished signal
-        self.editingFinished.connect(self._on_editing_finished)
-        self.returnPressed.connect(self._on_editing_finished)
-
-    def _on_editing_finished(self):
-        """Emit value changed signal when editing is done"""
-        try:
-            new_value = self.text()
-            self.value_changed.emit(self.pointer, new_value)
-            self.clearFocus()
-        except RuntimeError:
-            # Widget has been deleted, ignore
-            pass
-
-    def mouseDoubleClickEvent(self, event):
-        """Handle double-click to jump to offset for offset types"""
-        if self.is_offset_type and event.button() == Qt.LeftButton:
-            try:
-                # Parse the offset value as hex and jump to it
-                # Example: "207" -> 0x207 (decimal 519)
-                value_str = str(self.pointer.value).strip()
-                offset = int(value_str, 16)
-                self.offset_jump.emit(offset)
-                event.accept()
-                return
-            except (ValueError, AttributeError):
-                pass
-
-        # Default behavior for non-offset types or if parsing fails
-        super().mouseDoubleClickEvent(event)
-
-    def wheelEvent(self, event):
-        """Forward wheel events to hex display parent for scrolling"""
-        if self.hex_display_parent and hasattr(self.hex_display_parent, 'wheelEvent'):
-            self.hex_display_parent.wheelEvent(event)
-        else:
-            super().wheelEvent(event)
-
-
-class SignatureScanner(QThread):
-    """Thread for scanning file for signature patterns"""
-    progress_updated = pyqtSignal(int, int)  # (current_row, total_rows)
-    scan_complete = pyqtSignal(list)  # Emit all pointers when scan is done
-
-    def __init__(self, file_data: bytearray, hex_bytes: bytes, length: int, data_type: str, category_name: str):
-        super().__init__()
-        self.file_data = file_data
-        self.hex_bytes = hex_bytes
-        self.length = length
-        self.data_type = data_type
-        self.category_name = category_name
-
-    def run(self):
-        """Search for all occurrences of the pattern in chunks"""
-        file_size = len(self.file_data)
-        bytes_per_row = 16
-        total_rows = (file_size + bytes_per_row - 1) // bytes_per_row
-        rows_per_chunk = 50  # Process 50 rows at a time
-
-        offset = 0
-        found_count = 0
-        current_row = 0
-        all_pointers = []
-
-        while offset < file_size:
-            # Process one chunk
-            chunk_start = offset
-            chunk_end = min(chunk_start + (rows_per_chunk * bytes_per_row), file_size)
-
-            # Search within this chunk
-            search_offset = chunk_start
-            while search_offset < chunk_end:
-                search_offset = self.file_data.find(self.hex_bytes, search_offset, chunk_end)
-                if search_offset == -1:
-                    break
-
-                # The pointer points to bytes AFTER the search pattern
-                value_offset = search_offset + len(self.hex_bytes)
-                if value_offset + self.length <= file_size:
-                    pointer = SignaturePointer(
-                        value_offset,
-                        self.length,
-                        self.data_type,
-                        f"Result_{found_count + 1}",
-                        category=self.category_name,
-                        pattern=self.hex_bytes
-                    )
-                    all_pointers.append(pointer)
-                    found_count += 1
-
-                search_offset += 1
-
-            # Update progress after each chunk
-            offset = chunk_end
-            current_row = offset // bytes_per_row
-            self.progress_updated.emit(current_row, total_rows)
-
-            # Small delay to keep UI responsive
-            self.msleep(10)
-
-        self.progress_updated.emit(total_rows, total_rows)
-        self.scan_complete.emit(all_pointers)
-
-
-class SignatureWidget(QWidget):
-    """Widget for adding and managing signature pointers in hex view"""
-    pointer_added = pyqtSignal(object)  # Emits SignaturePointer
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.pointers = []  # List of SignaturePointer objects
-        self.parent_editor = None
-        self.hide_overlay_values = False  # Flag to control overlay visibility
-        self.label_editors = {}  # Track QLineEdit widgets for labels
-        self.setup_ui()
-
-    def get_valid_types_for_length(self, length):
-        """Return list of valid data types for a given byte length (without endianness)"""
-        types = ["Hex"]  # hex is always valid
-
-        if length >= 1:
-            types.extend(["int8", "uint8"])
-        if length >= 2:
-            types.extend(["int16", "uint16", "Offset"])
-        if length >= 3:
-            types.extend(["int24", "uint24"])
-        if length >= 4:
-            types.extend(["int32", "uint32", "float32"])
-        if length >= 8:
-            types.extend(["int64", "uint64", "float64"])
-        if length >= 1:
-            types.append("String")
-
-        return types
-
-    def needs_endianness(self, base_type):
-        """Check if a data type requires endianness selection"""
-        return base_type.lower() in ["int16", "uint16", "int24", "uint24", "int32", "uint32", "int64", "uint64", "float32", "float64"]
-
-    def get_full_type_name(self, base_type, endianness):
-        """Combine base type with endianness"""
-        if self.needs_endianness(base_type):
-            return f"{base_type} {endianness}"
-        return base_type
-
-    def get_length_for_type(self, data_type):
-        """Return the byte length for a given data type"""
-        # Remove endianness suffix if present
-        base_type = data_type.lower().split()[0]
-
-        type_lengths = {
-            "int8": 1, "uint8": 1,
-            "int16": 2, "uint16": 2, "offset": 2,
-            "int24": 3, "uint24": 3,
-            "int32": 4, "uint32": 4, "float32": 4,
-            "int64": 8, "uint64": 8, "float64": 8,
-            "hex": 1, "string": 1
-        }
-
-        return type_lengths.get(base_type, 4)  # Default to 4 if unknown
-
-    def setup_ui(self):
-        layout = QVBoxLayout()
-        layout.setContentsMargins(5, 5, 5, 5)
-
-        # Header with title
-        header_layout = QHBoxLayout()
-        title = QLabel("Pointers")
-        title.setFont(QFont("Arial", 11, QFont.Bold))
-        header_layout.addWidget(title)
-        header_layout.addStretch()
-        layout.addLayout(header_layout)
-
-        # Mode selection
-        # Mode and Type for Selection (on one line)
-        mode_group = QWidget()
-        mode_layout = QHBoxLayout()
-        mode_layout.setContentsMargins(0, 5, 0, 5)
-
-        mode_label = QLabel("Mode:")
-        mode_label.setFont(QFont("Arial", 8))
-        mode_layout.addWidget(mode_label)
-
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Selection", "Search"])
-        self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
-        mode_layout.addWidget(self.mode_combo)
-
-        mode_layout.addSpacing(15)
-
-        # Selection mode Type (visible only in Selection mode)
-        self.sel_type_label = QLabel("Type:")
-        self.sel_type_label.setFont(QFont("Arial", 8))
-        mode_layout.addWidget(self.sel_type_label)
-
-        self.selection_type_combo = QComboBox()
-        self.selection_type_combo.setFont(QFont("Arial", 8))
-        # Initially populate with all types, will be filtered when selection is made
-        self.selection_type_combo.addItems(self.get_valid_types_for_length(16))
-        self.selection_type_combo.setCurrentText("int32")
-        self.selection_type_combo.currentTextChanged.connect(self.on_selection_type_changed)
-        mode_layout.addWidget(self.selection_type_combo)
-
-        # Single LE/BE toggle button for Selection mode
-        self.sel_endian_button = QPushButton("LE")
-        self.sel_endian_button.setFont(QFont("Arial", 8))
-        self.sel_endian_button.setMinimumWidth(35)
-        self.sel_endian_button.setMaximumHeight(25)
-        self.sel_endian_button.clicked.connect(self.toggle_selection_endianness)
-        mode_layout.addWidget(self.sel_endian_button)
-
-        self.sel_endian = "LE"  # Default endianness for selection
-
-        # Hex pattern for Search mode (visible only in Search mode)
-        self.hex_label = QLabel("Hex Pattern:")
-        self.hex_label.setFont(QFont("Arial", 8))
-        self.hex_label.setVisible(False)
-        mode_layout.addWidget(self.hex_label)
-
-        self.hex_input = QLineEdit()
-        self.hex_input.setPlaceholderText("e.g., 48 65 6C 6C 6F")
-        self.hex_input.setFont(QFont("Courier", 9))
-        self.hex_input.setVisible(False)
-        mode_layout.addWidget(self.hex_input)
-
-        mode_layout.addStretch()
-
-        mode_group.setLayout(mode_layout)
-        layout.addWidget(mode_group)
-
-        # Search mode controls (visible only in Search mode)
-        self.search_widget = QWidget()
-        search_layout = QHBoxLayout()
-        search_layout.setContentsMargins(0, 0, 0, 5)
-
-        # Type for Search mode
-        type_label = QLabel("Type:")
-        type_label.setFont(QFont("Arial", 8))
-        search_layout.addWidget(type_label)
-
-        self.type_combo = QComboBox()
-        self.type_combo.setFont(QFont("Arial", 8))
-        # Show all available types
-        self.type_combo.addItems(self.get_valid_types_for_length(16))
-        self.type_combo.setCurrentText("int32")
-        self.type_combo.currentTextChanged.connect(self.on_search_type_changed)
-        search_layout.addWidget(self.type_combo)
-
-        # LE/BE toggle button for Search mode
-        self.search_endian_button = QPushButton("LE")
-        self.search_endian_button.setFont(QFont("Arial", 8))
-        self.search_endian_button.setMinimumWidth(35)
-        self.search_endian_button.setMaximumHeight(25)
-        self.search_endian_button.clicked.connect(self.toggle_search_endianness)
-        search_layout.addWidget(self.search_endian_button)
-
-        self.search_endian = "LE"  # Default endianness for search
-
-        # Length field for Offset type (hidden by default)
-        self.search_length_label = QLabel("Length:")
-        self.search_length_label.setFont(QFont("Arial", 8))
-        self.search_length_label.setVisible(False)
-        search_layout.addWidget(self.search_length_label)
-
-        self.search_length_input = QLineEdit()
-        self.search_length_input.setPlaceholderText("bytes")
-        self.search_length_input.setFont(QFont("Arial", 8))
-        self.search_length_input.setMaximumWidth(50)
-        self.search_length_input.setText("2")
-        self.search_length_input.setVisible(False)
-        search_layout.addWidget(self.search_length_input)
-
-        search_layout.addStretch()
-
-        self.search_widget.setLayout(search_layout)
-        self.search_widget.setVisible(False)
-        layout.addWidget(self.search_widget)
-
-        # Add Pointer button
-        self.add_pointer_button = QPushButton("Add Pointer")
-        self.add_pointer_button.clicked.connect(self.add_pointer)
-        self.add_pointer_button.setFont(QFont("Arial", 9, QFont.Bold))
-        layout.addWidget(self.add_pointer_button)
-
-        # Progress bar (hidden by default)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
-
-        # Pointer list header with count and checkbox
-        list_header_layout = QHBoxLayout()
-        list_header_layout.setContentsMargins(0, 5, 0, 0)
-
-        self.list_label = QLabel("Active Pointers: 0")
-        self.list_label.setFont(QFont("Arial", 9))
-        list_header_layout.addWidget(self.list_label)
-
-        self.hide_values_checkbox = QCheckBox("Hide Values")
-        self.hide_values_checkbox.setFont(QFont("Arial", 9, QFont.Bold))
-        self.hide_values_checkbox.setMinimumHeight(24)
-        self.hide_values_checkbox.stateChanged.connect(self.on_hide_values_changed)
-        list_header_layout.addWidget(self.hide_values_checkbox)
-
-        # String display mode toggle button
-        self.string_mode_button = QPushButton("ASCII")
-        self.string_mode_button.setFont(QFont("Arial", 9, QFont.Bold))
-        self.string_mode_button.setMinimumHeight(24)
-        self.string_mode_button.clicked.connect(self.on_string_mode_clicked)
-        list_header_layout.addWidget(self.string_mode_button)
-
-        # Track string display mode: "ascii" or "segment"
-        self.string_display_mode = "ascii"
-
-        list_header_layout.addStretch()
-        layout.addLayout(list_header_layout)
-
-        self.pointer_tree = QTreeWidget()
-        self.pointer_tree.setHeaderLabels(["Label", "Offset", "Type", "Value"])
-        self.pointer_tree.setIndentation(15)  # Minimal indent to show dropdown arrows
-        self.pointer_tree.setColumnWidth(0, 80)
-        self.pointer_tree.setColumnWidth(1, 70)
-        self.pointer_tree.setColumnWidth(2, 80)
-        self.pointer_tree.setColumnWidth(3, 100)
-        self.pointer_tree.itemClicked.connect(self.on_pointer_clicked)
-        self.pointer_tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.pointer_tree.customContextMenuRequested.connect(self.on_pointer_context_menu)
-        layout.addWidget(self.pointer_tree)
-
-        # Status label
-        self.status_label = QLabel("Ready")
-        self.status_label.setFont(QFont("Arial", 9))
-        layout.addWidget(self.status_label)
-
-        self.setLayout(layout)
-
-    def on_mode_changed(self, mode):
-        """Toggle between Selection and Search modes"""
-        is_search = mode == "Search"
-
-        # Toggle visibility of mode-specific fields in the header
-        self.sel_type_label.setVisible(not is_search)
-        self.selection_type_combo.setVisible(not is_search)
-        self.sel_endian_button.setVisible(not is_search)
-        self.hex_label.setVisible(is_search)
-        self.hex_input.setVisible(is_search)
-
-        # Toggle visibility of search parameters widget
-        self.search_widget.setVisible(is_search)
-
-    def add_pointer(self):
-        """Add a new pointer based on current mode"""
-        if not self.parent_editor or self.parent_editor.current_tab_index < 0:
-            self.status_label.setText("No file open")
-            return
-
-        current_file = self.parent_editor.open_files[self.parent_editor.current_tab_index]
-        file_data = current_file.file_data
-
-        mode = self.mode_combo.currentText()
-        new_pointers = []
-
-        if mode == "Selection":
-            # Use current selection
-            if self.parent_editor.selection_start is None or self.parent_editor.selection_end is None:
-                self.status_label.setText("No bytes selected")
-                return
-
-            # Type is from selection type combo + endianness
-            base_type = self.selection_type_combo.currentText()
-            data_type = self.get_full_type_name(base_type, self.sel_endian)
-
-            # Handle column selection mode differently
-            if self.parent_editor.column_selection_mode and self.parent_editor.column_sel_start_row is not None:
-                # Column selection - calculate based on column dimensions
-                min_row = min(self.parent_editor.column_sel_start_row, self.parent_editor.column_sel_end_row)
-                max_row = max(self.parent_editor.column_sel_start_row, self.parent_editor.column_sel_end_row)
-                min_col = min(self.parent_editor.column_sel_start_col, self.parent_editor.column_sel_end_col)
-                max_col = max(self.parent_editor.column_sel_start_col, self.parent_editor.column_sel_end_col)
-
-                sel_start = min_row * self.parent_editor.bytes_per_row + min_col
-                num_rows = max_row - min_row + 1
-                num_cols = max_col - min_col + 1
-                selection_length = num_rows * num_cols
-            else:
-                # Normal linear selection
-                sel_start = min(self.parent_editor.selection_start, self.parent_editor.selection_end)
-                sel_end = max(self.parent_editor.selection_start, self.parent_editor.selection_end)
-                selection_length = sel_end - sel_start + 1
-
-            # In Selection mode, length is ALWAYS determined by the selection
-            # for all types (Offset, Hex, String, etc.)
-            length = selection_length
-
-            # Extract the selected bytes as the pattern for grouping in statistics
-            pattern_bytes = bytes(file_data[sel_start:sel_start + length]) if sel_start + length <= len(file_data) else b''
-
-            pointer = SignaturePointer(sel_start, length, data_type, f"Selection_{sel_start:X}", category="Custom", pattern=pattern_bytes)
-            new_pointers.append(pointer)
-
-        else:  # Search mode - find ALL occurrences using threaded scanner
-            hex_pattern = self.hex_input.text().strip()
-            if not hex_pattern:
-                self.status_label.setText("Enter a hex pattern")
-                return
-
-            # Parse hex pattern
-            try:
-                hex_bytes = bytes.fromhex(hex_pattern.replace(" ", ""))
-            except ValueError:
-                self.status_label.setText("Invalid hex pattern")
-                return
-
-            # Get type and calculate length from type
-            base_type = self.type_combo.currentText()
-            data_type = self.get_full_type_name(base_type, self.search_endian)
-
-            # For Offset, String, and Hex types, use custom length from input
-            if base_type.lower() in ["offset", "string", "hex"]:
-                try:
-                    length = int(self.search_length_input.text())
-                    if length <= 0:
-                        self.status_label.setText("Length must be positive")
-                        return
-                except ValueError:
-                    self.status_label.setText("Invalid length")
-                    return
-            else:
-                length = self.get_length_for_type(data_type)
-
-            # Create category name from the hex pattern (just the pattern itself)
-            category_name = hex_pattern
-
-            # Disable button and show progress
-            self.add_pointer_button.setEnabled(False)
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(0)
-            self.status_label.setText("Searching...")
-
-            # Store the current tab index so we can continue processing in background if tab changes
-            self.scanning_tab_index = self.parent_editor.current_tab_index
-
-            # Start threaded scanner
-            self.scanner = SignatureScanner(file_data, hex_bytes, length, data_type, category_name)
-            self.scanner.progress_updated.connect(self.on_scan_progress)
-            self.scanner.scan_complete.connect(self.on_scan_complete)
-
-            self.scanner.start()
-            return  # Exit early, completion will be handled by signal
-
-        # For selection mode only:
-        # Calculate and store the value for all pointers
-        for pointer in new_pointers:
-            pointer.value = self.interpret_value(file_data, pointer.offset, pointer.length, pointer.data_type, self.string_display_mode)
-
-            # Add to list
-            self.pointers.append(pointer)
-
-            # Emit signal for overlay rendering
-            self.pointer_added.emit(pointer)
-
-        # Rebuild tree with categories
-        self.rebuild_tree()
-
-        if len(new_pointers) == 1:
-            self.status_label.setText(f"Pointer added at 0x{new_pointers[0].offset:X}")
-            # Scroll to the pointer location and set selection to highlight all bytes
-            pointer = new_pointers[0]
-            self.parent_editor.scroll_to_offset(pointer.offset, center=True)
-            self.parent_editor.selection_start = pointer.offset
-            self.parent_editor.selection_end = pointer.offset + pointer.length - 1
-            self.parent_editor.display_hex(preserve_scroll=True)
-        else:
-            self.status_label.setText(f"{len(new_pointers)} pointers added")
-            # Scroll to the first pointer location and highlight it
-            if new_pointers:
-                pointer = new_pointers[0]
-                self.parent_editor.scroll_to_offset(pointer.offset, center=True)
-                self.parent_editor.selection_start = pointer.offset
-                self.parent_editor.selection_end = pointer.offset + pointer.length - 1
-                self.parent_editor.display_hex(preserve_scroll=True)
-
-    def on_scan_progress(self, current_row, total_rows):
-        """Update progress bar during scan"""
-        try:
-            # Only update UI if still on the same tab
-            if not hasattr(self, 'scanning_tab_index') or self.parent_editor.current_tab_index != self.scanning_tab_index:
-                return
-
-            percentage = int((current_row / total_rows) * 100) if total_rows > 0 else 0
-            self.progress_bar.setValue(percentage)
-            self.progress_bar.setFormat(f"Scanning: {current_row:,} / {total_rows:,} rows ({percentage}%)")
-        except RuntimeError:
-            # Widget has been deleted, ignore
-            pass
-
-    def on_scan_complete(self, all_pointers):
-        """Called when signature scan completes - now load pointers progressively"""
-        try:
-            if not all_pointers:
-                # Only update UI if still on the same tab
-                if hasattr(self, 'scanning_tab_index') and self.parent_editor.current_tab_index == self.scanning_tab_index:
-                    self.progress_bar.setVisible(False)
-                    self.add_pointer_button.setEnabled(True)
-                    self.status_label.setText("Pattern not found")
-                return
-
-            # Scan complete, now start loading (update UI only if on same tab)
-            if hasattr(self, 'scanning_tab_index') and self.parent_editor.current_tab_index == self.scanning_tab_index:
-                self.status_label.setText(f"Scan complete, loading pointers...")
-                self.progress_bar.setValue(0)
-                self.progress_bar.setFormat(f"Loading: 0 / {len(all_pointers):,} pointers")
-
-            # Store pointers to be loaded
-            self.pending_pointers = all_pointers
-            self.total_pointers_found = len(all_pointers)
-            self.pointers_loaded = 0
-
-            # Start loading process
-            self.process_pending_pointers()
-        except RuntimeError:
-            # Widget has been deleted, ignore
-            pass
-
-    def process_pending_pointers(self):
-        """Process and render a batch of pending pointers"""
-        if not self.pending_pointers:
-            return
-
-        # Check if we have a valid scanning tab index
-        if not hasattr(self, 'scanning_tab_index'):
-            return
-
-        # Get the file data from the tab that started the scan
-        if self.scanning_tab_index < 0 or self.scanning_tab_index >= len(self.parent_editor.open_files):
-            return
-
-        scan_file = self.parent_editor.open_files[self.scanning_tab_index]
-        file_data = scan_file.file_data
-
-        # Process up to 5 pointers at a time
-        batch_size = 5
-        process_count = min(batch_size, len(self.pending_pointers))
-
-        for _ in range(process_count):
-            if not self.pending_pointers:
-                break
-
-            pointer = self.pending_pointers.pop(0)
-            pointer.value = self.interpret_value(file_data, pointer.offset, pointer.length, pointer.data_type, self.string_display_mode)
-            self.pointers.append(pointer)
-            self.pointer_added.emit(pointer)
-            self.pointers_loaded += 1
-
-        # Only update UI if still on the same tab
-        try:
-            on_same_tab = self.parent_editor.current_tab_index == self.scanning_tab_index
-            if on_same_tab:
-                # Update progress bar to show loading progress
-                self.progress_bar.setValue(int((self.pointers_loaded / self.total_pointers_found) * 100))
-                self.progress_bar.setFormat(f"Loading: {self.pointers_loaded:,} / {self.total_pointers_found:,} pointers")
-        except RuntimeError:
-            # Widget has been deleted, stop processing
-            return
-
-        # Schedule next batch if there are more pending
-        if self.pending_pointers:
-            QTimer.singleShot(10, self.process_pending_pointers)
-        else:
-            # All pointers loaded, rebuild tree
-            self.rebuild_tree()
-
-            # Only update UI if still on the same tab
-            try:
-                if on_same_tab:
-                    self.progress_bar.setVisible(False)
-                    self.add_pointer_button.setEnabled(True)
-                    self.status_label.setText(f"{self.pointers_loaded:,} pointers loaded")
-
-                    # Scroll to the first pointer location
-                    if self.pointers:
-                        self.parent_editor.scroll_to_offset(self.pointers[0].offset, center=True)
-            except RuntimeError:
-                # Widget has been deleted, ignore
-                pass
-
-    def interpret_value(self, data, offset, length, data_type, string_mode="ascii"):
-        """Interpret bytes as specified data type"""
-        if offset + length > len(data):
-            return "N/A"
-
-        value_bytes = bytes(data[offset:offset+length])
-
-        try:
-            # Normalize to lowercase for comparison
-            dtype_lower = data_type.lower()
-
-            # Length validation - check if length matches expected length for type
-            # Hex, String, and Offset types ignore this check
-            if not (dtype_lower == "hex" or dtype_lower == "string" or dtype_lower.startswith("offset")):
-                expected_lengths = {
-                    "int8": 1, "uint8": 1,
-                    "int16 le": 2, "uint16 le": 2, "int16 be": 2, "uint16 be": 2,
-                    "int24 le": 3, "uint24 le": 3, "int24 be": 3, "uint24 be": 3,
-                    "int32 le": 4, "uint32 le": 4, "int32 be": 4, "uint32 be": 4,
-                    "int64 le": 8, "uint64 le": 8, "int64 be": 8, "uint64 be": 8,
-                    "float32 le": 4, "float32 be": 4,
-                    "float64 le": 8, "float64 be": 8,
-                }
-                expected_length = expected_lengths.get(dtype_lower)
-                if expected_length is not None and length != expected_length:
-                    return "N/A"
-
-            if dtype_lower == "hex":
-                return " ".join(f"{b:02X}" for b in value_bytes)
-            elif dtype_lower == "int8":
-                return struct.unpack('b', value_bytes[:1])[0]
-            elif dtype_lower == "uint8":
-                return struct.unpack('B', value_bytes[:1])[0]
-            elif dtype_lower == "int16 le":
-                return struct.unpack('<h', value_bytes[:2])[0]
-            elif dtype_lower == "uint16 le":
-                return struct.unpack('<H', value_bytes[:2])[0]
-            elif dtype_lower == "int16 be":
-                return struct.unpack('>h', value_bytes[:2])[0]
-            elif dtype_lower == "uint16 be":
-                return struct.unpack('>H', value_bytes[:2])[0]
-            elif dtype_lower == "int24 le":
-                # Extend to 4 bytes for int32
-                extended = value_bytes[:3] + (b'\xff' if value_bytes[2] & 0x80 else b'\x00')
-                return struct.unpack('<i', extended)[0] >> 8
-            elif dtype_lower == "uint24 le":
-                extended = value_bytes[:3] + b'\x00'
-                return struct.unpack('<I', extended)[0]
-            elif dtype_lower == "int24 be":
-                extended = (b'\xff' if value_bytes[0] & 0x80 else b'\x00') + value_bytes[:3]
-                return struct.unpack('>i', extended)[0] >> 8
-            elif dtype_lower == "uint24 be":
-                extended = b'\x00' + value_bytes[:3]
-                return struct.unpack('>I', extended)[0]
-            elif dtype_lower == "int32 le":
-                return struct.unpack('<i', value_bytes[:4])[0]
-            elif dtype_lower == "uint32 le":
-                return struct.unpack('<I', value_bytes[:4])[0]
-            elif dtype_lower == "int32 be":
-                return struct.unpack('>i', value_bytes[:4])[0]
-            elif dtype_lower == "uint32 be":
-                return struct.unpack('>I', value_bytes[:4])[0]
-            elif dtype_lower == "int64 le":
-                return struct.unpack('<q', value_bytes[:8])[0]
-            elif dtype_lower == "uint64 le":
-                return struct.unpack('<Q', value_bytes[:8])[0]
-            elif dtype_lower == "int64 be":
-                return struct.unpack('>q', value_bytes[:8])[0]
-            elif dtype_lower == "uint64 be":
-                return struct.unpack('>Q', value_bytes[:8])[0]
-            elif dtype_lower == "float32 le":
-                val = struct.unpack('<f', value_bytes[:4])[0]
-                return f"{val:.3f}"
-            elif dtype_lower == "float32 be":
-                val = struct.unpack('>f', value_bytes[:4])[0]
-                return f"{val:.3f}"
-            elif dtype_lower == "float64 le":
-                val = struct.unpack('<d', value_bytes[:8])[0]
-                return f"{val:.3f}"
-            elif dtype_lower == "float64 be":
-                val = struct.unpack('>d', value_bytes[:8])[0]
-                return f"{val:.3f}"
-            elif dtype_lower == "offset":
-                # Treat as pointer/address using direct hex concatenation
-                # Example: 02 07 -> 207, 00 23 -> 23, 23 -> 23, 23 00 -> 2300
-                hex_str = ''.join(f'{b:02X}' for b in value_bytes)
-                # Strip leading zeros by converting to int and back to hex
-                return format(int(hex_str, 16), 'X')
-            elif dtype_lower == "string":
-                # Support both ASCII and offset modes
-                try:
-                    if string_mode == "ascii":
-                        # ASCII mode: Replace non-printable chars with '.'
-                        decoded = value_bytes.decode('latin-1', errors='ignore')
-                        # Control characters (0x00-0x1F, 0x7F-0x9F) shown as dots
-                        # Display printable ASCII (32-126) and extended ASCII (160-255)
-                        result = ""
-                        for char in decoded:
-                            char_code = ord(char)
-                            if (32 <= char_code <= 126) or (160 <= char_code <= 255):
-                                result += char
-                            else:
-                                result += "."
-                        return result if result else "N/A"
-                    else:
-                        # Offset mode: treat bytes as direct hex concatenation
-                        # Example: 02 07 -> 0x207, 00 23 -> 0x23, 23 -> 0x23, 23 00 -> 0x2300
-                        hex_str = ''.join(f'{b:02X}' for b in value_bytes)
-                        target_offset = int(hex_str, 16)
-
-                        # Check if target offset is valid
-                        if target_offset >= len(data):
-                            return "N/A"
-
-                        # Read ASCII string from target offset (up to null terminator or max 100 chars)
-                        max_len = min(100, len(data) - target_offset)
-                        string_bytes = data[target_offset:target_offset + max_len]
-
-                        # Find null terminator
-                        null_pos = -1
-                        for i, b in enumerate(string_bytes):
-                            if b == 0x00:
-                                null_pos = i
-                                break
-
-                        if null_pos > 0:
-                            string_bytes = string_bytes[:null_pos]
-
-                        # Decode to ASCII, replace non-printables with '.'
-                        # Control characters (0x00-0x1F, 0x7F-0x9F) shown as dots
-                        # Display printable ASCII (32-126) and extended ASCII (160-255)
-                        result = ""
-                        for byte in string_bytes:
-                            if (32 <= byte <= 126) or (160 <= byte <= 255):
-                                result += chr(byte)
-                            else:
-                                result += "."
-
-                        return result if result else "N/A"
-                except:
-                    return "N/A"
-            else:
-                return "N/A"
-        except (struct.error, IndexError, ValueError) as e:
-            return "N/A"
-
-    def on_pointer_label_changed(self, pointer, line_edit):
-        """Handle when a pointer label is changed"""
-        new_label = line_edit.text().strip()
-        pointer.label = new_label
-
-    def rebuild_tree(self):
-        """Rebuild the tree widget with categories"""
-        self.pointer_tree.clear()
-        self.label_editors.clear()
-
-        # Group pointers by category
-        categories = {}
-        for pointer in self.pointers:
-            if pointer.category not in categories:
-                categories[pointer.category] = []
-            categories[pointer.category].append(pointer)
-
-        # Add categories and their pointers to tree
-        for category_name, pointers_list in categories.items():
-            # Create category item
-            category_item = QTreeWidgetItem(self.pointer_tree)
-            category_item.setText(0, category_name)
-            category_item.setTextAlignment(0, Qt.AlignCenter)
-            category_item.setText(1, f"({len(pointers_list)} items)")
-            category_item.setExpanded(True)
-
-            # Add pointers under category
-            for pointer in pointers_list:
-                self.add_pointer_to_category(pointer, category_item)
-
-        # Update pointer count
-        self.update_pointer_count()
-
-    def update_pointer_count(self):
-        """Update the pointer count label"""
-        count = len(self.pointers)
-        self.list_label.setText(f"Active Pointers: {count}")
-
-    def toggle_selection_endianness(self):
-        """Toggle between LE and BE for selection mode"""
-        if self.sel_endian == "LE":
-            self.sel_endian = "BE"
-            self.sel_endian_button.setText("BE")
-        else:
-            self.sel_endian = "LE"
-            self.sel_endian_button.setText("LE")
-
-    def toggle_search_endianness(self):
-        """Toggle between LE and BE for search mode"""
-        if self.search_endian == "LE":
-            self.search_endian = "BE"
-            self.search_endian_button.setText("BE")
-        else:
-            self.search_endian = "LE"
-            self.search_endian_button.setText("LE")
-
-    def on_selection_type_changed(self, type_text):
-        """Update endian button visibility based on type in Selection mode"""
-        # Show/hide endian button based on whether type needs endianness
-        self.sel_endian_button.setVisible(self.needs_endianness(type_text))
-
-    def on_search_type_changed(self, type_text):
-        """Show/hide length field and endian button for appropriate types in Search mode"""
-        # Show length field for Offset, String, and Hex types
-        needs_length = type_text.lower() in ["offset", "string", "hex"]
-        self.search_length_label.setVisible(needs_length)
-        self.search_length_input.setVisible(needs_length)
-
-        # Update placeholder based on type
-        if needs_length:
-            if type_text.lower() == "offset":
-                self.search_length_input.setPlaceholderText("bytes")
-                if not self.search_length_input.text():
-                    self.search_length_input.setText("2")
-            else:  # String or Hex
-                self.search_length_input.setPlaceholderText("bytes")
-                if not self.search_length_input.text():
-                    self.search_length_input.setText("1")
-
-        # Hide endian button for types that don't need it
-        self.search_endian_button.setVisible(not needs_length and self.needs_endianness(type_text))
-
-    def on_hide_values_changed(self, state):
-        """Toggle visibility of pointer value overlay boxes"""
-        self.hide_overlay_values = (state == Qt.Checked)
-
-        # Hide or show all overlay widgets
-        if self.parent_editor and hasattr(self.parent_editor, 'signature_overlays'):
-            for overlay in self.parent_editor.signature_overlays:
-                overlay.setVisible(not self.hide_overlay_values)
-
-    def on_string_mode_clicked(self):
-        """Toggle string display mode between ASCII and offset"""
-        if self.string_display_mode == "ascii":
-            self.string_display_mode = "offset"
-            self.string_mode_button.setText("Offset")
-        else:
-            self.string_display_mode = "ascii"
-            self.string_mode_button.setText("ASCII")
-
-        # Refresh all pointers to update string displays
-        if self.parent_editor:
-            self.parent_editor.update_signature_overlays()
-
-    def add_pointer_to_category(self, pointer, category_item):
-        """Add a pointer to a category in the tree widget"""
-        item = QTreeWidgetItem(category_item)
-
-        # Create editable label widget for column 0
-        label_edit = QLineEdit()
-        label_edit.setText(pointer.label if pointer.label else "")
-        label_edit.setPlaceholderText("Enter label...")
-        label_edit.setFrame(False)
-        label_edit.setFont(QFont("Arial", 8))
-        label_edit.setStyleSheet("QLineEdit { background: transparent; }")
-        label_edit.returnPressed.connect(lambda p=pointer, le=label_edit: self.on_pointer_label_changed(p, le))
-        label_edit.editingFinished.connect(lambda p=pointer, le=label_edit: self.on_pointer_label_changed(p, le))
-
-        # Store reference for later access
-        pointer_id = (pointer.offset, pointer.length)
-        self.label_editors[pointer_id] = label_edit
-
-        item.setText(1, f"0x{pointer.offset:X}")
-        item.setText(2, pointer.data_type)
-
-        # For String types with custom values, show the custom value
-        if pointer.data_type.lower() == "string" and pointer.custom_value:
-            item.setText(3, pointer.custom_value)
-        # For Offset types, show format like "05: (0x5)" or "2e 33 34: (0x2e3334)"
-        elif pointer.data_type.lower().startswith("offset"):
-            if self.parent_editor and self.parent_editor.current_tab_index >= 0:
-                current_file = self.parent_editor.open_files[self.parent_editor.current_tab_index]
-                hex_bytes = current_file.file_data[pointer.offset:pointer.offset + pointer.length]
-                hex_str = " ".join(f"{b:02x}" for b in hex_bytes)
-                value_str = f"{hex_str}: ({pointer.value})"
-                item.setText(3, value_str)
-            else:
-                item.setText(3, str(pointer.value))
-        else:
-            item.setText(3, str(pointer.value))
-
-        item.setData(0, Qt.UserRole, pointer)
-        self.pointer_tree.setItemWidget(item, 0, label_edit)
-
-    def add_pointer_to_tree(self, pointer):
-        """Add pointer to the tree widget (legacy method for compatibility)"""
-        item = QTreeWidgetItem(self.pointer_tree)
-
-        # Hex bytes (non-editable, fetched from file data)
-        if self.parent_editor and self.parent_editor.current_tab_index >= 0:
-            current_file = self.parent_editor.open_files[self.parent_editor.current_tab_index]
-            hex_bytes = current_file.file_data[pointer.offset:pointer.offset + pointer.length]
-            hex_str = " ".join(f"{b:02X}" for b in hex_bytes)
-            item.setText(0, hex_str)
-        else:
-            item.setText(0, "")
-
-        item.setText(1, f"0x{pointer.offset:X}")
-        item.setText(2, pointer.data_type)
-        # For String types with custom values, show the custom value
-        if pointer.data_type.lower() == "string" and pointer.custom_value:
-            item.setText(3, pointer.custom_value)
-        else:
-            item.setText(3, str(pointer.value))
-        item.setData(0, Qt.UserRole, pointer)
-
-
-    def on_pointer_clicked(self, item, column):
-        """Navigate to pointer location when clicked"""
-        pointer = item.data(0, Qt.UserRole)
-        if isinstance(pointer, SignaturePointer) and self.parent_editor:
-            self.parent_editor.scroll_to_offset(pointer.offset, center=True)
-            # Set selection to highlight the pointer bytes
-            self.parent_editor.selection_start = pointer.offset
-            self.parent_editor.selection_end = pointer.offset + pointer.length - 1
-            self.parent_editor.display_hex(preserve_scroll=True)
-
-    def on_pointer_context_menu(self, position):
-        """Show context menu for pointer items"""
-        item = self.pointer_tree.itemAt(position)
-        if item:
-            pointer = item.data(0, Qt.UserRole)
-            if isinstance(pointer, SignaturePointer):
-                menu = QMenu()
-                edit_action = menu.addAction("Edit Value")
-                delete_action = menu.addAction("Delete Pointer")
-                action = menu.exec_(self.pointer_tree.viewport().mapToGlobal(position))
-
-                if action == edit_action:
-                    self.edit_pointer_value(pointer, item)
-                elif action == delete_action:
-                    self.delete_pointer(pointer, item)
-
-    def edit_pointer_value(self, pointer, item):
-        """Open dialog to edit pointer value"""
-        if not self.parent_editor or self.parent_editor.current_tab_index < 0:
-            return
-
-        current_file = self.parent_editor.open_files[self.parent_editor.current_tab_index]
-        file_data = current_file.file_data
-
-        # Show input dialog
-        new_value, ok = QInputDialog.getText(
-            self,
-            "Edit Value",
-            f"Enter new value for {pointer.label} ({pointer.data_type}):",
-            text=str(pointer.value)
-        )
-
-        if ok and new_value:
-            # Convert value back to bytes
-            try:
-                new_bytes = self.value_to_bytes(new_value, pointer.data_type, pointer.length)
-                if new_bytes:
-                    # Update file data
-                    for i, byte in enumerate(new_bytes):
-                        if pointer.offset + i < len(file_data):
-                            file_data[pointer.offset + i] = byte
-
-                    # Recalculate value
-                    pointer.value = self.interpret_value(file_data, pointer.offset, pointer.length, pointer.data_type, self.string_display_mode)
-
-                    # Rebuild tree to update displayed value
-                    self.rebuild_tree()
-
-                    # Refresh hex display
-                    self.parent_editor.display_hex(preserve_scroll=True)
-                    self.status_label.setText(f"Updated value at 0x{pointer.offset:X}")
-                else:
-                    self.status_label.setText("Invalid value for type")
-            except Exception as e:
-                self.status_label.setText(f"Error: {str(e)}")
-
-    def value_to_bytes(self, value_str, data_type, length):
-        """Convert string value to bytes based on data type"""
-        # Don't allow editing N/A values
-        if value_str == "N/A":
-            return None
-
-        # Normalize to lowercase for comparison
-        dtype_lower = data_type.lower()
-
-        try:
-            if dtype_lower == "hex":
-                hex_clean = value_str.replace(" ", "")
-                return bytes.fromhex(hex_clean)[:length]
-            elif dtype_lower == "int8":
-                return struct.pack('b', int(value_str))
-            elif dtype_lower == "uint8":
-                return struct.pack('B', int(value_str))
-            elif dtype_lower == "int16 le":
-                return struct.pack('<h', int(value_str))
-            elif dtype_lower == "uint16 le":
-                return struct.pack('<H', int(value_str))
-            elif dtype_lower == "int16 be":
-                return struct.pack('>h', int(value_str))
-            elif dtype_lower == "uint16 be":
-                return struct.pack('>H', int(value_str))
-            elif dtype_lower == "int24 le":
-                val = int(value_str)
-                # Pack as int32 then take 3 bytes
-                bytes32 = struct.pack('<i', val)
-                return bytes32[:3]
-            elif dtype_lower == "uint24 le":
-                val = int(value_str)
-                bytes32 = struct.pack('<I', val)
-                return bytes32[:3]
-            elif dtype_lower == "int24 be":
-                val = int(value_str)
-                bytes32 = struct.pack('>i', val)
-                return bytes32[1:]  # Skip first byte
-            elif dtype_lower == "uint24 be":
-                val = int(value_str)
-                bytes32 = struct.pack('>I', val)
-                return bytes32[1:]  # Skip first byte
-            elif dtype_lower == "int32 le":
-                return struct.pack('<i', int(value_str))
-            elif dtype_lower == "uint32 le":
-                return struct.pack('<I', int(value_str))
-            elif dtype_lower == "int32 be":
-                return struct.pack('>i', int(value_str))
-            elif dtype_lower == "uint32 be":
-                return struct.pack('>I', int(value_str))
-            elif dtype_lower == "int64 le":
-                return struct.pack('<q', int(value_str))
-            elif dtype_lower == "uint64 le":
-                return struct.pack('<Q', int(value_str))
-            elif dtype_lower == "int64 be":
-                return struct.pack('>q', int(value_str))
-            elif dtype_lower == "uint64 be":
-                return struct.pack('>Q', int(value_str))
-            elif dtype_lower == "float32 le":
-                return struct.pack('<f', float(value_str))
-            elif dtype_lower == "float32 be":
-                return struct.pack('>f', float(value_str))
-            elif dtype_lower == "float64 le":
-                return struct.pack('<d', float(value_str))
-            elif dtype_lower == "float64 be":
-                return struct.pack('>d', float(value_str))
-            elif dtype_lower == "offset":
-                # Parse hex string and convert to bytes
-                # Example: "0207" -> bytes [0x02, 0x07]
-                hex_str = value_str.strip().upper()
-
-                # Pad to even length
-                if len(hex_str) % 2 != 0:
-                    hex_str = '0' + hex_str
-
-                # Convert hex string to bytes
-                result_bytes = bytes.fromhex(hex_str)
-
-                # Pad or truncate to match expected length
-                if len(result_bytes) < length:
-                    result_bytes += b'\x00' * (length - len(result_bytes))
-
-                return result_bytes[:length]
-            elif dtype_lower == "string":
-                # Encode string as UTF-8
-                encoded = value_str.encode('utf-8')
-                # Pad or truncate to length
-                if len(encoded) < length:
-                    encoded += b'\x00' * (length - len(encoded))
-                return encoded[:length]
-            else:
-                return None
-        except (ValueError, struct.error, OverflowError):
-            return None
-
-    def delete_pointer(self, pointer, item):
-        """Delete a pointer from the list"""
-        if pointer in self.pointers:
-            self.pointers.remove(pointer)
-        self.status_label.setText(f"Deleted pointer at 0x{pointer.offset:X}")
-
-        # Rebuild tree to update categories
-        self.rebuild_tree()
-
-        # Refresh display to remove overlay
-        if self.parent_editor:
-            self.parent_editor.display_hex(preserve_scroll=True)
-
-    def set_file_data(self, file_data: bytearray):
-        """Called when a new file is opened"""
-        self.pointers.clear()
-        self.pointer_tree.clear()
-        self.update_pointer_count()
-        self.status_label.setText("Ready")
-
-
 class FileTab:
+    """
+    Represents a single file tab in the hex editor.
+
+    Each opened file gets its own FileTab instance containing the file data and
+    all associated metadata. This allows multiple files to be open simultaneously
+    with independent edit histories, bookmarks, highlights, etc.
+
+    Features:
+    - Memory-mapped I/O for large files (>100MB)
+    - Tracks modified/inserted/replaced bytes
+    - Maintains pattern scan results and signature pointers
+    - Stores highlights and bookmarks
+    - Preserves notes attached to byte ranges
+
+    Attributes:
+        file_path (str): Absolute path to the file
+        file_data (bytearray): Raw file bytes (or mmap object for large files)
+        original_data (bytearray): Original unmodified file data (for comparison)
+        modified (bool): Whether file has unsaved changes
+        modified_bytes (set): Set of byte offsets that were modified
+        inserted_bytes (set): Set of byte offsets that were inserted
+        replaced_bytes (set): Set of byte offsets that were replaced
+        file_handle: Open file handle (used for memory-mapping)
+        mmap: Memory-mapped file object (for large files)
+        use_mmap (bool): Whether this file uses memory mapping
+        scan_results (list): Pattern scan results for this file
+        highlights (list): Byte range highlights with colors/descriptions
+        bookmarks (dict): Named bookmarks at specific offsets
+        notes (list): Notes attached to byte ranges
+    """
     def __init__(self, file_path, file_data=None, file_handle=None, use_mmap=False):
         self.file_path = file_path
         self.file_handle = file_handle
@@ -1582,11 +144,11 @@ class FileTab:
         self.use_mmap = use_mmap
 
         if use_mmap and file_handle:
-            # Memory-mapped file for large files
+            # Memory-mapped file for large files (efficient for files >100MB)
             try:
                 self.mmap = mmap.mmap(file_handle.fileno(), 0, access=mmap.ACCESS_READ)
                 self.file_data = self.mmap  # Acts like bytearray but memory-mapped
-                self.original_data = None  # Don't duplicate large files
+                self.original_data = None  # Don't duplicate large files in memory
             except:
                 # Fallback to regular loading if mmap fails
                 self.file_data = bytearray(file_data)
@@ -2349,869 +911,6 @@ class HexTextEdit(QTextEdit):
         super().mouseMoveEvent(event)
 
 
-class StatisticsWidget(QWidget):
-    """Widget for displaying file statistics with multiple graph types"""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.file_data = None
-        self.current_graph_index = 0
-        self.parent_editor = None  # Will be set by main editor
-        self.graph_types = [
-            "Byte Distribution Throughout File",
-            "ASCII Character Frequency",
-            "High/Low Nibble Distribution",
-            "Overall Entropy",
-            "Magic Numbers / Pointers"
-        ]
-        self.setup_ui()
-
-    def setup_ui(self):
-        layout = QVBoxLayout()
-        layout.setContentsMargins(5, 5, 5, 5)
-
-        # Title
-        title = QLabel("File Statistics")
-        title.setFont(QFont("Arial", 11, QFont.Bold))
-        layout.addWidget(title)
-
-        if MATPLOTLIB_AVAILABLE:
-            # Graph area with canvas
-            self.figure = Figure(figsize=(5, 4), dpi=100, facecolor='#2d2d30')
-            self.canvas = FigureCanvas(self.figure)
-            self.canvas.setMinimumHeight(250)
-            layout.addWidget(self.canvas)
-
-            # Hover info label (for ASCII character graph)
-            self.hover_info_label = QLabel("")
-            self.hover_info_label.setAlignment(Qt.AlignCenter)
-            self.hover_info_label.setFont(QFont("Arial", 9))
-            self.hover_info_label.setMinimumHeight(20)
-            self.hover_info_label.setStyleSheet("color: #e5c07b; padding: 5px;")
-            layout.addWidget(self.hover_info_label)
-
-            # Pointer filter and list (only visible for magic numbers graph)
-            self.pointer_controls_widget = QWidget()
-            pointer_controls_layout = QVBoxLayout()
-            pointer_controls_layout.setContentsMargins(0, 5, 0, 5)
-
-            # Filter dropdown
-            filter_layout = QHBoxLayout()
-            filter_label = QLabel("Filter:")
-            filter_label.setFont(QFont("Arial", 9))
-            filter_layout.addWidget(filter_label)
-
-            self.pointer_filter_combo = QComboBox()
-            self.pointer_filter_combo.setFont(QFont("Arial", 9))
-            self.pointer_filter_combo.currentTextChanged.connect(self.on_pointer_filter_changed)
-            filter_layout.addWidget(self.pointer_filter_combo)
-            filter_layout.addStretch()
-            pointer_controls_layout.addLayout(filter_layout)
-
-            # Pointer list
-            self.pointer_list = QListWidget()
-            self.pointer_list.setFont(QFont("Courier", 8))
-            self.pointer_list.setMaximumHeight(150)
-            self.pointer_list.itemClicked.connect(self.on_pointer_list_clicked)
-            self.pointer_list.itemEntered.connect(self.on_pointer_list_hovered)
-            self.pointer_list.setMouseTracking(True)
-            pointer_controls_layout.addWidget(self.pointer_list)
-
-            self.pointer_controls_widget.setLayout(pointer_controls_layout)
-            self.pointer_controls_widget.hide()  # Hidden by default
-            layout.addWidget(self.pointer_controls_widget)
-
-            # Graph navigation
-            nav_layout = QHBoxLayout()
-            self.prev_graph_btn = QPushButton("◄ Previous")
-            self.prev_graph_btn.clicked.connect(self.prev_graph)
-            nav_layout.addWidget(self.prev_graph_btn)
-
-            self.graph_label = QLabel(self.graph_types[0])
-            self.graph_label.setAlignment(Qt.AlignCenter)
-            self.graph_label.setFont(QFont("Arial", 9, QFont.Bold))
-            nav_layout.addWidget(self.graph_label)
-
-            self.next_graph_btn = QPushButton("Next ►")
-            self.next_graph_btn.clicked.connect(self.next_graph)
-            nav_layout.addWidget(self.next_graph_btn)
-
-            layout.addLayout(nav_layout)
-        else:
-            info_label = QLabel("Matplotlib not available. Install matplotlib for graph visualization.")
-            info_label.setWordWrap(True)
-            layout.addWidget(info_label)
-
-        # Information area (scrollable)
-        info_scroll = QScrollArea()
-        info_scroll.setWidgetResizable(True)
-        info_scroll.setMinimumHeight(200)
-
-        self.info_widget = QWidget()
-        self.info_layout = QVBoxLayout()
-        self.info_layout.setAlignment(Qt.AlignTop)
-        self.info_widget.setLayout(self.info_layout)
-        info_scroll.setWidget(self.info_widget)
-
-        layout.addWidget(info_scroll)
-
-        self.setLayout(layout)
-
-        # Install event filter for arrow key navigation
-        self.installEventFilter(self)
-
-    def eventFilter(self, obj, event):
-        """Handle arrow key navigation"""
-        if event.type() == QEvent.KeyPress:
-            if event.key() == Qt.Key_Left:
-                self.prev_graph()
-                return True
-            elif event.key() == Qt.Key_Right:
-                self.next_graph()
-                return True
-        return super().eventFilter(obj, event)
-
-    def set_file_data(self, data):
-        """Set the file data and update statistics"""
-        self.file_data = data
-        self.update_statistics()
-
-    def prev_graph(self):
-        """Show previous graph type"""
-        if not MATPLOTLIB_AVAILABLE or not self.file_data:
-            return
-        self.current_graph_index = (self.current_graph_index - 1) % len(self.graph_types)
-        self.update_statistics()
-
-    def next_graph(self):
-        """Show next graph type"""
-        if not MATPLOTLIB_AVAILABLE or not self.file_data:
-            return
-        self.current_graph_index = (self.current_graph_index + 1) % len(self.graph_types)
-        self.update_statistics()
-
-    def update_statistics(self):
-        """Update both graph and information areas"""
-        if not self.file_data:
-            self.clear_info()
-            return
-
-        # Update graph
-        if MATPLOTLIB_AVAILABLE:
-            self.graph_label.setText(self.graph_types[self.current_graph_index])
-            self.hover_info_label.setText("")  # Clear hover info when switching graphs
-            self.figure.clear()
-            ax = self.figure.add_subplot(111)
-
-            # Show/hide pointer controls based on current graph
-            if self.current_graph_index == 4:  # Magic Numbers/Pointers graph
-                self.pointer_controls_widget.show()
-            else:
-                self.pointer_controls_widget.hide()
-
-            if self.current_graph_index == 0:
-                self.plot_byte_distribution_throughout_file(ax)
-            elif self.current_graph_index == 1:
-                self.plot_ascii_character_frequency(ax)
-            elif self.current_graph_index == 2:
-                self.plot_nibble_distribution(ax)
-            elif self.current_graph_index == 3:
-                self.plot_overall_entropy(ax)
-            elif self.current_graph_index == 4:
-                self.plot_magic_numbers_pointers(ax)
-
-            self.canvas.draw()
-
-        # Update information area
-        self.update_info()
-
-
-    def plot_nibble_distribution(self, ax):
-        """Plot high and low nibble distribution"""
-        high_nibbles = Counter()
-        low_nibbles = Counter()
-
-        for byte in self.file_data:
-            high_nibbles[byte >> 4] += 1
-            low_nibbles[byte & 0x0F] += 1
-
-        x = range(16)
-        high_freq = [high_nibbles.get(i, 0) for i in x]
-        low_freq = [low_nibbles.get(i, 0) for i in x]
-
-        width = 0.35
-        x_pos = [i - width/2 for i in x]
-        x_pos2 = [i + width/2 for i in x]
-
-        ax.bar(x_pos, high_freq, width, label='High Nibble', color='#c678dd')
-        ax.bar(x_pos2, low_freq, width, label='Low Nibble', color='#56b6c2')
-        ax.set_xlabel('Nibble Value', color='#abb2bf')
-        ax.set_ylabel('Frequency', color='#abb2bf')
-        ax.set_title('High/Low Nibble Distribution', color='#abb2bf')
-        ax.set_xticks(x)
-        ax.legend()
-        ax.set_facecolor('#21252b')
-        ax.tick_params(colors='#abb2bf')
-        for spine in ax.spines.values():
-            spine.set_color('#3e4451')
-
-    def plot_byte_distribution_throughout_file(self, ax):
-        """Plot byte value distribution throughout file - each byte on its own line"""
-        # Determine range based on parent editor setting
-        max_byte = 256  # Always show full range including extended ASCII
-
-        # Sample the file for performance (max 10000 samples)
-        max_samples = 10000
-        if len(self.file_data) > max_samples:
-            step = len(self.file_data) // max_samples
-            sampled_positions = range(0, len(self.file_data), step)
-            sampled_data = [(pos, self.file_data[pos]) for pos in sampled_positions if self.file_data[pos] < max_byte]
-        else:
-            sampled_data = [(i, byte) for i, byte in enumerate(self.file_data) if byte < max_byte]
-
-        # Separate into x (position) and y (byte value)
-        if sampled_data:
-            positions, byte_values = zip(*sampled_data)
-
-            # Create scatter plot with small points
-            scatter = ax.scatter(positions, byte_values, s=1, c='#61afef', alpha=0.5, picker=True)
-            ax.set_xlabel('File Position', color='#abb2bf')
-            ax.set_ylabel('Byte Value', color='#abb2bf')
-
-            # Title and y-axis for full byte range (0-255)
-            ax.set_title('Byte Distribution Throughout File (0-255)', color='#abb2bf')
-            ax.set_ylim(-5, 260)
-            ax.set_yticks([0, 64, 128, 192, 255])
-            ax.set_facecolor('#21252b')
-            ax.tick_params(colors='#abb2bf')
-            for spine in ax.spines.values():
-                spine.set_color('#3e4451')
-
-            # Add interactivity - show byte value on hover
-            def on_hover(event):
-                if event.inaxes == ax:
-                    # Find closest point to mouse
-                    if event.xdata is not None and event.ydata is not None:
-                        # Calculate distance to all points
-                        x_range = ax.get_xlim()[1] - ax.get_xlim()[0]
-                        y_range = ax.get_ylim()[1] - ax.get_ylim()[0]
-
-                        # Normalize coordinates for distance calculation
-                        distances = []
-                        for i, (px, py) in enumerate(zip(positions, byte_values)):
-                            norm_dx = (px - event.xdata) / x_range
-                            norm_dy = (py - event.ydata) / y_range
-                            dist = norm_dx**2 + norm_dy**2
-                            distances.append((dist, i))
-
-                        # Find closest point
-                        distances.sort()
-                        if distances and distances[0][0] < 0.001:  # Threshold for hovering
-                            closest_idx = distances[0][1]
-                            pos = positions[closest_idx]
-                            byte_val = byte_values[closest_idx]
-
-                            # Create label based on byte value
-                            # Standard control character names
-                            control_chars = {
-                                0: 'NUL', 1: 'SOH', 2: 'STX', 3: 'ETX', 4: 'EOT', 5: 'ENQ', 6: 'ACK', 7: 'BEL',
-                                8: 'BS', 9: 'TAB', 10: 'LF', 11: 'VT', 12: 'FF', 13: 'CR', 14: 'SO', 15: 'SI',
-                                16: 'DLE', 17: 'DC1', 18: 'DC2', 19: 'DC3', 20: 'DC4', 21: 'NAK', 22: 'SYN', 23: 'ETB',
-                                24: 'CAN', 25: 'EM', 26: 'SUB', 27: 'ESC', 28: 'FS', 29: 'GS', 30: 'RS', 31: 'US',
-                                127: 'DEL'
-                            }
-
-                            if 32 <= byte_val <= 126:  # Printable ASCII
-                                char_display = f"'{chr(byte_val)}'"
-                            elif byte_val in control_chars:
-                                char_display = control_chars[byte_val]
-                            elif 160 <= byte_val <= 255:  # Extended ASCII (printable)
-                                char_display = f"'{chr(byte_val)}'"
-                            else:
-                                char_display = f"\\x{byte_val:02x}"
-
-                            label_text = f"Position: 0x{pos:x} ({pos})  •  Byte: {byte_val} (0x{byte_val:02x}) {char_display}"
-                            self.hover_info_label.setText(label_text)
-                            return
-
-                    # No point hovered
-                    self.hover_info_label.setText("")
-
-            # Connect hover event
-            self.canvas.mpl_connect('motion_notify_event', on_hover)
-
-            # Add click event to jump to byte position
-            def on_pick(event):
-                if event.mouseevent.inaxes == ax and hasattr(self, 'parent_editor') and self.parent_editor:
-                    # Get the index of the clicked point
-                    if len(event.ind) > 0:
-                        idx = event.ind[0]
-                        clicked_position = positions[idx]
-
-                        # Navigate the editor to this position
-                        self.parent_editor.cursor_position = clicked_position
-                        self.parent_editor.cursor_nibble = 0
-                        self.parent_editor.scroll_to_offset(clicked_position)
-                        self.parent_editor.display_hex(preserve_scroll=True)
-                        self.parent_editor.update_data_inspector()
-
-            # Connect click event
-            self.canvas.mpl_connect('pick_event', on_pick)
-
-    def plot_ascii_character_frequency(self, ax):
-        """Plot frequency of ASCII characters with interactive hover"""
-        # Determine range based on parent editor setting
-        max_char = 256  # Always show full range including extended ASCII
-
-        # Count characters in the appropriate range
-        char_counts = [0] * max_char
-        for byte in self.file_data:
-            if byte < max_char:
-                char_counts[byte] += 1
-
-        # Show ALL characters in range
-        chars = list(range(max_char))
-        counts = char_counts
-
-        if chars:
-            # Use chars and counts directly
-
-            # Create character labels for tooltip
-            def get_char_label(char_code):
-                # Standard control character names
-                control_chars = {
-                    0: 'NUL', 1: 'SOH', 2: 'STX', 3: 'ETX', 4: 'EOT', 5: 'ENQ', 6: 'ACK', 7: 'BEL',
-                    8: 'BS', 9: 'TAB', 10: 'LF', 11: 'VT', 12: 'FF', 13: 'CR', 14: 'SO', 15: 'SI',
-                    16: 'DLE', 17: 'DC1', 18: 'DC2', 19: 'DC3', 20: 'DC4', 21: 'NAK', 22: 'SYN', 23: 'ETB',
-                    24: 'CAN', 25: 'EM', 26: 'SUB', 27: 'ESC', 28: 'FS', 29: 'GS', 30: 'RS', 31: 'US',
-                    127: 'DEL'
-                }
-
-                if 32 <= char_code <= 126:  # Printable ASCII
-                    return f"'{chr(char_code)}' (Byte {char_code})"
-                elif char_code in control_chars:
-                    return f'{control_chars[char_code]} (Byte {char_code})'
-                elif 160 <= char_code <= 255:  # Extended ASCII (printable)
-                    return f"'{chr(char_code)}' (Byte {char_code})"
-                else:
-                    return f'\\x{char_code:02x} (Byte {char_code})'
-
-            x = range(len(chars))
-            bars = ax.bar(x, counts, color='#98c379', edgecolor='#98c379', linewidth=1)
-
-            # Title for full byte range (0-255)
-            ax.set_xlabel('Byte Characters', color='#abb2bf')
-            ax.set_ylabel('Frequency', color='#abb2bf')
-            ax.set_title('Byte Character Frequency (0-255) - Hover for details', color='#abb2bf')
-            ax.set_xticks([])  # Remove x-axis labels
-            ax.set_facecolor('#21252b')
-            ax.tick_params(colors='#abb2bf')
-            for spine in ax.spines.values():
-                spine.set_color('#3e4451')
-
-            # Store hover state
-            self.hover_bar_index = None
-
-            def on_hover(event):
-                if event.inaxes == ax and event.xdata is not None:
-                    # Determine which bar segment we're hovering over based on x-position
-                    bar_index = int(round(event.xdata))
-
-                    # Check if the bar index is valid
-                    if 0 <= bar_index < len(bars):
-                        # Highlight this bar
-                        if self.hover_bar_index != bar_index:
-                            # Reset all bars
-                            for b in bars:
-                                b.set_color('#98c379')
-                                b.set_edgecolor('#98c379')
-                                b.set_linewidth(1)
-
-                            # Highlight current bar
-                            bars[bar_index].set_color('#61afef')
-                            bars[bar_index].set_edgecolor('#61afef')
-                            bars[bar_index].set_linewidth(2)
-
-                            # Update label
-                            char_code = chars[bar_index]
-                            count = counts[bar_index]
-                            label = get_char_label(char_code)
-                            self.hover_info_label.setText(f"{label}  •  Count: {count}")
-
-                            self.hover_bar_index = bar_index
-                            self.canvas.draw_idle()
-                        return
-
-                # No bar hovered - reset if needed
-                if self.hover_bar_index is not None:
-                    for b in bars:
-                        b.set_color('#98c379')
-                        b.set_edgecolor('#98c379')
-                        b.set_linewidth(1)
-                    self.hover_info_label.setText("")
-                    self.hover_bar_index = None
-                    self.canvas.draw_idle()
-
-            # Connect hover event
-            self.canvas.mpl_connect('motion_notify_event', on_hover)
-
-    def plot_overall_entropy(self, ax):
-        """Plot overall entropy visualization with metrics"""
-        # Calculate overall entropy
-        overall_entropy = self.calculate_entropy(self.file_data)
-
-        # Calculate entropy for different block sizes to show distribution
-        block_sizes = [256, 1024, 4096]
-        block_entropies = {}
-
-        for block_size in block_sizes:
-            entropies = []
-            for i in range(0, len(self.file_data), block_size):
-                block = self.file_data[i:i+block_size]
-                if block:
-                    entropies.append(self.calculate_entropy(block))
-            if entropies:
-                block_entropies[block_size] = {
-                    'mean': sum(entropies) / len(entropies),
-                    'min': min(entropies),
-                    'max': max(entropies)
-                }
-
-        # Create bar chart showing entropy metrics
-        categories = ['Overall', '256-byte\nblocks', '1KB\nblocks', '4KB\nblocks']
-        values = [overall_entropy]
-        colors = ['#e06c75']
-
-        for block_size in block_sizes:
-            if block_size in block_entropies:
-                values.append(block_entropies[block_size]['mean'])
-                colors.append('#61afef')
-
-        # Ensure we only plot valid data
-        categories = categories[:len(values)]
-
-        x = range(len(values))
-        bars = ax.bar(x, values, color=colors, edgecolor=colors, linewidth=2)
-
-        ax.set_ylabel('Entropy (bits)', color='#abb2bf')
-        ax.set_title('Entropy Analysis', color='#abb2bf')
-        ax.set_xticks(x)
-        ax.set_xticklabels(categories, color='#abb2bf')
-        ax.set_ylim(0, 8)
-        ax.axhline(y=7, color='#98c379', linestyle='--', linewidth=1, alpha=0.5, label='High entropy (≥7 bits)')
-        ax.legend()
-        ax.set_facecolor('#21252b')
-        ax.tick_params(colors='#abb2bf')
-        for spine in ax.spines.values():
-            spine.set_color('#3e4451')
-
-        # Add value labels on bars
-        for i, (bar, value) in enumerate(zip(bars, values)):
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height,
-                   f'{value:.2f}',
-                   ha='center', va='bottom', color='#abb2bf', fontsize=9)
-
-    def plot_magic_numbers_pointers(self, ax):
-        """Plot magic numbers and pointers throughout file as colored dots"""
-        # Get pointers from signature widget if available
-        pointers = []
-        if self.parent_editor and hasattr(self.parent_editor, 'signature_widget'):
-            pointers = self.parent_editor.signature_widget.pointers
-
-        # Store pointers for event handlers
-        self.current_pointers = pointers
-        self.current_pointer_filter = None
-
-        if not pointers:
-            # Show empty graph with message
-            ax.text(0.5, 0.5, 'No pointers defined\n\nAdd pointers in the Pointers tab to visualize them here',
-                   ha='center', va='center', transform=ax.transAxes,
-                   color='#abb2bf', fontsize=11, style='italic')
-            ax.set_facecolor('#21252b')
-            ax.set_title('Magic Numbers / Pointers Distribution', color='#abb2bf')
-            ax.set_xticks([])
-            ax.set_yticks([])
-            for spine in ax.spines.values():
-                spine.set_color('#3e4451')
-
-            # Clear list and filter
-            self.pointer_list.clear()
-            self.pointer_filter_combo.clear()
-            return
-
-        # Group pointers by pattern to assign colors
-        pattern_groups = {}
-        selection_pointers = []
-
-        for pointer in pointers:
-            # Check if this is a selection-based pointer (custom category, selection label)
-            is_selection = (hasattr(pointer, 'category') and pointer.category == "Custom" and
-                          hasattr(pointer, 'label') and pointer.label.startswith("Selection_"))
-
-            if is_selection:
-                selection_pointers.append(pointer)
-            else:
-                pattern = pointer.pattern if hasattr(pointer, 'pattern') and pointer.pattern else b''
-                # Convert pattern to hex string for grouping
-                if isinstance(pattern, (bytes, bytearray)) and len(pattern) > 0:
-                    pattern_key = ' '.join(f'{b:02X}' for b in pattern)
-                else:
-                    # Fallback for pointers without pattern - group by category
-                    pattern_key = f"Unknown ({pointer.category if hasattr(pointer, 'category') else 'Custom'})"
-
-                if pattern_key not in pattern_groups:
-                    pattern_groups[pattern_key] = []
-                pattern_groups[pattern_key].append(pointer)
-
-        # Add selection pointers as their own group
-        if selection_pointers:
-            pattern_groups["Selection"] = selection_pointers
-
-        # Store pattern groups for filtering
-        self.pattern_groups = pattern_groups
-
-        # Assign colors to each pattern
-        color_palette = ['#e06c75', '#61afef', '#98c379', '#e5c07b', '#c678dd', '#56b6c2', '#d19a66']
-        pattern_colors = {}
-        for i, pattern_key in enumerate(pattern_groups.keys()):
-            pattern_colors[pattern_key] = color_palette[i % len(color_palette)]
-
-        self.pattern_colors = pattern_colors
-
-        # Update filter dropdown - preserve current selection
-        current_filter = self.pointer_filter_combo.currentText() if self.pointer_filter_combo.count() > 0 else "All"
-
-        self.pointer_filter_combo.blockSignals(True)
-        self.pointer_filter_combo.clear()
-        self.pointer_filter_combo.addItem("All")
-
-        # Add "Selection" first if it exists
-        if "Selection" in pattern_groups:
-            self.pointer_filter_combo.addItem("Selection")
-
-        # Add other patterns sorted
-        other_patterns = sorted([k for k in pattern_groups.keys() if k != "Selection"])
-        for pattern_key in other_patterns:
-            self.pointer_filter_combo.addItem(pattern_key)
-
-        # Restore previous filter selection if it still exists
-        filter_index = self.pointer_filter_combo.findText(current_filter)
-        if filter_index >= 0:
-            self.pointer_filter_combo.setCurrentIndex(filter_index)
-        else:
-            self.pointer_filter_combo.setCurrentIndex(0)  # Default to "All"
-
-        self.pointer_filter_combo.blockSignals(False)
-
-        # Determine which pointers to show based on filter
-        current_filter = self.pointer_filter_combo.currentText()
-        if current_filter == "All":
-            pointers_to_show = pointers
-        else:
-            pointers_to_show = pattern_groups.get(current_filter, [])
-
-        # Plot each pointer as a dot (byte distribution style)
-        file_length = len(self.file_data)
-
-        for pattern_key, group_pointers in pattern_groups.items():
-            # Skip if filtering and this isn't the selected pattern
-            if current_filter != "All" and pattern_key != current_filter:
-                continue
-
-            positions = []
-            byte_values = []
-
-            for pointer in group_pointers:
-                # Get position
-                pos = pointer.offset if hasattr(pointer, 'offset') else 0
-
-                # Get byte value at position
-                if 0 <= pos < file_length:
-                    byte_val = self.file_data[pos]
-                    positions.append(pos)
-                    byte_values.append(byte_val)
-
-            # Plot this pattern group with smaller dots like byte distribution
-            if positions:
-                ax.scatter(positions, byte_values, s=1, c=pattern_colors[pattern_key],
-                          alpha=0.5, picker=True)
-
-        ax.set_xlabel('File Position', color='#abb2bf')
-        ax.set_ylabel('Byte Value', color='#abb2bf')
-        ax.set_title('Magic Numbers / Pointers Distribution', color='#abb2bf')
-        ax.set_ylim(-5, 260)
-        ax.set_yticks([0, 64, 128, 192, 255])
-        ax.set_facecolor('#21252b')
-        ax.tick_params(colors='#abb2bf')
-        for spine in ax.spines.values():
-            spine.set_color('#3e4451')
-
-        # Populate pointer list
-        self.pointer_list.clear()
-        for pointer in pointers_to_show:
-            pos = pointer.offset if hasattr(pointer, 'offset') else 0
-            label = pointer.label if hasattr(pointer, 'label') and pointer.label else 'Unknown'
-            byte_val = self.file_data[pos] if 0 <= pos < file_length else 0
-
-            # Get pattern and pattern key
-            pattern = pointer.pattern if hasattr(pointer, 'pattern') else ''
-            if isinstance(pattern, (bytes, bytearray)):
-                pattern_str = ' '.join(f'{b:02X}' for b in pattern[:4])
-                pattern_key = ' '.join(f'{b:02X}' for b in pattern)
-                if len(pattern) > 4:
-                    pattern_str += '...'
-            else:
-                pattern_str = str(pattern)[:12]
-                pattern_key = str(pattern)
-
-            # Create list item with color indicator
-            list_text = f"[{label}] 0x{pos:06X} | {pattern_str}"
-            item = QListWidgetItem(list_text)
-            item.setData(Qt.UserRole, pointer)  # Store pointer object
-
-            # Set text color based on pattern
-            if pattern_key in self.pattern_colors:
-                item.setForeground(QColor(self.pattern_colors[pattern_key]))
-
-            self.pointer_list.addItem(item)
-
-        # Add interactivity - show pointer info on hover
-        def on_hover(event):
-            if event.inaxes == ax and event.xdata is not None:
-                # Find closest pointer
-                closest_pointer = None
-                min_distance = float('inf')
-
-                for pointer in pointers:
-                    pos = pointer.offset if hasattr(pointer, 'offset') else 0
-                    if 0 <= pos < file_length:
-                        byte_val = self.file_data[pos]
-
-                        # Normalize coordinates
-                        x_range = ax.get_xlim()[1] - ax.get_xlim()[0]
-                        y_range = ax.get_ylim()[1] - ax.get_ylim()[0]
-                        norm_dx = (pos - event.xdata) / x_range
-                        norm_dy = (byte_val - event.ydata) / y_range
-                        dist = norm_dx**2 + norm_dy**2
-
-                        if dist < min_distance:
-                            min_distance = dist
-                            closest_pointer = pointer
-
-                if closest_pointer and min_distance < 0.001:
-                    pos = closest_pointer.offset if hasattr(closest_pointer, 'offset') else 0
-                    label = closest_pointer.label if hasattr(closest_pointer, 'label') and closest_pointer.label else 'Unknown'
-                    byte_val = self.file_data[pos] if 0 <= pos < file_length else 0
-
-                    # Show pointer info
-                    pattern = closest_pointer.pattern if hasattr(closest_pointer, 'pattern') else ''
-                    if isinstance(pattern, (bytes, bytearray)):
-                        pattern_str = ' '.join(f'{b:02X}' for b in pattern[:8])
-                        if len(pattern) > 8:
-                            pattern_str += '...'
-                    else:
-                        pattern_str = str(pattern)[:20]
-
-                    label_text = f"{label} @ 0x{pos:X}  •  Pattern: {pattern_str}  •  Byte: 0x{byte_val:02X}"
-                    self.hover_info_label.setText(label_text)
-                    return
-
-            # No pointer hovered
-            self.hover_info_label.setText("")
-
-        # Connect hover event
-        self.canvas.mpl_connect('motion_notify_event', on_hover)
-
-        # Add click to jump to pointer
-        def on_pick(event):
-            if event.mouseevent.inaxes == ax and self.parent_editor:
-                # Find which pointer was clicked
-                if hasattr(event, 'ind') and len(event.ind) > 0:
-                    # Count through all pointers to find the clicked one
-                    point_index = event.ind[0]
-                    current_index = 0
-
-                    for pattern_key, group_pointers in pattern_groups.items():
-                        if current_index + len(group_pointers) > point_index:
-                            clicked_pointer = group_pointers[point_index - current_index]
-                            pos = clicked_pointer.offset if hasattr(clicked_pointer, 'offset') else 0
-
-                            # Navigate editor to this position
-                            self.parent_editor.cursor_position = pos
-                            self.parent_editor.cursor_nibble = 0
-                            self.parent_editor.scroll_to_offset(pos)
-                            self.parent_editor.display_hex(preserve_scroll=True)
-                            self.parent_editor.update_data_inspector()
-                            break
-                        current_index += len(group_pointers)
-
-        # Connect click event
-        self.canvas.mpl_connect('pick_event', on_pick)
-
-    def calculate_entropy(self, data):
-        """Calculate Shannon entropy of data"""
-        if not data:
-            return 0
-        byte_counts = Counter(data)
-        entropy = 0
-        data_len = len(data)
-        for count in byte_counts.values():
-            probability = count / data_len
-            if probability > 0:
-                entropy -= probability * math.log2(probability)
-        return entropy
-
-    def on_pointer_filter_changed(self, filter_text):
-        """Handle pointer filter dropdown change"""
-        # Redraw the graph with the new filter
-        self.update_statistics()
-
-    def on_pointer_list_clicked(self, item):
-        """Handle pointer list item click - jump to offset"""
-        pointer = item.data(Qt.UserRole)
-        if pointer and self.parent_editor:
-            pos = pointer.offset if hasattr(pointer, 'offset') else 0
-
-            # Navigate editor to this position
-            self.parent_editor.cursor_position = pos
-            self.parent_editor.cursor_nibble = 0
-            self.parent_editor.scroll_to_offset(pos)
-            self.parent_editor.display_hex(preserve_scroll=True)
-            self.parent_editor.update_data_inspector()
-
-    def on_pointer_list_hovered(self, item):
-        """Handle pointer list item hover - show info"""
-        pointer = item.data(Qt.UserRole)
-        if pointer and self.file_data:
-            pos = pointer.offset if hasattr(pointer, 'offset') else 0
-            label = pointer.label if hasattr(pointer, 'label') and pointer.label else 'Unknown'
-            byte_val = self.file_data[pos] if 0 <= pos < len(self.file_data) else 0
-
-            # Show pointer info
-            pattern = pointer.pattern if hasattr(pointer, 'pattern') else ''
-            if isinstance(pattern, (bytes, bytearray)):
-                pattern_str = ' '.join(f'{b:02X}' for b in pattern[:8])
-                if len(pattern) > 8:
-                    pattern_str += '...'
-            else:
-                pattern_str = str(pattern)[:20]
-
-            label_text = f"{label} @ 0x{pos:X}  •  Pattern: {pattern_str}  •  Byte: 0x{byte_val:02X}"
-            self.hover_info_label.setText(label_text)
-
-    def update_plots(self):
-        """Convenience method to update plots (called from toggle)"""
-        self.update_statistics()
-
-    def update_info(self):
-        """Update information area with statistics"""
-        # Clear previous info
-        self.clear_info()
-
-        if not self.file_data:
-            return
-
-        # Calculate statistics
-        byte_counts = Counter(self.file_data)
-        total_bytes = len(self.file_data)
-
-        # File size
-        self.add_info_item("File Size", f"{total_bytes:,} bytes")
-
-        # Top 5 most common bytes
-        most_common = byte_counts.most_common(5)
-        self.add_info_section("Most Common Bytes:")
-        for byte_val, count in most_common:
-            percentage = (count / total_bytes) * 100
-            self.add_info_item(f"  0x{byte_val:02X}", f"{count:,} ({percentage:.2f}%)")
-
-        # Null byte count
-        null_count = byte_counts.get(0, 0)
-        null_percentage = (null_count / total_bytes) * 100
-        self.add_info_item("Null Bytes (0x00)", f"{null_count:,} ({null_percentage:.2f}%)")
-
-        # Printable vs non-printable
-        printable_count = sum(count for byte_val, count in byte_counts.items()
-                             if (32 <= byte_val <= 126) or (160 <= byte_val <= 255))
-        non_printable_count = total_bytes - printable_count
-        printable_percentage = (printable_count / total_bytes) * 100
-        self.add_info_item("Printable Bytes", f"{printable_count:,} ({printable_percentage:.2f}%)")
-        self.add_info_item("Non-Printable Bytes", f"{non_printable_count:,} ({100-printable_percentage:.2f}%)")
-
-        # High/Low nibble distribution
-        high_nibbles = Counter(byte >> 4 for byte in self.file_data)
-        low_nibbles = Counter(byte & 0x0F for byte in self.file_data)
-        self.add_info_section("Nibble Distribution:")
-        self.add_info_item("  Most common high nibble", f"0x{high_nibbles.most_common(1)[0][0]:X}")
-        self.add_info_item("  Most common low nibble", f"0x{low_nibbles.most_common(1)[0][0]:X}")
-
-        # Entropy
-        entropy = self.calculate_entropy(self.file_data)
-        self.add_info_item("Overall Entropy", f"{entropy:.4f} bits")
-
-        # Repeated sequences
-        self.detect_repeated_sequences()
-
-    def detect_repeated_sequences(self):
-        """Detect repeated byte sequences"""
-        if len(self.file_data) < 4:
-            return
-
-        self.add_info_section("Repeated Sequences:")
-
-        # Look for repeated 4-byte sequences
-        sequences = Counter()
-        for i in range(len(self.file_data) - 3):
-            seq = bytes(self.file_data[i:i+4])
-            if seq != b'\x00\x00\x00\x00':  # Skip null sequences
-                sequences[seq] += 1
-
-        most_repeated = [(seq, count) for seq, count in sequences.most_common(3) if count > 1]
-
-        if most_repeated:
-            for seq, count in most_repeated:
-                hex_str = ' '.join(f'{b:02X}' for b in seq)
-                self.add_info_item(f"  {hex_str}", f"appears {count} times")
-        else:
-            self.add_info_item("  No significant patterns", "detected")
-
-    def add_info_section(self, title):
-        """Add a section header to info area"""
-        label = QLabel(title)
-        label.setFont(QFont("Arial", 9, QFont.Bold))
-        label.setStyleSheet("margin-top: 10px;")
-        self.info_layout.addWidget(label)
-
-    def add_info_item(self, label_text, value_text):
-        """Add an info item to info area"""
-        item_layout = QHBoxLayout()
-
-        label = QLabel(label_text + ":")
-        label.setFont(QFont("Arial", 9))
-        label.setMinimumWidth(180)
-        item_layout.addWidget(label)
-
-        value = QLabel(value_text)
-        value.setFont(QFont("Courier", 9))
-        item_layout.addWidget(value)
-
-        item_layout.addStretch()
-        self.info_layout.addLayout(item_layout)
-
-    def clear_info(self):
-        """Clear all info items"""
-        while self.info_layout.count():
-            item = self.info_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-            elif item.layout():
-                while item.layout().count():
-                    subitem = item.layout().takeAt(0)
-                    if subitem.widget():
-                        subitem.widget().deleteLater()
-
-
 class SmartPasteDialog(QDialog):
     """Dialog for handling paste size mismatches over selections"""
 
@@ -3283,15 +982,11 @@ class SmartPasteDialog(QDialog):
 
             layout.addSpacing(10)
 
-            # Options
-            options_label = QLabel("Choose an option:")
-            options_label.setFont(QFont("Arial", 9, QFont.Bold))
-            layout.addWidget(options_label)
-
-            self.pad_radio = QRadioButton("Fill with padding")
-            self.pad_radio.setChecked(True)
-            self.pad_radio.toggled.connect(self.update_padding_controls)
-            layout.addWidget(self.pad_radio)
+            # Checkbox for fill padding
+            self.pad_checkbox = QCheckBox("Fill with padding")
+            self.pad_checkbox.setChecked(False)  # Unchecked by default (ignore mode)
+            self.pad_checkbox.toggled.connect(self.update_padding_controls)
+            layout.addWidget(self.pad_checkbox)
 
             # Padding controls
             padding_container = QWidget()
@@ -3333,10 +1028,7 @@ class SmartPasteDialog(QDialog):
             padding_container.setLayout(padding_layout)
             layout.addWidget(padding_container)
             self.padding_container = padding_container
-
-            self.ignore_radio = QRadioButton("Ignore: Paste bytes normally without padding")
-            self.ignore_radio.toggled.connect(self.update_padding_controls)
-            layout.addWidget(self.ignore_radio)
+            padding_container.setEnabled(False)  # Disabled by default since checkbox is unchecked
 
         layout.addSpacing(10)
 
@@ -3358,9 +1050,9 @@ class SmartPasteDialog(QDialog):
         self.setLayout(layout)
 
     def update_padding_controls(self):
-        """Enable/disable padding controls based on selection"""
+        """Enable/disable padding controls based on checkbox"""
         if hasattr(self, 'padding_container'):
-            enabled = self.pad_radio.isChecked()
+            enabled = self.pad_checkbox.isChecked() if hasattr(self, 'pad_checkbox') else False
             self.padding_container.setEnabled(enabled)
 
     def update_custom_input(self):
@@ -3378,9 +1070,7 @@ class SmartPasteDialog(QDialog):
                 self.result = 'ignore'
         else:
             # Paste is smaller
-            if self.ignore_radio.isChecked():
-                self.result = 'ignore'
-            else:
+            if self.pad_checkbox.isChecked():
                 # Padding selected
                 self.result = 'pad'
 
@@ -3406,6 +1096,9 @@ class SmartPasteDialog(QDialog):
                     except ValueError as e:
                         QMessageBox.warning(self, "Invalid Input", f"Invalid hex pattern: {e}")
                         return
+            else:
+                # Checkbox unchecked = ignore mode
+                self.result = 'ignore'
 
         self.accept()
 
@@ -3668,7 +1361,7 @@ class SegmentOverlay(QWidget):
 
         # Use a bold grey line
         pen = QPen(self.line_color)
-        pen.setWidth(1)
+        pen.setWidth(2)
         painter.setPen(pen)
 
         # Calculate positions for segment lines
@@ -3694,6 +1387,126 @@ class SegmentOverlay(QWidget):
                 print(f"  overlay width={self.width()}, spacing_multiplier={self.spacing_multiplier}")
 
             # Draw line from top to bottom
+            painter.drawLine(x, 0, x, self.height())
+
+
+
+class EditBoxOverlay(QWidget):
+    """Overlay widget to draw an edit box around highlighted bytes during typing"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setStyleSheet("background: transparent;")
+        self.edit_box_rect = None  # QRect for the edit box
+        self.theme_colors = {}
+        self.visible_box = False
+
+    def set_edit_box(self, rect):
+        """Set the rectangle for the edit box"""
+        self.edit_box_rect = rect
+        self.visible_box = rect is not None
+        self.update()
+
+    def clear_edit_box(self):
+        """Clear the edit box"""
+        self.edit_box_rect = None
+        self.visible_box = False
+        self.update()
+
+    def set_theme_colors(self, colors):
+        """Set theme colors for drawing"""
+        self.theme_colors = colors
+
+    def paintEvent(self, event):
+        """Draw the edit box"""
+        if not self.visible_box or self.edit_box_rect is None:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Get border color from theme
+        border_color = QColor(self.theme_colors.get('button_bg', '#0e639c'))
+        border_color.setAlpha(255)
+
+        # Draw thick border around edit box
+        pen = QPen(border_color, 3, Qt.SolidLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(self.edit_box_rect)
+
+        # Draw semi-transparent fill
+        fill_color = QColor(self.theme_colors.get('selection_bg', '#264f78'))
+        fill_color.setAlpha(30)
+        painter.fillRect(self.edit_box_rect, fill_color)
+
+
+class BoundaryOverlay(QWidget):
+    """Overlay widget to draw vertical lines at column boundaries"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setStyleSheet("background: transparent;")
+        self.boundary_enabled = False
+        self.boundary_start_col = 0
+        self.boundary_end_col = 15
+        self.theme_colors = {}
+        self.char_width = 10
+        self.padding_offset = 0
+        self.leading_spaces = 0
+        self.bytes_per_row = 16
+
+    def set_boundaries(self, enabled, start_col, end_col):
+        """Set boundary columns"""
+        self.boundary_enabled = enabled
+        self.boundary_start_col = start_col
+        self.boundary_end_col = end_col
+        self.update()
+
+    def set_display_params(self, char_width, padding_offset, leading_spaces, bytes_per_row):
+        """Set display parameters for calculating line positions"""
+        self.char_width = char_width
+        self.padding_offset = padding_offset
+        self.leading_spaces = leading_spaces
+        self.bytes_per_row = bytes_per_row
+        self.update()
+
+    def set_theme_colors(self, colors):
+        """Set theme colors for drawing"""
+        self.theme_colors = colors
+        self.update()
+
+    def paintEvent(self, event):
+        """Draw boundary lines"""
+        if not self.boundary_enabled:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Use same color as edit box border
+        border_color = QColor(self.theme_colors.get('button_bg', '#0e639c'))
+        border_color.setAlpha(255)
+
+        pen = QPen(border_color, 3, Qt.SolidLine)
+        painter.setPen(pen)
+
+        # Calculate x positions for boundary lines
+        # Each hex byte takes 3 characters: "XX "
+        bytes_per_char = 3
+
+        # Draw line at start boundary (left side of start column) only if not at column 0
+        if self.boundary_start_col > 0:
+            base_x = self.padding_offset + self.leading_spaces * self.char_width + self.boundary_start_col * bytes_per_char * self.char_width
+            x = round(base_x - 4.0)  # Adjust spacing
+            painter.drawLine(x, 0, x, self.height())
+
+        # Draw line at end boundary (right side of end column) only if not at column 0x0F (15)
+        if self.boundary_end_col < 15:
+            base_x = self.padding_offset + self.leading_spaces * self.char_width + (self.boundary_end_col + 1) * bytes_per_char * self.char_width
+            x = round(base_x - 4.0)  # Adjust spacing
             painter.drawLine(x, 0, x, self.height())
 
 
@@ -3756,7 +1569,165 @@ class GradientWidget(QWidget):
             painter.end()
 
 
+class DebugOutputRedirector:
+    def __init__(self, text_widget):
+        self.text_widget = text_widget
+        self.buffer = []
+
+    def write(self, text):
+        if text and text.strip():
+            self.buffer.append(text)
+            QMetaObject.invokeMethod(
+                self.text_widget,
+                "append",
+                Qt.QueuedConnection,
+                Q_ARG(str, text.rstrip())
+            )
+
+    def flush(self):
+        pass
+
+
+class DebugWindow(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Debugging Console")
+        self.setMinimumSize(800, 600)
+        self.parent_editor = parent
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        title_label = QLabel("Terminal Output")
+        title_label.setFont(QFont("Arial", 12, QFont.Bold))
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+
+        self.output_text = QTextEdit()
+        self.output_text.setReadOnly(True)
+        self.output_text.setFont(QFont("Courier", 9))
+        layout.addWidget(self.output_text)
+
+        button_layout = QHBoxLayout()
+
+        copy_button = QPushButton("Copy All")
+        copy_button.clicked.connect(self.copy_all)
+        button_layout.addWidget(copy_button)
+
+        clear_button = QPushButton("Clear")
+        clear_button.clicked.connect(self.clear_output)
+        button_layout.addWidget(clear_button)
+
+        button_layout.addStretch()
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        button_layout.addWidget(close_button)
+
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+
+        if parent and hasattr(parent, 'current_theme'):
+            self.setStyleSheet(get_theme_stylesheet(parent.current_theme))
+
+    def copy_all(self):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.output_text.toPlainText())
+
+    def clear_output(self):
+        self.output_text.clear()
+
+    def append_text(self, text):
+        self.output_text.append(text.rstrip())
+        scrollbar = self.output_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+
 class HexEditorQt(QMainWindow):
+    """
+    Main hex editor application window.
+
+    This is the primary class that orchestrates the entire hex editor application.
+    It manages the UI, file operations, editing functionality, and coordinates
+    between all sub-components.
+
+    Core Features:
+    --------------
+    File Management:
+    - Multi-file tabs with independent state
+    - Memory-mapped I/O for large files (>100MB)
+    - Save/Save As/Export functionality
+    - Recent files tracking
+    - File comparison tool
+
+    Editing:
+    - Hex and ASCII editing modes
+    - Insert/Overwrite modes
+    - Undo/Redo with state snapshots
+    - Copy/Paste with multiple formats (hex, C array, etc.)
+    - Column selection mode
+    - Smart paste with delimiter configuration
+    - Find & Replace (hex patterns, ASCII, UTF-16, regex)
+
+    Visualization:
+    - Hex + ASCII side-by-side display
+    - Configurable bytes per row (8, 16, 32, 64)
+    - Virtual scrolling for large files
+    - Syntax highlighting for modified/inserted bytes
+    - Customizable themes with gradient backgrounds
+    - Signature pointer overlays
+
+    Analysis Tools:
+    - Pattern scanner (strings, pointers, file signatures)
+    - Data inspector (interpret bytes as various types)
+    - Statistics (byte frequency, entropy)
+    - Byte distribution visualization
+    - Signature tracking with custom data types
+
+    UI Components:
+    - Tab widget for multiple files
+    - Hex display (HexTextEdit)
+    - Right panel with tabs: Pattern Scan, Signatures, Data Inspector, Statistics
+    - Status bar with offset/size info
+    - Menubar with File/Edit/View/Tools/Help
+    - Toolbar with common actions
+
+    Architecture:
+    -------------
+    The class follows a coordinator pattern where:
+    - HexEditorQt manages overall state and UI
+    - FileTab instances store per-file data
+    - Specialized widgets (PatternScanWidget, SignatureWidget, DataInspector,
+      StatisticsWidget) handle specific features
+    - HexTextEdit renders the hex display with virtual scrolling
+
+    Key Methods:
+    - open_file(): Load a file into a new tab
+    - display_hex(): Render hex+ASCII display (virtual scrolling for large files)
+    - save_file(): Write changes back to disk
+    - handle_key_press(): Process keyboard input for editing
+    - update_data_inspector(): Refresh data inspector at cursor
+    - scroll_to_offset(): Navigate to specific byte offset
+
+    Attributes:
+        open_files (list[FileTab]): List of open file tabs
+        current_tab_index (int): Index of currently active tab
+        cursor_position (int): Current cursor byte offset
+        cursor_nibble (int): Which nibble of byte is selected (0 or 1)
+        selection_start (int): Start offset of selection
+        selection_end (int): End offset of selection
+        undo_stack (list): Stack of previous file states
+        redo_stack (list): Stack of undone file states
+        bytes_per_row (int): Number of bytes per row (default 16)
+        endian_mode (str): 'little' or 'big' endian for multi-byte values
+        current_theme (str): Name of active color theme
+        hex_display (HexTextEdit): Main hex display widget
+        pattern_scan_widget (PatternScanWidget): Pattern scanning panel
+        signature_widget (SignatureWidget): Signature pointer panel
+        data_inspector (DataInspector): Data interpretation panel
+        statistics_widget (StatisticsWidget): Statistics panel
+    """
     def __init__(self):
         super().__init__()
         self.open_files = []
@@ -3784,6 +1755,10 @@ class HexEditorQt(QMainWindow):
         self.snapshot_timer.timeout.connect(self.create_snapshot)
         self.current_theme = self.load_theme_preference()
         self.notes_window = None
+        self.debug_window = None
+        self.debug_redirector = None
+        self.original_stdout = sys.stdout
+        self.original_stderr = sys.stderr
         self.bytes_per_row = 16
         self.offset_mode = 'h'  # 'h' for hex, 'd' for decimal, 'o' for octal
         self._last_inspector_pos = None
@@ -3813,6 +1788,20 @@ class HexEditorQt(QMainWindow):
 
         # Extended ASCII display option (128-255)
         self.show_extended_ascii = True  # Always show extended ASCII (128-255)
+
+        # Edit box feature
+        self.edit_box_active = False
+        self.edit_box_start = None
+        self.edit_box_end = None
+        self.edit_box_start_row = None
+        self.edit_box_start_col = None
+        self.edit_box_end_row = None
+        self.edit_box_end_col = None
+
+        # Segment boundaries feature
+        self.boundary_enabled = False
+        self.boundary_start_col = 0
+        self.boundary_end_col = 15
 
         # Segment separator (0 = none, 1, 2, 4, 8 = draw lines between segments)
         self.segment_size = 0
@@ -3897,6 +1886,17 @@ class HexEditorQt(QMainWindow):
             self.header_segment_overlay.update()
             print(f"Updated header_segment_overlay: char_width={header_char_width}, spacing_mult={spacing_mult}")
 
+        # Update boundary overlay with current display parameters
+        if hasattr(self, 'boundary_overlay') and hasattr(self, 'hex_display'):
+            font_metrics = QFontMetrics(self.hex_display.font())
+            char_width = font_metrics.horizontalAdvance('0')
+            # Use same padding as SegmentOverlay (4) for alignment
+            padding_offset = 4
+            leading_spaces = 2
+            self.boundary_overlay.set_display_params(char_width, padding_offset, leading_spaces, self.bytes_per_row)
+            self.boundary_overlay.set_boundaries(self.boundary_enabled, self.boundary_start_col, self.boundary_end_col)
+            self.boundary_overlay.update()
+
         # Update if the width changed
         if new_width != self.hex_column_width:
             self.hex_column_width = new_width
@@ -3907,6 +1907,16 @@ class HexEditorQt(QMainWindow):
             self.hex_header.setMaximumWidth(self.hex_column_width)
             self.hex_display.setMinimumWidth(self.hex_column_width)
             self.hex_display.setMaximumWidth(self.hex_column_width)
+
+            # Update overlay geometries
+            if hasattr(self, 'segment_overlay'):
+                self.segment_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
+            if hasattr(self, 'header_segment_overlay'):
+                self.header_segment_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_header.height())
+            if hasattr(self, 'edit_box_overlay'):
+                self.edit_box_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
+            if hasattr(self, 'boundary_overlay'):
+                self.boundary_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
 
             # Update search results overlay if it exists
             if hasattr(self, 'results_overlay') and self.results_overlay is not None:
@@ -3970,6 +1980,7 @@ class HexEditorQt(QMainWindow):
         self.central_widget = central_widget  # Store reference for gradient application
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
         # Tab widget for files
         self.tab_widget = QTabWidget()
@@ -3979,6 +1990,33 @@ class HexEditorQt(QMainWindow):
         # Set file tab font
         tab_font = QFont("Arial", 10)
         self.tab_widget.setFont(tab_font)
+
+        # Add scroll buttons to the left side of tab bar
+        tab_scroll_widget = QWidget()
+        tab_scroll_layout = QHBoxLayout()
+        tab_scroll_layout.setContentsMargins(0, 0, 5, 0)
+        tab_scroll_layout.setSpacing(2)
+
+        self.tab_scroll_left_btn = QPushButton("<")
+        self.tab_scroll_left_btn.setMinimumWidth(40)
+        self.tab_scroll_left_btn.setMaximumWidth(40)
+        self.tab_scroll_left_btn.setMaximumHeight(42)
+        self.tab_scroll_left_btn.clicked.connect(self.scroll_tabs_left)
+        tab_scroll_layout.addWidget(self.tab_scroll_left_btn)
+
+        self.tab_scroll_right_btn = QPushButton(">")
+        self.tab_scroll_right_btn.setMinimumWidth(40)
+        self.tab_scroll_right_btn.setMaximumWidth(40)
+        self.tab_scroll_right_btn.setMaximumHeight(42)
+        self.tab_scroll_right_btn.clicked.connect(self.scroll_tabs_right)
+        tab_scroll_layout.addWidget(self.tab_scroll_right_btn)
+
+        tab_scroll_widget.setLayout(tab_scroll_layout)
+        self.tab_widget.setCornerWidget(tab_scroll_widget, Qt.TopLeftCorner)
+
+        # Remove any spacing/margins from tab widget
+        self.tab_widget.setContentsMargins(0, 0, 0, 0)
+
         main_layout.addWidget(self.tab_widget, stretch=0)
 
         # Main content splitter
@@ -4125,6 +2163,23 @@ class HexEditorQt(QMainWindow):
         self.segment_overlay.set_spacing_multiplier(spacing_mult)
         self.segment_overlay.show()
 
+        # Create edit box overlay
+        self.edit_box_overlay = EditBoxOverlay(self.hex_display)
+        self.edit_box_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
+        self.edit_box_overlay.set_theme_colors(theme_colors)
+        self.edit_box_overlay.show()
+
+        # Create boundary overlay
+        self.boundary_overlay = BoundaryOverlay(self.hex_display)
+        self.boundary_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
+        self.boundary_overlay.set_theme_colors(theme_colors)
+        # Initialize display parameters (use same padding as SegmentOverlay: 4)
+        font_metrics = QFontMetrics(self.hex_display.font())
+        char_width = font_metrics.horizontalAdvance('0')
+        self.boundary_overlay.set_display_params(char_width, 4, 2, self.bytes_per_row)
+        self.boundary_overlay.set_boundaries(self.boundary_enabled, self.boundary_start_col, self.boundary_end_col)
+        self.boundary_overlay.show()
+
         # ASCII column - fixed next to hex
         self.ascii_display = HexTextEdit()
         self.ascii_display.editor = self  # Set reference to parent editor
@@ -4195,9 +2250,14 @@ class HexEditorQt(QMainWindow):
         # Create tab widget for different panels
         self.right_panel_tabs = QTabWidget()
         self.right_panel_tabs.setTabPosition(QTabWidget.North)
+        self.right_panel_tabs.setUsesScrollButtons(True)
         # Set tab font size
         tab_font = QFont("Arial", 10)
         self.right_panel_tabs.setFont(tab_font)
+        # Style scroll buttons to match theme
+        self.update_tab_scroll_buttons_style()
+        # Update arrow text when tabs change
+        self.right_panel_tabs.currentChanged.connect(lambda: self._update_arrow_button_text())
 
         # Data Inspector Tab (original inspector)
         data_inspector_widget = QWidget()
@@ -4255,7 +2315,10 @@ class HexEditorQt(QMainWindow):
         self.inspector_content_layout.setAlignment(Qt.AlignTop)
         self.inspector_content.setLayout(self.inspector_content_layout)
         self.inspector_scroll.setWidget(self.inspector_content)
-        inspector_layout.addWidget(self.inspector_scroll)
+        inspector_layout.addWidget(self.inspector_scroll, 1)  # Stretch factor to expand and fill space
+
+        # Initialize DataInspector module
+        self.data_inspector = DataInspector(self)
 
         # Endian button
         self.endian_btn = QPushButton("Byte Order: Little Endian")
@@ -4314,6 +2377,12 @@ class HexEditorQt(QMainWindow):
         self.signature_widget.parent_editor = self
         self.signature_widget.pointer_added.connect(self.on_signature_pointer_added)
         self.right_panel_tabs.addTab(self.signature_widget, "Pointers")
+
+        # Fields Tab
+        self.fields_widget = FieldWidget()
+        self.fields_widget.parent_editor = self
+        self.fields_widget.field_segment_clicked.connect(self.on_field_segment_clicked)
+        self.right_panel_tabs.addTab(self.fields_widget, "Fields")
 
         # Statistics Tab
         self.statistics_widget = StatisticsWidget()
@@ -4640,6 +2709,10 @@ class HexEditorQt(QMainWindow):
 
         options_menu.addSeparator()
 
+        debug_action = QAction("Debugging", self)
+        debug_action.triggered.connect(self.show_debug_window)
+        options_menu.addAction(debug_action)
+
         about_action = QAction("About", self)
         about_action.triggered.connect(self.show_about_dialog)
         options_menu.addAction(about_action)
@@ -4711,7 +2784,7 @@ class HexEditorQt(QMainWindow):
                 self.cursor_position += self.bytes_per_row
 
         self.update_cursor_highlight()
-        self.update_data_inspector()
+        self.data_inspector.update()
 
     def handle_hex_input(self, char):
         current_file = self.open_files[self.current_tab_index]
@@ -4743,7 +2816,7 @@ class HexEditorQt(QMainWindow):
 
         self.display_hex()
         self.update_cursor_highlight()
-        self.update_data_inspector()
+        self.data_inspector.update()
 
     def handle_ascii_input(self, char):
         current_file = self.open_files[self.current_tab_index]
@@ -4762,7 +2835,7 @@ class HexEditorQt(QMainWindow):
 
         self.display_hex()
         self.update_cursor_highlight()
-        self.update_data_inspector()
+        self.data_inspector.update()
 
     def open_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -4824,6 +2897,10 @@ class HexEditorQt(QMainWindow):
             self.open_files.pop(index)
             self.tab_widget.removeTab(index)
 
+            # Update reference file dropdown after closing a tab
+            if hasattr(self, 'signature_widget') and hasattr(self.signature_widget, '_update_ref_file_combo'):
+                self.signature_widget._update_ref_file_combo()
+
             if len(self.open_files) == 0:
                 self.current_tab_index = -1
                 self.clear_display()
@@ -4852,6 +2929,10 @@ class HexEditorQt(QMainWindow):
             tab_name += " *"
 
         self.tab_widget.setTabText(tab_index, tab_name)
+
+        # Update reference file dropdown to reflect the tab name change
+        if hasattr(self, 'signature_widget') and hasattr(self.signature_widget, '_update_ref_file_combo'):
+            self.signature_widget._update_ref_file_combo()
 
     def on_tab_changed(self, index):
         # Save pattern scan results and pointers from the previous tab
@@ -4912,6 +2993,10 @@ class HexEditorQt(QMainWindow):
             self.signature_widget.pointers = list(current_file.inspector_pointers)
             self.signature_widget.rebuild_tree()
 
+            # Update reference file dropdown to reflect current open files
+            if hasattr(self.signature_widget, '_update_ref_file_combo'):
+                self.signature_widget._update_ref_file_combo()
+
             self.display_hex()
         else:
             self.clear_display()
@@ -4940,9 +3025,6 @@ class HexEditorQt(QMainWindow):
                 else:
                     # At or after insert position - shift forward
                     current_file.pattern_labels[offset + shift_amount] = label
-
-        # Save shifted labels to JSON
-        self.save_pattern_labels_to_json()
 
     def shift_signature_pointers(self, start_pos, shift_amount):
         """Shift signature pointers after a position by shift_amount (positive for insert, negative for cut)"""
@@ -5234,7 +3316,8 @@ class HexEditorQt(QMainWindow):
             self.ascii_display.verticalScrollBar().setValue(ascii_scroll_pos)
 
         self.update_cursor_highlight()
-        self.update_data_inspector()
+        self.update_edit_box_overlay()  # Update edit box if active
+        self.data_inspector.update()
         self.update_status()
         self.update_tab_title()
 
@@ -5243,6 +3326,10 @@ class HexEditorQt(QMainWindow):
 
         # Update signature pointer overlays
         self.update_signature_overlays()
+
+        # Update fields tree
+        if hasattr(self, 'fields_widget'):
+            self.fields_widget.rebuild_tree()
 
     def scroll_to_offset(self, offset, center=True):
         """Scroll the hex display to show the given offset, using proper QTextEdit scrolling"""
@@ -5505,7 +3592,7 @@ class HexEditorQt(QMainWindow):
             if byte_index in current_file.byte_highlights:
                 highlight_info = current_file.byte_highlights[byte_index]
                 highlight_color = QColor(highlight_info["color"])
-                highlight_color.setAlpha(170)
+                highlight_color.setAlpha(80)
 
                 user_highlight_format = QTextCharFormat()
                 if highlight_info.get("underline", False):
@@ -5613,7 +3700,7 @@ class HexEditorQt(QMainWindow):
         self.offset_display.clear()
         self.hex_display.clear()
         self.ascii_display.clear()
-        self.clear_inspector()
+        self.data_inspector.clear()
         # Clear pattern scan widget
         self.pattern_scan_widget.tree.clear()
         self.pattern_scan_widget.label_editors.clear()
@@ -5852,6 +3939,28 @@ class HexEditorQt(QMainWindow):
         byte_index = absolute_row * self.bytes_per_row + byte_in_row
 
         if byte_index < len(current_file.file_data):
+            # Check if boundaries are enabled and click is outside boundary columns
+            if self.boundary_enabled:
+                clicked_col = byte_in_row
+                if clicked_col < self.boundary_start_col:
+                    # Snap to start boundary
+                    byte_in_row = self.boundary_start_col
+                    byte_index = absolute_row * self.bytes_per_row + byte_in_row
+                    print(f"Click on column {clicked_col} snapped to start boundary {self.boundary_start_col}")
+                elif clicked_col > self.boundary_end_col:
+                    # Snap to end boundary
+                    byte_in_row = self.boundary_end_col
+                    byte_index = absolute_row * self.bytes_per_row + byte_in_row
+                    print(f"Click on column {clicked_col} snapped to end boundary {self.boundary_end_col}")
+
+            # Check if edit box is active and byte is outside the edit box range
+            if self.edit_box_active and (byte_index < self.edit_box_start or byte_index > self.edit_box_end):
+                # Deactivate edit box when clicking outside the range
+                self.edit_box_active = False
+                if hasattr(self, 'edit_box_overlay'):
+                    self.edit_box_overlay.clear_edit_box()
+                print(f"Edit box deactivated - clicked byte {byte_index} outside range [{self.edit_box_start}, {self.edit_box_end}]")
+
             self.cursor_position = byte_index
             # Always start at the first nibble (high nibble) of the byte
             self.cursor_nibble = 0
@@ -5880,7 +3989,7 @@ class HexEditorQt(QMainWindow):
             print(f"Hex click: line={line}, col={col}, byte_in_row={byte_in_row}, byte_index={byte_index}")
             # Just update cursor/selection highlighting, don't redraw everything
             self.update_cursor_highlight()
-            self.update_data_inspector()
+            self.data_inspector.update()
             self.update_status()
             self.setFocus()  # Make sure main window has focus for keyboard events
 
@@ -5909,6 +4018,19 @@ class HexEditorQt(QMainWindow):
         byte_index = absolute_row * self.bytes_per_row + col
 
         if byte_index < len(current_file.file_data):
+            # Check if boundaries are enabled and click is outside boundary columns
+            if self.boundary_enabled:
+                if col < self.boundary_start_col:
+                    # Snap to start boundary
+                    col = self.boundary_start_col
+                    byte_index = absolute_row * self.bytes_per_row + col
+                    print(f"ASCII click on column snapped to start boundary {self.boundary_start_col}")
+                elif col > self.boundary_end_col:
+                    # Snap to end boundary
+                    col = self.boundary_end_col
+                    byte_index = absolute_row * self.bytes_per_row + col
+                    print(f"ASCII click on column snapped to end boundary {self.boundary_end_col}")
+
             self.cursor_position = byte_index
             self.cursor_nibble = 0
 
@@ -5936,7 +4058,7 @@ class HexEditorQt(QMainWindow):
             print(f"ASCII click: line={line}, col={col}, byte_index={byte_index}, cursor_pos={self.cursor_position}")
             # Just update cursor/selection highlighting, don't redraw everything
             self.update_cursor_highlight()
-            self.update_data_inspector()
+            self.data_inspector.update()
             self.update_status()
             self.setFocus()  # Make sure main window has focus for keyboard events
 
@@ -6081,6 +4203,16 @@ class HexEditorQt(QMainWindow):
         paste_write_action.triggered.connect(self.paste_write)
         paste_insert_action.triggered.connect(self.paste_insert)
 
+        menu.addSeparator()
+
+        # Segment 3: Fields actions
+        if self.selection_start is not None and self.selection_end is not None:
+            add_field_action = menu.addAction("Add Field")
+            add_field_action.triggered.connect(self.add_field_from_selection)
+
+            copy_subfield_action = menu.addAction("Copy Subfield")
+            copy_subfield_action.triggered.connect(self.copy_subfield_from_selection)
+
         menu.exec_(event.globalPos())
 
     def on_ascii_right_click(self, event):
@@ -6111,6 +4243,16 @@ class HexEditorQt(QMainWindow):
         """Update only the cursor and selection highlighting without redrawing text"""
         if self.current_tab_index < 0:
             return
+
+        # Check if edit box should be deactivated due to cursor moving outside range
+        if self.edit_box_active and self.cursor_position is not None:
+            if self.cursor_position < self.edit_box_start or self.cursor_position > self.edit_box_end:
+                # Cursor moved outside edit box range, deactivate it
+                self.edit_box_active = False
+                if hasattr(self, 'edit_box_overlay'):
+                    self.edit_box_overlay.clear_edit_box()
+                print(f"Edit box deactivated - cursor moved to {self.cursor_position} outside range [{self.edit_box_start}, {self.edit_box_end}]")
+
         current_file = self.open_files[self.current_tab_index]
         self.apply_hex_formatting(current_file)
 
@@ -6220,644 +4362,10 @@ class HexEditorQt(QMainWindow):
             self.hex_nav_scrollbar.setValue(new_value)
             self.hex_nav_scrollbar.blockSignals(False)
 
-    def update_data_inspector(self):
-        # Clear existing inspector widgets
-        for i in reversed(range(self.inspector_content_layout.count())):
-            self.inspector_content_layout.itemAt(i).widget().setParent(None)
-
-        if self.current_tab_index < 0 or self.cursor_position is None:
-            return
-
-        current_file = self.open_files[self.current_tab_index]
-        pos = self.cursor_position
-
-        if pos >= len(current_file.file_data):
-            return
-
-        data = current_file.file_data
-
-        # Helper to read bytes
-        def read_bytes(offset, count):
-            if offset + count <= len(data):
-                return bytes(data[offset:offset + count])
-            return None
-
-        # Display format
-        def add_inspector_row(label, value, byte_size=1, data_offset=0, data_type=None):
-            widget = QWidget()
-            if self.is_dark_theme():
-                widget.setStyleSheet("background-color: #252525; border: 1px solid #3a3a3a; border-radius: 3px; margin: 1px;")
-                label_color = "#b0b0b0"
-                value_bg = "#2d2d2d"
-                value_border = "#4a4a4a"
-                value_color = "#ffffff"
-            else:
-                widget.setStyleSheet("background-color: #f5f5f5; border: 1px solid #c0c0c0; border-radius: 3px; margin: 1px;")
-                label_color = "#5a5a5a"
-                value_bg = "#ffffff"
-                value_border = "#b0b0b0"
-                value_color = "#2c3e50"
-
-            layout = QHBoxLayout()
-            layout.setContentsMargins(8, 4, 8, 4)
-
-            label_widget = QLabel(label)
-            label_widget.setMinimumWidth(80)
-            label_widget.setFont(QFont("Arial", 8))
-            label_widget.setStyleSheet(f"color: {label_color}; border: none;")
-            layout.addWidget(label_widget)
-
-            # Make all values editable
-            value_edit = QLineEdit(str(value))
-            value_edit.setFont(QFont("Courier", 8))
-            value_edit.setMinimumWidth(150)
-
-            value_edit.setStyleSheet(f"border: 1px solid {value_border}; background-color: {value_bg}; color: {value_color}; padding: 2px;")
-
-            # Store metadata for highlighting and editing
-            value_edit.setProperty('byte_size', byte_size)
-            value_edit.setProperty('data_offset', data_offset)
-            value_edit.setProperty('data_type', data_type)
-
-            # Connect focus event to highlight bytes
-            def on_focus(event):
-                # Use cursor_position directly, not the captured pos variable
-                if self.cursor_position is not None:
-                    self.highlight_bytes(self.cursor_position + data_offset, byte_size)
-                QLineEdit.focusInEvent(value_edit, event)
-            value_edit.focusInEvent = on_focus
-
-            # Connect editing finished event to update bytes
-            if data_type and data_type != 'offset':
-                def on_edit_finished():
-                    # Use cursor_position directly, not the captured pos variable
-                    if self.cursor_position is not None:
-                        self.update_bytes_from_inspector(value_edit, self.cursor_position + data_offset, data_type)
-                value_edit.editingFinished.connect(on_edit_finished)
-
-            layout.addWidget(value_edit, 1)  # Stretch factor to expand horizontally
-            widget.setLayout(layout)
-            self.inspector_content_layout.addWidget(widget)
-
-        # Offset
-        offset_str = f"0x{pos:X}" if self.offset_mode == 'h' else str(pos)
-        add_inspector_row("Offset:", offset_str, byte_size=0, data_offset=0, data_type='offset')
-
-        # Byte (always shown in hex for reference)
-        byte_val = data[pos]
-        if self.integral_basis == 'hex':
-            add_inspector_row("Byte (hex):", f"0x{byte_val:02X}", byte_size=1, data_offset=0, data_type='byte_hex')
-
-        # Int8
-        int8_val = struct.unpack('b', bytes([byte_val]))[0]
-        add_inspector_row("Int8:", self.format_integral(int8_val, 2, signed=True), byte_size=1, data_offset=0, data_type='int8')
-
-        # UInt8
-        add_inspector_row("UInt8:", self.format_integral(byte_val, 2), byte_size=1, data_offset=0, data_type='uint8')
-
-        # Int16
-        bytes_16 = read_bytes(pos, 2)
-        if bytes_16:
-            fmt = '<h' if self.endian_mode == 'little' else '>h'
-            int16_val = struct.unpack(fmt, bytes_16)[0]
-            add_inspector_row("Int16:", self.format_integral(int16_val, 4, signed=True), byte_size=2, data_offset=0, data_type='int16')
-
-        # UInt16
-        if bytes_16:
-            fmt = '<H' if self.endian_mode == 'little' else '>H'
-            uint16_val = struct.unpack(fmt, bytes_16)[0]
-            add_inspector_row("UInt16:", self.format_integral(uint16_val, 4), byte_size=2, data_offset=0, data_type='uint16')
-
-        # Int32
-        bytes_32 = read_bytes(pos, 4)
-        if bytes_32:
-            fmt = '<i' if self.endian_mode == 'little' else '>i'
-            int32_val = struct.unpack(fmt, bytes_32)[0]
-            add_inspector_row("Int32:", self.format_integral(int32_val, 8, signed=True), byte_size=4, data_offset=0, data_type='int32')
-
-        # UInt32
-        if bytes_32:
-            fmt = '<I' if self.endian_mode == 'little' else '>I'
-            uint32_val = struct.unpack(fmt, bytes_32)[0]
-            add_inspector_row("UInt32:", self.format_integral(uint32_val, 8), byte_size=4, data_offset=0, data_type='uint32')
-
-        # Int64
-        bytes_64 = read_bytes(pos, 8)
-        if bytes_64:
-            fmt = '<q' if self.endian_mode == 'little' else '>q'
-            int64_val = struct.unpack(fmt, bytes_64)[0]
-            add_inspector_row("Int64:", self.format_integral(int64_val, 16, signed=True), byte_size=8, data_offset=0, data_type='int64')
-
-        # UInt64
-        if bytes_64:
-            fmt = '<Q' if self.endian_mode == 'little' else '>Q'
-            uint64_val = struct.unpack(fmt, bytes_64)[0]
-            add_inspector_row("UInt64:", self.format_integral(uint64_val, 16), byte_size=8, data_offset=0, data_type='uint64')
-
-        # Int24
-        bytes_24 = read_bytes(pos, 3)
-        if bytes_24:
-            # Manual 24-bit signed int parsing
-            if self.endian_mode == 'little':
-                int24_val = bytes_24[0] | (bytes_24[1] << 8) | (bytes_24[2] << 16)
-            else:
-                int24_val = (bytes_24[0] << 16) | (bytes_24[1] << 8) | bytes_24[2]
-            if int24_val & 0x800000:
-                int24_val -= 0x1000000
-            add_inspector_row("Int24:", self.format_integral(int24_val, 6, signed=True), byte_size=3, data_offset=0, data_type='int24')
-
-        # UInt24
-        if bytes_24:
-            if self.endian_mode == 'little':
-                uint24_val = bytes_24[0] | (bytes_24[1] << 8) | (bytes_24[2] << 16)
-            else:
-                uint24_val = (bytes_24[0] << 16) | (bytes_24[1] << 8) | bytes_24[2]
-            add_inspector_row("UInt24:", self.format_integral(uint24_val, 6), byte_size=3, data_offset=0, data_type='uint24')
-
-        # LEB128 (signed)
-        leb_bytes = read_bytes(pos, min(10, len(data) - pos))
-        if leb_bytes:
-            try:
-                result = 0
-                shift = 0
-                leb_size = 0
-                for b in leb_bytes:
-                    leb_size += 1
-                    result |= (b & 0x7f) << shift
-                    shift += 7
-                    if (b & 0x80) == 0:
-                        break
-                if result & (1 << (shift - 1)):
-                    result -= (1 << shift)
-                add_inspector_row("LEB128:", str(result), byte_size=leb_size, data_offset=0, data_type='leb128')
-            except:
-                add_inspector_row("LEB128:", "Invalid", byte_size=1, data_offset=0, data_type=None)
-
-        # ULEB128 (unsigned)
-        if leb_bytes:
-            try:
-                result = 0
-                shift = 0
-                uleb_size = 0
-                for b in leb_bytes:
-                    uleb_size += 1
-                    result |= (b & 0x7f) << shift
-                    shift += 7
-                    if (b & 0x80) == 0:
-                        break
-                add_inspector_row("ULEB128:", str(result), byte_size=uleb_size, data_offset=0, data_type='uleb128')
-            except:
-                add_inspector_row("ULEB128:", "Invalid", byte_size=1, data_offset=0, data_type=None)
-
-        # AnsiChar / char8_t
-        # Control characters (0x00-0x1F, 0x7F-0x9F) shown as hex escape
-        ansi_char = chr(byte_val) if (32 <= byte_val <= 126) or (160 <= byte_val <= 255) else f"\\x{byte_val:02x}"
-        add_inspector_row("AnsiChar / char8_t:", ansi_char, byte_size=1, data_offset=0, data_type='ansichar')
-
-        # WideChar / char16_t
-        if bytes_16:
-            fmt = '<H' if self.endian_mode == 'little' else '>H'
-            wide_val = struct.unpack(fmt, bytes_16)[0]
-            try:
-                wide_char = chr(wide_val) if wide_val < 0xD800 or wide_val > 0xDFFF else f"\\u{wide_val:04x}"
-            except:
-                wide_char = f"\\u{wide_val:04x}"
-            add_inspector_row("WideChar / char16_t:", wide_char, byte_size=2, data_offset=0, data_type='widechar')
-
-        # UTF-8 code point
-        utf8_bytes = read_bytes(pos, min(4, len(data) - pos))
-        if utf8_bytes:
-            try:
-                utf8_size = 1
-                if utf8_bytes[0] < 0x80:
-                    utf8_size = 1
-                elif (utf8_bytes[0] & 0xE0) == 0xC0:
-                    utf8_size = 2
-                elif (utf8_bytes[0] & 0xF0) == 0xE0:
-                    utf8_size = 3
-                elif (utf8_bytes[0] & 0xF8) == 0xF0:
-                    utf8_size = 4
-                utf8_str = bytes(utf8_bytes[:utf8_size]).decode('utf-8')
-                add_inspector_row("UTF-8 code point:", utf8_str, byte_size=utf8_size, data_offset=0, data_type='utf8')
-            except:
-                add_inspector_row("UTF-8 code point:", "Invalid", byte_size=1, data_offset=0, data_type=None)
-
-        # Single (float32) - same as Float
-        if bytes_32:
-            fmt = '<f' if self.endian_mode == 'little' else '>f'
-            float_val = struct.unpack(fmt, bytes_32)[0]
-            add_inspector_row("Single (float32):", f"{float_val:.6f}", byte_size=4, data_offset=0, data_type='float')
-
-        # Double (float64)
-        if bytes_64:
-            fmt = '<d' if self.endian_mode == 'little' else '>d'
-            double_val = struct.unpack(fmt, bytes_64)[0]
-            add_inspector_row("Double (float64):", f"{double_val:.15f}", byte_size=8, data_offset=0, data_type='double')
-
-        # OLETIME (OLE Automation date - 8 bytes double)
-        if bytes_64:
-            fmt = '<d' if self.endian_mode == 'little' else '>d'
-            ole_val = struct.unpack(fmt, bytes_64)[0]
-            try:
-                from datetime import datetime, timedelta
-                base_date = datetime(1899, 12, 30)
-                result_date = base_date + timedelta(days=ole_val)
-                add_inspector_row("OLETIME:", result_date.strftime("%Y-%m-%d %H:%M:%S"), byte_size=8, data_offset=0, data_type='oletime')
-            except:
-                add_inspector_row("OLETIME:", "Invalid", byte_size=8, data_offset=0, data_type=None)
-
-        # FILETIME (Windows FILETIME - 8 bytes)
-        if bytes_64:
-            fmt = '<Q' if self.endian_mode == 'little' else '>Q'
-            filetime_val = struct.unpack(fmt, bytes_64)[0]
-            try:
-                from datetime import datetime, timedelta
-                if filetime_val > 0:
-                    base_date = datetime(1601, 1, 1)
-                    result_date = base_date + timedelta(microseconds=filetime_val / 10)
-                    add_inspector_row("FILETIME:", result_date.strftime("%Y-%m-%d %H:%M:%S"), byte_size=8, data_offset=0, data_type='filetime')
-                else:
-                    add_inspector_row("FILETIME:", "Invalid", byte_size=8, data_offset=0, data_type=None)
-            except:
-                add_inspector_row("FILETIME:", "Invalid", byte_size=8, data_offset=0, data_type=None)
-
-        # DOS date (2 bytes)
-        if bytes_16:
-            fmt = '<H' if self.endian_mode == 'little' else '>H'
-            dos_date = struct.unpack(fmt, bytes_16)[0]
-            try:
-                day = dos_date & 0x1F
-                month = (dos_date >> 5) & 0x0F
-                year = ((dos_date >> 9) & 0x7F) + 1980
-                if 1 <= day <= 31 and 1 <= month <= 12:
-                    add_inspector_row("DOS date:", f"{year:04d}-{month:02d}-{day:02d}", byte_size=2, data_offset=0, data_type='dos_date')
-                else:
-                    add_inspector_row("DOS date:", "Invalid", byte_size=2, data_offset=0, data_type=None)
-            except:
-                add_inspector_row("DOS date:", "Invalid", byte_size=2, data_offset=0, data_type=None)
-
-        # DOS time (2 bytes)
-        if bytes_16:
-            fmt = '<H' if self.endian_mode == 'little' else '>H'
-            dos_time = struct.unpack(fmt, bytes_16)[0]
-            try:
-                seconds = (dos_time & 0x1F) * 2
-                minutes = (dos_time >> 5) & 0x3F
-                hours = (dos_time >> 11) & 0x1F
-                if hours < 24 and minutes < 60 and seconds < 60:
-                    add_inspector_row("DOS time:", f"{hours:02d}:{minutes:02d}:{seconds:02d}", byte_size=2, data_offset=0, data_type='dos_time')
-                else:
-                    add_inspector_row("DOS time:", "Invalid", byte_size=2, data_offset=0, data_type=None)
-            except:
-                add_inspector_row("DOS time:", "Invalid", byte_size=2, data_offset=0, data_type=None)
-
-        # DOS time & date (4 bytes)
-        bytes_dos = read_bytes(pos, 4)
-        if bytes_dos:
-            fmt = '<HH' if self.endian_mode == 'little' else '>HH'
-            dos_time, dos_date = struct.unpack(fmt, bytes_dos)
-            try:
-                seconds = (dos_time & 0x1F) * 2
-                minutes = (dos_time >> 5) & 0x3F
-                hours = (dos_time >> 11) & 0x1F
-                day = dos_date & 0x1F
-                month = (dos_date >> 5) & 0x0F
-                year = ((dos_date >> 9) & 0x7F) + 1980
-                if hours < 24 and minutes < 60 and seconds < 60 and 1 <= day <= 31 and 1 <= month <= 12:
-                    add_inspector_row("DOS time & date:", f"{year:04d}-{month:02d}-{day:02d} {hours:02d}:{minutes:02d}:{seconds:02d}", byte_size=4, data_offset=0, data_type='dos_datetime')
-                else:
-                    add_inspector_row("DOS time & date:", "Invalid", byte_size=4, data_offset=0, data_type=None)
-            except:
-                add_inspector_row("DOS time & date:", "Invalid", byte_size=4, data_offset=0, data_type=None)
-
-        # time_t (32 bit)
-        if bytes_32:
-            fmt = '<i' if self.endian_mode == 'little' else '>i'
-            time_t_32 = struct.unpack(fmt, bytes_32)[0]
-            try:
-                from datetime import datetime
-                if time_t_32 >= 0:
-                    result_date = datetime.utcfromtimestamp(time_t_32)
-                    add_inspector_row("time_t (32 bit):", result_date.strftime("%Y-%m-%d %H:%M:%S UTC"), byte_size=4, data_offset=0, data_type='time_t_32')
-                else:
-                    add_inspector_row("time_t (32 bit):", "Invalid", byte_size=4, data_offset=0, data_type=None)
-            except:
-                add_inspector_row("time_t (32 bit):", "Invalid", byte_size=4, data_offset=0, data_type=None)
-
-        # time_t (64 bit)
-        if bytes_64:
-            fmt = '<q' if self.endian_mode == 'little' else '>q'
-            time_t_64 = struct.unpack(fmt, bytes_64)[0]
-            try:
-                from datetime import datetime
-                if time_t_64 >= 0:
-                    result_date = datetime.utcfromtimestamp(time_t_64)
-                    add_inspector_row("time_t (64 bit):", result_date.strftime("%Y-%m-%d %H:%M:%S UTC"), byte_size=8, data_offset=0, data_type='time_t_64')
-                else:
-                    add_inspector_row("time_t (64 bit):", "Invalid", byte_size=8, data_offset=0, data_type=None)
-            except:
-                add_inspector_row("time_t (64 bit):", "Invalid", byte_size=8, data_offset=0, data_type=None)
-
-        # GUID (16 bytes)
-        bytes_guid = read_bytes(pos, 16)
-        if bytes_guid:
-            try:
-                if self.endian_mode == 'little':
-                    guid_fmt = '<IHH8s'
-                    d1, d2, d3, d4 = struct.unpack(guid_fmt, bytes_guid)
-                    guid_str = f"{d1:08X}-{d2:04X}-{d3:04X}-{d4[0]:02X}{d4[1]:02X}-{d4[2]:02X}{d4[3]:02X}{d4[4]:02X}{d4[5]:02X}{d4[6]:02X}{d4[7]:02X}"
-                else:
-                    guid_fmt = '>IHH8s'
-                    d1, d2, d3, d4 = struct.unpack(guid_fmt, bytes_guid)
-                    guid_str = f"{d1:08X}-{d2:04X}-{d3:04X}-{d4[0]:02X}{d4[1]:02X}-{d4[2]:02X}{d4[3]:02X}{d4[4]:02X}{d4[5]:02X}{d4[6]:02X}{d4[7]:02X}"
-                add_inspector_row("GUID:", guid_str, byte_size=16, data_offset=0, data_type='guid')
-            except:
-                add_inspector_row("GUID:", "Invalid", byte_size=16, data_offset=0, data_type=None)
-
-        # Disassembly (x86-16, x86-32, x86-64)
-        disasm_bytes = read_bytes(pos, min(15, len(data) - pos))
-        if disasm_bytes:
-            try:
-                from capstone import Cs, CS_ARCH_X86, CS_MODE_16, CS_MODE_32, CS_MODE_64
-
-                # x86-16
-                try:
-                    md16 = Cs(CS_ARCH_X86, CS_MODE_16)
-                    instructions = list(md16.disasm(disasm_bytes, pos))
-                    if instructions:
-                        instr = instructions[0]
-                        disasm_text = f"{instr.mnemonic} {instr.op_str}"
-                        add_inspector_row("Disassembly (x86-16):", disasm_text, byte_size=instr.size, data_offset=0, data_type=None)
-                    else:
-                        add_inspector_row("Disassembly (x86-16):", "Invalid instruction", byte_size=1, data_offset=0, data_type=None)
-                except:
-                    add_inspector_row("Disassembly (x86-16):", "Error", byte_size=1, data_offset=0, data_type=None)
-
-                # x86-32
-                try:
-                    md32 = Cs(CS_ARCH_X86, CS_MODE_32)
-                    instructions = list(md32.disasm(disasm_bytes, pos))
-                    if instructions:
-                        instr = instructions[0]
-                        disasm_text = f"{instr.mnemonic} {instr.op_str}"
-                        add_inspector_row("Disassembly (x86-32):", disasm_text, byte_size=instr.size, data_offset=0, data_type=None)
-                    else:
-                        add_inspector_row("Disassembly (x86-32):", "Invalid instruction", byte_size=1, data_offset=0, data_type=None)
-                except:
-                    add_inspector_row("Disassembly (x86-32):", "Error", byte_size=1, data_offset=0, data_type=None)
-
-                # x86-64
-                try:
-                    md64 = Cs(CS_ARCH_X86, CS_MODE_64)
-                    instructions = list(md64.disasm(disasm_bytes, pos))
-                    if instructions:
-                        instr = instructions[0]
-                        disasm_text = f"{instr.mnemonic} {instr.op_str}"
-                        add_inspector_row("Disassembly (x86-64):", disasm_text, byte_size=instr.size, data_offset=0, data_type=None)
-                    else:
-                        add_inspector_row("Disassembly (x86-64):", "Invalid instruction", byte_size=1, data_offset=0, data_type=None)
-                except:
-                    add_inspector_row("Disassembly (x86-64):", "Error", byte_size=1, data_offset=0, data_type=None)
-            except ImportError:
-                # Capstone not available
-                add_inspector_row("Disassembly (x86-16):", "[capstone library not installed]", byte_size=1, data_offset=0, data_type=None)
-                add_inspector_row("Disassembly (x86-32):", "[capstone library not installed]", byte_size=1, data_offset=0, data_type=None)
-                add_inspector_row("Disassembly (x86-64):", "[capstone library not installed]", byte_size=1, data_offset=0, data_type=None)
-
-    def clear_inspector(self):
-        for i in reversed(range(self.inspector_content_layout.count())):
-            self.inspector_content_layout.itemAt(i).widget().setParent(None)
-
-    def update_bytes_from_inspector(self, line_edit, position, data_type):
-        """Update file bytes based on inspector field edit"""
-        if self.current_tab_index < 0:
-            return
-
-        current_file = self.open_files[self.current_tab_index]
-        file_data = current_file.file_data
-
-        try:
-            text = line_edit.text().strip()
-
-            # Parse hex values
-            is_hex = text.startswith('0x') or text.startswith('0X')
-            if is_hex:
-                text = text[2:]
-
-            # Convert based on data type
-            if data_type == 'byte_hex':
-                value = int(text, 16)
-                if 0 <= value <= 0xFF:
-                    file_data[position] = value
-                else:
-                    raise ValueError("Byte value out of range")
-
-            elif data_type == 'int8':
-                if is_hex:
-                    value = int(text, 16)
-                    if value > 127:
-                        value = value - 256
-                else:
-                    value = int(text)
-                if -128 <= value <= 127:
-                    file_data[position] = value & 0xFF
-                else:
-                    raise ValueError("Int8 value out of range")
-
-            elif data_type == 'uint8':
-                value = int(text, 16) if is_hex else int(text)
-                if 0 <= value <= 255:
-                    file_data[position] = value
-                else:
-                    raise ValueError("UInt8 value out of range")
-
-            elif data_type == 'int16':
-                value = int(text, 16) if is_hex else int(text)
-                if -32768 <= value <= 32767:
-                    fmt = '<h' if self.endian_mode == 'little' else '>h'
-                    bytes_val = struct.pack(fmt, value)
-                    for i, b in enumerate(bytes_val):
-                        if position + i < len(file_data):
-                            file_data[position + i] = b
-                else:
-                    raise ValueError("Int16 value out of range")
-
-            elif data_type == 'uint16':
-                value = int(text, 16) if is_hex else int(text)
-                if 0 <= value <= 65535:
-                    fmt = '<H' if self.endian_mode == 'little' else '>H'
-                    bytes_val = struct.pack(fmt, value)
-                    for i, b in enumerate(bytes_val):
-                        if position + i < len(file_data):
-                            file_data[position + i] = b
-                else:
-                    raise ValueError("UInt16 value out of range")
-
-            elif data_type == 'int32':
-                value = int(text, 16) if is_hex else int(text)
-                if -2147483648 <= value <= 2147483647:
-                    fmt = '<i' if self.endian_mode == 'little' else '>i'
-                    bytes_val = struct.pack(fmt, value)
-                    for i, b in enumerate(bytes_val):
-                        if position + i < len(file_data):
-                            file_data[position + i] = b
-                else:
-                    raise ValueError("Int32 value out of range")
-
-            elif data_type == 'uint32':
-                value = int(text, 16) if is_hex else int(text)
-                if 0 <= value <= 4294967295:
-                    fmt = '<I' if self.endian_mode == 'little' else '>I'
-                    bytes_val = struct.pack(fmt, value)
-                    for i, b in enumerate(bytes_val):
-                        if position + i < len(file_data):
-                            file_data[position + i] = b
-                else:
-                    raise ValueError("UInt32 value out of range")
-
-            elif data_type == 'int64':
-                value = int(text, 16) if is_hex else int(text)
-                if -9223372036854775808 <= value <= 9223372036854775807:
-                    fmt = '<q' if self.endian_mode == 'little' else '>q'
-                    bytes_val = struct.pack(fmt, value)
-                    for i, b in enumerate(bytes_val):
-                        if position + i < len(file_data):
-                            file_data[position + i] = b
-                else:
-                    raise ValueError("Int64 value out of range")
-
-            elif data_type == 'uint64':
-                value = int(text, 16) if is_hex else int(text)
-                if 0 <= value <= 18446744073709551615:
-                    fmt = '<Q' if self.endian_mode == 'little' else '>Q'
-                    bytes_val = struct.pack(fmt, value)
-                    for i, b in enumerate(bytes_val):
-                        if position + i < len(file_data):
-                            file_data[position + i] = b
-                else:
-                    raise ValueError("UInt64 value out of range")
-
-            elif data_type == 'float':
-                value = float(text)
-                fmt = '<f' if self.endian_mode == 'little' else '>f'
-                bytes_val = struct.pack(fmt, value)
-                for i, b in enumerate(bytes_val):
-                    if position + i < len(file_data):
-                        file_data[position + i] = b
-
-            elif data_type == 'double':
-                value = float(text)
-                fmt = '<d' if self.endian_mode == 'little' else '>d'
-                bytes_val = struct.pack(fmt, value)
-                for i, b in enumerate(bytes_val):
-                    if position + i < len(file_data):
-                        file_data[position + i] = b
-
-            elif data_type == 'int24':
-                value = int(text, 16) if is_hex else int(text)
-                if -8388608 <= value <= 8388607:
-                    if value < 0:
-                        value = value + 0x1000000
-                    if self.endian_mode == 'little':
-                        bytes_val = bytes([value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF])
-                    else:
-                        bytes_val = bytes([(value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF])
-                    for i, b in enumerate(bytes_val):
-                        if position + i < len(file_data):
-                            file_data[position + i] = b
-                else:
-                    raise ValueError("Int24 value out of range")
-
-            elif data_type == 'uint24':
-                value = int(text, 16) if is_hex else int(text)
-                if 0 <= value <= 16777215:
-                    if self.endian_mode == 'little':
-                        bytes_val = bytes([value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF])
-                    else:
-                        bytes_val = bytes([(value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF])
-                    for i, b in enumerate(bytes_val):
-                        if position + i < len(file_data):
-                            file_data[position + i] = b
-                else:
-                    raise ValueError("UInt24 value out of range")
-
-            elif data_type == 'ansichar':
-                if len(text) == 1:
-                    file_data[position] = ord(text)
-                elif text.startswith('\\x') and len(text) == 4:
-                    file_data[position] = int(text[2:], 16)
-                else:
-                    raise ValueError("Invalid AnsiChar format")
-
-            elif data_type == 'widechar':
-                if len(text) == 1:
-                    value = ord(text)
-                elif text.startswith('\\u') and len(text) == 6:
-                    value = int(text[2:], 16)
-                else:
-                    raise ValueError("Invalid WideChar format")
-                fmt = '<H' if self.endian_mode == 'little' else '>H'
-                bytes_val = struct.pack(fmt, value)
-                for i, b in enumerate(bytes_val):
-                    if position + i < len(file_data):
-                        file_data[position + i] = b
-
-            elif data_type == 'utf8':
-                bytes_val = text.encode('utf-8')
-                for i, b in enumerate(bytes_val):
-                    if position + i < len(file_data):
-                        file_data[position + i] = b
-
-            elif data_type == 'guid':
-                # Parse GUID format: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
-                guid_parts = text.replace('{', '').replace('}', '').split('-')
-                if len(guid_parts) == 5:
-                    d1 = int(guid_parts[0], 16)
-                    d2 = int(guid_parts[1], 16)
-                    d3 = int(guid_parts[2], 16)
-                    d4_1 = int(guid_parts[3], 16)
-                    d4_2 = int(guid_parts[4], 16)
-
-                    if self.endian_mode == 'little':
-                        bytes_val = struct.pack('<IHH', d1, d2, d3)
-                    else:
-                        bytes_val = struct.pack('>IHH', d1, d2, d3)
-
-                    bytes_val += struct.pack('>HQ', d4_1, d4_2)[0:8]
-
-                    for i, b in enumerate(bytes_val[:16]):
-                        if position + i < len(file_data):
-                            file_data[position + i] = b
-                else:
-                    raise ValueError("Invalid GUID format")
-
-            # Mark as modified and update displays
-            self.save_undo_state()
-            current_file.modified = True
-
-            # Mark the modified bytes
-            byte_count = 1 if data_type in ['byte_hex', 'int8', 'uint8', 'ansichar'] else \
-                         2 if data_type in ['int16', 'uint16', 'widechar', 'dos_date', 'dos_time'] else \
-                         3 if data_type in ['int24', 'uint24'] else \
-                         4 if data_type in ['int32', 'uint32', 'float', 'dos_datetime', 'time_t_32'] else \
-                         8 if data_type in ['int64', 'uint64', 'double', 'oletime', 'filetime', 'time_t_64'] else \
-                         16 if data_type in ['guid'] else 1
-
-            for i in range(byte_count):
-                if position + i < len(file_data):
-                    current_file.modified_bytes.add(position + i)
-
-            # Update tab title
-            tab_text = os.path.basename(current_file.file_path) + " *"
-            self.tab_widget.setTabText(self.current_tab_index, tab_text)
-
-            self.display_hex()
-            self.update_data_inspector()
-
-        except (ValueError, struct.error) as e:
-            # Reset to original value on error
-            print(f"Invalid input: {e}")
-            self.update_data_inspector()
+    # NOTE: update_data_inspector, clear_inspector, and update_bytes_from_inspector
+    # have been moved to the datainspect.DataInspector class.
+    # Use self.data_inspector.update(), self.data_inspector.clear(), and
+    # self.data_inspector.update_bytes_from_editor() instead.
 
     def update_status(self):
         if self.current_tab_index < 0:
@@ -6916,6 +4424,45 @@ class HexEditorQt(QMainWindow):
         if self.current_tab_index >= 0:
             self.display_hex(preserve_scroll=True)
 
+    def on_field_segment_clicked(self, start, end):
+        """Called when a field segment is clicked - jump to and highlight that byte range"""
+        if self.current_tab_index >= 0:
+            self.highlight_bytes(start, end - start + 1)
+            self.scroll_to_offset(start, center=True)
+
+    def add_field_from_selection(self):
+        """Add a new field from the current selection"""
+        if self.selection_start is None or self.selection_end is None or self.current_tab_index < 0:
+            return
+
+        start = min(self.selection_start, self.selection_end)
+        end = max(self.selection_start, self.selection_end) + 1
+
+        print(f"DEBUG: Creating field from selection")
+        print(f"  selection_start = {self.selection_start} (0x{self.selection_start:X})")
+        print(f"  selection_end = {self.selection_end} (0x{self.selection_end:X})")
+        print(f"  start = {start} (0x{start:X})")
+        print(f"  end = {end} (0x{end:X}) [exclusive]")
+        print(f"  This represents bytes 0x{start:X} through 0x{end-1:X} (inclusive)")
+
+        from PyQt5.QtWidgets import QInputDialog
+        label, ok = QInputDialog.getText(self, "Add Field", "Enter field label:", text=f"Field_{len(self.fields_widget.fields) + 1}")
+
+        if ok and label:
+            self.fields_widget.add_field(label, start, end, self.current_tab_index)
+            self.right_panel_tabs.setCurrentWidget(self.fields_widget)
+
+    def copy_subfield_from_selection(self):
+        """Copy the current selection as a subfield segment"""
+        if self.selection_start is None or self.selection_end is None or self.current_tab_index < 0:
+            return
+
+        start = min(self.selection_start, self.selection_end)
+        end = max(self.selection_start, self.selection_end) + 1
+
+        self.fields_widget.copy_segment(start, end, self.current_tab_index)
+        self.right_panel_tabs.setCurrentWidget(self.fields_widget)
+
     def update_signature_overlays(self):
         """Update signature pointer overlay widgets positioned over hex display"""
         # Clear existing overlays
@@ -6970,7 +4517,7 @@ class HexEditorQt(QMainWindow):
                 else:
                     pointer.value = self.signature_widget.interpret_value(
                         current_file.file_data, pointer.offset, pointer.length, pointer.data_type,
-                        self.signature_widget.string_display_mode
+                        self.signature_widget.string_display_mode, pointer
                     )
 
             # Calculate X position at START of pointer: 4px left padding + 2 spaces + col * 3 characters (XX + space)
@@ -6983,13 +4530,14 @@ class HexEditorQt(QMainWindow):
             overlay = ClickableOverlay(pointer, self.hex_display)
             overlay.value_changed.connect(self.on_overlay_value_changed)
             overlay.offset_jump.connect(self.on_offset_jump)
+            overlay.clicked.connect(self.on_overlay_clicked)
 
             # Show interpreted value instead of raw hex bytes
             # For string types: show custom value if set
             if pointer.data_type.lower() == "string" and pointer.custom_value:
                 value_str = pointer.custom_value
             # For offset types: always show the offset value (clickable to jump)
-            elif pointer.data_type.lower().startswith("offset"):
+            elif pointer.data_type.lower().startswith("offset") or pointer.data_type.lower() in ["string (offset)", "string (ref.)"]:
                 value_str = str(pointer.value)
             else:
                 value_str = str(pointer.value)
@@ -7019,21 +4567,22 @@ class HexEditorQt(QMainWindow):
                 }}
             """)
 
-            # Calculate width based on value string length and hex bytes coverage
-            # Overlay should cover the hex bytes in the display
+            # Calculate width based on hex bytes coverage
+            # Boxes should NOT grow larger than the number of bytes they represent
             hex_coverage_width = (pointer.length * 3 - 1) * char_width
-            # But also be wide enough for the value text
-            value_width = len(value_str) * char_width + 8  # +8 for padding
-            overlay_width = max(hex_coverage_width, value_width)
+            overlay_width = hex_coverage_width
 
             overlay.setGeometry(int(x_pos), int(y_pos), int(overlay_width), line_height)
 
-            # Set tooltip showing hex bytes
+            # Set tooltip showing hex bytes and full value (for long values)
             hex_bytes = current_file.file_data[pointer.offset:pointer.offset + pointer.length]
             hex_str = " ".join(f"{b:02X}" for b in hex_bytes)
             tooltip_text = f"Hex: {hex_str}\nOffset: 0x{pointer.offset:X}"
             if pointer.label:
                 tooltip_text = f"Label: {pointer.label}\n{tooltip_text}"
+            # Add full value to tooltip if it's long
+            if len(value_str) > 10:
+                tooltip_text += f"\nValue: {value_str}"
             overlay.setToolTip(tooltip_text)
 
             # Check if overlays should be hidden
@@ -7059,6 +4608,44 @@ class HexEditorQt(QMainWindow):
             self.selection_end = offset
             self.display_hex()
             self.scroll_to_offset(offset, center=True)
+
+    def on_overlay_clicked(self, pointer):
+        """Locate and highlight pointer in the pointer table when overlay is clicked"""
+        if not self.signature_widget:
+            return
+
+        # For Segment type, highlight the segment of bytes indicated by the value
+        if pointer.data_type.lower() == "segment":
+            if self.current_tab_index >= 0:
+                current_file = self.open_files[self.current_tab_index]
+
+                # Parse the segment value from the pointer's interpreted value
+                # Format is "0xSTART-0xEND: VALUE"
+                if isinstance(pointer.value, str) and ":" in pointer.value:
+                    try:
+                        # Extract the numeric value from the formatted string
+                        value_str = pointer.value.split(":")[-1].strip()
+                        segment_length = int(value_str)
+
+                        # Use segment_start from pointer
+                        segment_start = pointer.segment_start if hasattr(pointer, 'segment_start') else pointer.offset
+                        segment_end = min(segment_start + segment_length - 1, len(current_file.file_data) - 1)
+
+                        if segment_end >= segment_start and segment_length > 0:
+                            self.selection_start = segment_start
+                            self.selection_end = segment_end
+                            self.scroll_to_offset(segment_start, center=True)
+                            self.display_hex(preserve_scroll=True)
+
+                            # Show info in status bar
+                            self.status_label.setText(
+                                f"Segment: 0x{segment_start:X} - 0x{segment_end:X} ({segment_length} bytes)"
+                            )
+                    except (ValueError, AttributeError):
+                        pass
+
+        # Find the pointer in the tree and select it
+        self.signature_widget.locate_pointer_in_tree(pointer)
 
     def on_overlay_value_changed(self, pointer, new_value):
         """Handle inline editing of pointer value"""
@@ -7087,8 +4674,9 @@ class HexEditorQt(QMainWindow):
                     self.display_hex(preserve_scroll=True)
                     return
 
-                # For offset types, update the label instead of modifying bytes
-                if pointer.data_type.lower().startswith("offset"):
+                # For offset types and string offset/ref types, update the label instead of modifying bytes
+                dtype_lower = pointer.data_type.lower()
+                if dtype_lower.startswith("offset") or dtype_lower in ["string (offset)", "string (ref.)"]:
                     # Check if value actually changed
                     current_display = pointer.label if (pointer.label and not pointer.label.startswith("Selection_")) else str(pointer.value)
                     if new_value == current_display or new_value == str(pointer.value):
@@ -7104,6 +4692,32 @@ class HexEditorQt(QMainWindow):
                     self.display_hex(preserve_scroll=True)
                     return
 
+                # For segment types, update the bytes (the value determines the segment length)
+                if pointer.data_type.lower() == "segment":
+                    # If the value contains ":", extract just the number part
+                    if ":" in new_value:
+                        new_value = new_value.split(":")[-1].strip()
+
+                    # Convert value to bytes and update
+                    new_bytes = self.signature_widget.value_to_bytes(new_value, pointer.data_type, pointer.length, pointer)
+                    if new_bytes:
+                        for i, byte in enumerate(new_bytes):
+                            if pointer.offset + i < len(file_data):
+                                file_data[pointer.offset + i] = byte
+
+                        # Re-interpret the value
+                        pointer.value = self.signature_widget.interpret_value(
+                            file_data, pointer.offset, pointer.length, pointer.data_type,
+                            self.signature_widget.string_display_mode, pointer
+                        )
+
+                        # Mark as modified and update UI
+                        current_file.modified = True
+                        self.update_tab_title()
+                        self.signature_widget.rebuild_tree()
+                        self.display_hex(preserve_scroll=True)
+                    return
+
                 # Check if value actually changed by comparing with current value
                 current_value = str(pointer.value)
                 if new_value == current_value:
@@ -7111,7 +4725,7 @@ class HexEditorQt(QMainWindow):
                     return
 
                 # Convert new value to bytes using the signature widget's method
-                new_bytes = self.signature_widget.value_to_bytes(new_value, pointer.data_type, pointer.length)
+                new_bytes = self.signature_widget.value_to_bytes(new_value, pointer.data_type, pointer.length, pointer)
                 if new_bytes:
                     # Save undo state
                     self.save_undo_state()
@@ -7128,7 +4742,7 @@ class HexEditorQt(QMainWindow):
                     # Recalculate pointer value
                     pointer.value = self.signature_widget.interpret_value(
                         file_data, pointer.offset, pointer.length, pointer.data_type,
-                        self.signature_widget.string_display_mode
+                        self.signature_widget.string_display_mode, pointer
                     )
 
                     # Update tree display
@@ -7184,95 +4798,6 @@ class HexEditorQt(QMainWindow):
                         if result.offset in self.pattern_scan_widget.label_editors:
                             self.pattern_scan_widget.label_editors[result.offset].setText(result.label)
 
-    def save_pattern_labels_to_json(self):
-        """Save pattern scan labels to the highlights JSON file"""
-        if self.current_tab_index < 0:
-            return
-
-        current_file = self.open_files[self.current_tab_index]
-
-        # Get all labels from pattern scan widget
-        current_file.pattern_labels.clear()
-        root = self.pattern_scan_widget.tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            category_item = root.child(i)
-            for j in range(category_item.childCount()):
-                item = category_item.child(j)
-                result = item.data(0, Qt.UserRole)
-                if isinstance(result, PatternResult) and result.label:
-                    current_file.pattern_labels[result.offset] = result.label
-
-        # Auto-save to the highlights JSON file
-        json_path = current_file.file_path + '.json'
-
-        # Read existing JSON or create new structure
-        json_data = {}
-        if os.path.exists(json_path):
-            try:
-                with open(json_path, 'r') as f:
-                    json_data = json.load(f)
-            except:
-                pass
-
-        # Build pattern_scan_labels data
-        pattern_labels_data = []
-        root = self.pattern_scan_widget.tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            category_item = root.child(i)
-            category_name = category_item.text(0)
-            for j in range(category_item.childCount()):
-                item = category_item.child(j)
-                result = item.data(0, Qt.UserRole)
-                if isinstance(result, PatternResult):
-                    has_label = result.label and result.label.strip()
-                    has_color = hasattr(result, 'highlight_color') and result.highlight_color
-
-                    if has_label or has_color:
-                        pattern_labels_data.append({
-                            "category": category_name,
-                            "offset": result.offset,
-                            "length": result.length,
-                            "description": result.description,
-                            "label": result.label if has_label else "",
-                            "color": result.highlight_color if has_color else ""
-                        })
-
-        # Update pattern_scan_labels in JSON
-        json_data["pattern_scan_labels"] = pattern_labels_data
-
-        # Save to file
-        try:
-            with open(json_path, 'w') as f:
-                json.dump(json_data, f, indent=2)
-        except Exception as e:
-            print(f"Failed to save pattern labels to JSON: {e}")
-
-    def load_pattern_labels_from_json(self):
-        """Load pattern scan labels from the highlights JSON file"""
-        if self.current_tab_index < 0:
-            return
-
-        current_file = self.open_files[self.current_tab_index]
-        current_file.pattern_labels.clear()
-
-        # Load from the highlights JSON file
-        json_path = current_file.file_path + '.json'
-        try:
-            if os.path.exists(json_path):
-                with open(json_path, 'r') as f:
-                    json_data = json.load(f)
-                    # Extract pattern scan labels
-                    for item in json_data.get("pattern_scan_labels", []):
-                        offset = item.get("offset")
-                        label = item.get("label", "")
-                        if offset is not None and label:
-                            current_file.pattern_labels[offset] = label
-        except Exception as e:
-            print(f"Failed to load pattern labels from JSON: {e}")
-
-        # Update pattern scan widget
-        self.load_pattern_labels_to_widget()
-
     def first_byte(self):
         """Jump to the first byte of the file"""
         if self.cursor_position is not None and self.current_tab_index >= 0:
@@ -7280,7 +4805,7 @@ class HexEditorQt(QMainWindow):
             self.cursor_nibble = 0
             self.display_hex(preserve_scroll=True)
             self.scroll_to_offset(0)
-            self.update_data_inspector()
+            self.data_inspector.update()
 
     def last_byte(self):
         """Jump to the last byte of the file"""
@@ -7291,7 +4816,7 @@ class HexEditorQt(QMainWindow):
                 self.cursor_nibble = 0
                 self.display_hex(preserve_scroll=True)
                 self.scroll_to_offset(self.cursor_position)
-                self.update_data_inspector()
+                self.data_inspector.update()
 
     def prev_byte(self):
         if self.cursor_position is not None and self.cursor_position > 0:
@@ -7299,7 +4824,7 @@ class HexEditorQt(QMainWindow):
             self.cursor_nibble = 0
             self.display_hex(preserve_scroll=True)
             self.scroll_to_offset(self.cursor_position)
-            self.update_data_inspector()
+            self.data_inspector.update()
 
     def next_byte(self):
         if self.cursor_position is not None and self.current_tab_index >= 0:
@@ -7309,14 +4834,36 @@ class HexEditorQt(QMainWindow):
                 self.cursor_nibble = 0
                 self.display_hex(preserve_scroll=True)
                 self.scroll_to_offset(self.cursor_position)
-                self.update_data_inspector()
+                self.data_inspector.update()
+
+    def scroll_tabs_left(self):
+        """Scroll the tab bar to the left"""
+        tab_bar = self.tab_widget.tabBar()
+        if tab_bar:
+            # Get the current scroll position and scroll left
+            scroll_buttons = tab_bar.findChildren(QToolButton)
+            for button in scroll_buttons:
+                if 'Left' in button.objectName() or button.arrowType() == Qt.LeftArrow:
+                    button.click()
+                    break
+
+    def scroll_tabs_right(self):
+        """Scroll the tab bar to the right"""
+        tab_bar = self.tab_widget.tabBar()
+        if tab_bar:
+            # Get the current scroll position and scroll right
+            scroll_buttons = tab_bar.findChildren(QToolButton)
+            for button in scroll_buttons:
+                if 'Right' in button.objectName() or button.arrowType() == Qt.RightArrow:
+                    button.click()
+                    break
 
     def toggle_endian(self):
         self.endian_mode = 'big' if self.endian_mode == 'little' else 'little'
         self.endian_btn.setText(
             f"Byte Order: {'Little' if self.endian_mode == 'little' else 'Big'} Endian"
         )
-        self.update_data_inspector()
+        self.data_inspector.update()
 
     def format_integral(self, value, num_digits=None, signed=False):
         """Format an integral value based on current basis setting."""
@@ -7370,10 +4917,13 @@ class HexEditorQt(QMainWindow):
         self.dec_basis_check.blockSignals(False)
         self.oct_basis_check.blockSignals(False)
 
-        self.update_data_inspector()
+        self.data_inspector.update()
 
     def highlight_bytes(self, start_pos, byte_count):
         """Highlight a range of bytes in the hex and ASCII displays"""
+        print(f"DEBUG highlight_bytes: start_pos={start_pos} (0x{start_pos:X}), byte_count={byte_count}")
+        print(f"  Will highlight bytes 0x{start_pos:X} through 0x{start_pos + byte_count - 1:X}")
+
         if self.current_tab_index < 0 or not self.open_files:
             return
 
@@ -7701,6 +5251,10 @@ class HexEditorQt(QMainWindow):
                     self.shift_pattern_labels(current_file, pos, -1)
                     self.shift_signature_pointers(pos, -1)
 
+                    # Adjust fields
+                    if hasattr(self, 'fields_widget'):
+                        self.fields_widget.adjust_for_delete(pos, 1, self.current_tab_index)
+
                     # Delete the byte
                     del current_file.file_data[pos]
 
@@ -7770,6 +5324,10 @@ class HexEditorQt(QMainWindow):
                 # Shift signature pointers
                 self.shift_signature_pointers(start, -num_bytes)
 
+                # Adjust fields
+                if hasattr(self, 'fields_widget'):
+                    self.fields_widget.adjust_for_delete(start, num_bytes, self.current_tab_index)
+
                 del current_file.file_data[start:end + 1]
                 current_file.modified = True
                 current_file.pattern_highlights_dirty = True  # Mark pattern highlights for reapplication
@@ -7831,6 +5389,10 @@ class HexEditorQt(QMainWindow):
             # Shift signature pointers
             self.shift_signature_pointers(self.cursor_position, -1)
 
+            # Adjust fields
+            if hasattr(self, 'fields_widget'):
+                self.fields_widget.adjust_for_delete(self.cursor_position, 1, self.current_tab_index)
+
             del current_file.file_data[self.cursor_position]
             current_file.modified = True
             current_file.pattern_highlights_dirty = True  # Mark pattern highlights for reapplication
@@ -7879,6 +5441,12 @@ class HexEditorQt(QMainWindow):
         if self.current_tab_index < 0 or self.cursor_position is None:
             return
 
+        # Deactivate edit box for paste operations
+        if self.edit_box_active:
+            self.edit_box_active = False
+            if hasattr(self, 'edit_box_overlay'):
+                self.edit_box_overlay.clear_edit_box()
+
         # Try to get data from system clipboard first, then fall back to internal clipboard
         paste_data = self.get_paste_data()
         if not paste_data:
@@ -7905,16 +5473,44 @@ class HexEditorQt(QMainWindow):
                 paste_size = len(paste_data)
 
                 # Show Smart Paste Dialog if sizes differ
+                smart_paste_choice = None
                 if paste_size != selection_size:
                     dialog = SmartPasteDialog(self, paste_size, selection_size)
                     if dialog.exec_() != QDialog.Accepted:
                         return  # User cancelled
 
                     choice, padding_value = dialog.get_result()
+                    smart_paste_choice = choice
 
                     if choice == 'trim':
                         # Trim paste data to match selection size
-                        paste_data = paste_data[:selection_size]
+                        # If clipboard has grid structure, maintain it during trim
+                        if self.clipboard_grid_rows is not None and self.clipboard_grid_cols is not None:
+                            # Structure-aware trim: extract the portion that fits
+                            src_rows = self.clipboard_grid_rows
+                            src_cols = self.clipboard_grid_cols
+                            tgt_rows = num_rows
+                            tgt_cols = num_cols
+
+                            trimmed_data = bytearray()
+                            data_idx = 0
+
+                            for src_row in range(min(src_rows, tgt_rows)):
+                                for src_col in range(min(src_cols, tgt_cols)):
+                                    if data_idx < len(paste_data):
+                                        trimmed_data.append(paste_data[data_idx])
+                                    data_idx += 1
+                                # Skip remaining columns in this row if src_cols > tgt_cols
+                                if src_cols > tgt_cols:
+                                    data_idx += (src_cols - tgt_cols)
+
+                            paste_data = bytes(trimmed_data)
+                            # Update grid metadata to match trimmed dimensions
+                            self.clipboard_grid_rows = min(src_rows, tgt_rows)
+                            self.clipboard_grid_cols = min(src_cols, tgt_cols)
+                        else:
+                            # Linear trim (no structure)
+                            paste_data = paste_data[:selection_size]
                     elif choice == 'pad':
                         # Check if clipboard has grid structure metadata
                         if self.clipboard_grid_rows is not None and self.clipboard_grid_cols is not None:
@@ -7954,50 +5550,158 @@ class HexEditorQt(QMainWindow):
                 self.save_undo_state()
 
                 # Paste data column-wise (row by row within the column range)
-                data_index = 0
-                for row in range(min_row, max_row + 1):
-                    for col in range(min_col, max_col + 1):
-                        if data_index < len(paste_data):
+                # If ignore was chosen and data has grid structure, maintain that structure
+                if smart_paste_choice == 'ignore' and self.clipboard_grid_rows is not None and self.clipboard_grid_cols is not None:
+                    # Use source grid dimensions, not selection dimensions
+                    src_rows = self.clipboard_grid_rows
+                    src_cols = self.clipboard_grid_cols
+                    data_index = 0
+
+                    for src_row in range(src_rows):
+                        for src_col in range(src_cols):
+                            if data_index < len(paste_data):
+                                # Map to target position starting at min_row, min_col
+                                tgt_row = min_row + src_row
+                                tgt_col = min_col + src_col
+                                pos = tgt_row * self.bytes_per_row + tgt_col
+                                if pos < len(current_file.file_data):
+                                    current_file.file_data[pos] = paste_data[data_index]
+                                    if pos not in current_file.inserted_bytes:
+                                        current_file.modified_bytes.add(pos)
+                                data_index += 1
+                elif smart_paste_choice == 'ignore':
+                    # Ignore chosen but no grid metadata - paste linearly starting at selection start
+                    # Only paste the actual data without filling the entire selection
+                    data_index = 0
+                    row = min_row
+                    col = min_col
+
+                    while data_index < len(paste_data):
+                        pos = row * self.bytes_per_row + col
+                        if pos < len(current_file.file_data):
+                            current_file.file_data[pos] = paste_data[data_index]
+                            if pos not in current_file.inserted_bytes:
+                                current_file.modified_bytes.add(pos)
+                        data_index += 1
+
+                        # Move to next position (linear, not confined to selection box)
+                        col += 1
+                        if col >= self.bytes_per_row:
+                            # Wrap to next row
+                            col = 0
+                            row += 1
+                else:
+                    # Standard pasting with trim/pad: paste within the selection box
+                    # If clipboard has grid structure after trim/pad, use it
+                    if self.clipboard_grid_rows is not None and self.clipboard_grid_cols is not None:
+                        # Structure-aware pasting
+                        src_rows = self.clipboard_grid_rows
+                        src_cols = self.clipboard_grid_cols
+                        data_index = 0
+
+                        for src_row in range(src_rows):
+                            for src_col in range(src_cols):
+                                if data_index < len(paste_data):
+                                    # Map to target position
+                                    tgt_row = min_row + src_row
+                                    tgt_col = min_col + src_col
+                                    pos = tgt_row * self.bytes_per_row + tgt_col
+                                    if pos < len(current_file.file_data):
+                                        current_file.file_data[pos] = paste_data[data_index]
+                                        if pos not in current_file.inserted_bytes:
+                                            current_file.modified_bytes.add(pos)
+                                    data_index += 1
+                    else:
+                        # Linear pasting within selection box
+                        data_index = 0
+                        row = min_row
+                        col = min_col
+
+                        while data_index < len(paste_data):
                             pos = row * self.bytes_per_row + col
                             if pos < len(current_file.file_data):
                                 current_file.file_data[pos] = paste_data[data_index]
                                 if pos not in current_file.inserted_bytes:
                                     current_file.modified_bytes.add(pos)
                             data_index += 1
-                        else:
-                            # No more data to paste, stop
-                            break
-                    if data_index >= len(paste_data):
-                        break
+
+                            # Move to next position within selection box
+                            col += 1
+                            if col > max_col:
+                                # Move to next row
+                                col = min_col
+                                row += 1
 
                 paste_position = sel_start
             else:
                 # Normal linear selection - paste without smart paste dialog
-                # Just paste the data starting at selection start
+                # Check if clipboard has grid structure to preserve it
                 paste_position = sel_start
 
                 self.save_undo_state()
 
-                for i, byte in enumerate(paste_data):
-                    pos = paste_position + i
-                    if pos < len(current_file.file_data):
-                        current_file.file_data[pos] = byte
-                        # Mark as modified only if not in inserted_bytes
-                        if pos not in current_file.inserted_bytes:
-                            current_file.modified_bytes.add(pos)
+                if self.clipboard_grid_rows is not None and self.clipboard_grid_cols is not None:
+                    # Preserve grid structure during paste
+                    src_rows = self.clipboard_grid_rows
+                    src_cols = self.clipboard_grid_cols
+                    start_row = paste_position // self.bytes_per_row
+                    start_col = paste_position % self.bytes_per_row
+                    data_index = 0
+
+                    for src_row in range(src_rows):
+                        for src_col in range(src_cols):
+                            if data_index < len(paste_data):
+                                # Map to target position
+                                tgt_row = start_row + src_row
+                                tgt_col = start_col + src_col
+                                pos = tgt_row * self.bytes_per_row + tgt_col
+                                if pos < len(current_file.file_data):
+                                    current_file.file_data[pos] = paste_data[data_index]
+                                    if pos not in current_file.inserted_bytes:
+                                        current_file.modified_bytes.add(pos)
+                                data_index += 1
+                else:
+                    # Linear paste (no grid structure)
+                    for i, byte in enumerate(paste_data):
+                        pos = paste_position + i
+                        if pos < len(current_file.file_data):
+                            current_file.file_data[pos] = byte
+                            if pos not in current_file.inserted_bytes:
+                                current_file.modified_bytes.add(pos)
         else:
             # No selection, paste at cursor
             paste_position = self.cursor_position
 
             self.save_undo_state()
 
-            for i, byte in enumerate(paste_data):
-                pos = paste_position + i
-                if pos < len(current_file.file_data):
-                    current_file.file_data[pos] = byte
-                    # Mark as modified only if not in inserted_bytes
-                    if pos not in current_file.inserted_bytes:
-                        current_file.modified_bytes.add(pos)
+            if self.clipboard_grid_rows is not None and self.clipboard_grid_cols is not None:
+                # Preserve grid structure during paste
+                src_rows = self.clipboard_grid_rows
+                src_cols = self.clipboard_grid_cols
+                start_row = paste_position // self.bytes_per_row
+                start_col = paste_position % self.bytes_per_row
+                data_index = 0
+
+                for src_row in range(src_rows):
+                    for src_col in range(src_cols):
+                        if data_index < len(paste_data):
+                            # Map to target position
+                            tgt_row = start_row + src_row
+                            tgt_col = start_col + src_col
+                            pos = tgt_row * self.bytes_per_row + tgt_col
+                            if pos < len(current_file.file_data):
+                                current_file.file_data[pos] = paste_data[data_index]
+                                if pos not in current_file.inserted_bytes:
+                                    current_file.modified_bytes.add(pos)
+                            data_index += 1
+            else:
+                # Linear paste (no grid structure)
+                for i, byte in enumerate(paste_data):
+                    pos = paste_position + i
+                    if pos < len(current_file.file_data):
+                        current_file.file_data[pos] = byte
+                        if pos not in current_file.inserted_bytes:
+                            current_file.modified_bytes.add(pos)
 
         current_file.modified = True
         current_file.pattern_highlights_dirty = True  # Mark pattern highlights for reapplication
@@ -8008,12 +5712,21 @@ class HexEditorQt(QMainWindow):
         if self.current_tab_index < 0 or self.cursor_position is None:
             return
 
+        # Deactivate edit box for paste operations
+        if self.edit_box_active:
+            self.edit_box_active = False
+            if hasattr(self, 'edit_box_overlay'):
+                self.edit_box_overlay.clear_edit_box()
+
         # Try to get data from system clipboard first, then fall back to internal clipboard
         paste_data = self.get_paste_data()
         if not paste_data:
             return
 
         current_file = self.open_files[self.current_tab_index]
+
+        # Initialize smart paste choice
+        smart_paste_choice = None
 
         # Check if pasting over a selection
         insert_position = self.cursor_position
@@ -8033,86 +5746,345 @@ class HexEditorQt(QMainWindow):
                 num_cols = max_col - min_col + 1
                 selection_size = num_rows * num_cols
             else:
-                # Normal linear selection
+                # Normal linear selection - no smart paste dialog, just replace selection
                 selection_size = sel_end - sel_start + 1
 
-            paste_size = len(paste_data)
+            # For column selections, show smart paste dialog if sizes differ
+            if self.column_selection_mode and self.column_sel_start_row is not None:
+                paste_size = len(paste_data)
 
-            # If sizes differ, show Smart Paste Dialog
-            if paste_size != selection_size:
-                dialog = SmartPasteDialog(self, paste_size, selection_size)
-                if dialog.exec_() != QDialog.Accepted:
-                    return  # User cancelled
+                # Show Smart Paste Dialog if sizes differ
+                smart_paste_choice = None
+                if paste_size != selection_size:
+                    dialog = SmartPasteDialog(self, paste_size, selection_size)
+                    if dialog.exec_() != QDialog.Accepted:
+                        return  # User cancelled
 
-                choice, padding_value = dialog.get_result()
+                    choice, padding_value = dialog.get_result()
+                    smart_paste_choice = choice
 
-                if choice == 'trim':
-                    # Trim paste data to match selection size
-                    paste_data = paste_data[:selection_size]
-                elif choice == 'pad':
-                    # Pad paste data to match selection size
-                    bytes_needed = selection_size - paste_size
-                    # Loop the padding pattern
-                    padding = bytearray()
-                    while len(padding) < bytes_needed:
-                        padding.extend(padding_value)
-                    padding = padding[:bytes_needed]  # Trim to exact size
-                    paste_data = paste_data + bytes(padding)
-                # If choice == 'ignore', use paste_data as is
+                    if choice == 'trim':
+                        # Trim paste data to match selection size
+                        # If clipboard has grid structure, maintain it during trim
+                        if self.clipboard_grid_rows is not None and self.clipboard_grid_cols is not None:
+                            # Structure-aware trim: extract the portion that fits
+                            src_rows = self.clipboard_grid_rows
+                            src_cols = self.clipboard_grid_cols
+                            tgt_rows = num_rows
+                            tgt_cols = num_cols
+
+                            trimmed_data = bytearray()
+                            data_idx = 0
+
+                            for src_row in range(min(src_rows, tgt_rows)):
+                                for src_col in range(min(src_cols, tgt_cols)):
+                                    if data_idx < len(paste_data):
+                                        trimmed_data.append(paste_data[data_idx])
+                                    data_idx += 1
+                                # Skip remaining columns in this row if src_cols > tgt_cols
+                                if src_cols > tgt_cols:
+                                    data_idx += (src_cols - tgt_cols)
+
+                            paste_data = bytes(trimmed_data)
+                            # Update grid metadata to match trimmed dimensions
+                            self.clipboard_grid_rows = min(src_rows, tgt_rows)
+                            self.clipboard_grid_cols = min(src_cols, tgt_cols)
+                        else:
+                            # Linear trim (no structure)
+                            paste_data = paste_data[:selection_size]
+                    elif choice == 'pad':
+                        # Check if clipboard has grid structure metadata
+                        if self.clipboard_grid_rows is not None and self.clipboard_grid_cols is not None:
+                            # Structure-aware padding: maintain row/column layout
+                            src_rows = self.clipboard_grid_rows
+                            src_cols = self.clipboard_grid_cols
+                            tgt_rows = num_rows
+                            tgt_cols = num_cols
+
+                            padded_data = bytearray()
+                            data_idx = 0
+
+                            for tgt_row in range(tgt_rows):
+                                for tgt_col in range(tgt_cols):
+                                    if tgt_row < src_rows and tgt_col < src_cols:
+                                        # Data from source
+                                        if data_idx < len(paste_data):
+                                            padded_data.append(paste_data[data_idx])
+                                            data_idx += 1
+                                        else:
+                                            # Source data exhausted (shouldn't happen)
+                                            padded_data.extend(padding_value[:1])
+                                    else:
+                                        # Padding region
+                                        padded_data.extend(padding_value[:1])
+
+                            paste_data = bytes(padded_data)
+                        else:
+                            # Linear padding (no structure metadata)
+                            bytes_needed = selection_size - paste_size
+                            padding = bytearray()
+                            while len(padding) < bytes_needed:
+                                padding.extend(padding_value)
+                            padding = padding[:bytes_needed]
+                            paste_data = paste_data + bytes(padding)
+                    # If 'ignore' is chosen, keep original paste_data size
 
             # Use selection start as insert position
             insert_position = sel_start
 
-        # Warning prompt before inserting (increases file size)
+            # For both linear and column selections, we delete the selected bytes
+            selection_bytes_to_delete = selection_size
+        else:
+            selection_bytes_to_delete = 0
+
+        # Calculate net file size change: bytes_to_insert - bytes_to_delete
         num_bytes = len(paste_data)
-        if not self.show_file_size_warning(self, num_bytes, is_increase=True):
-            return
+        net_size_change = num_bytes - selection_bytes_to_delete
+
+        # Warning prompt (only if file size will change)
+        if net_size_change > 0:
+            if not self.show_file_size_warning(self, net_size_change, is_increase=True):
+                return
+        elif net_size_change < 0:
+            if not self.show_file_size_warning(self, -net_size_change, is_increase=False):
+                return
 
         self.save_undo_state()
 
-        # When inserting, we need to shift all existing markers that come after the insertion point
-        insert_count = len(paste_data)
-        old_modified = set(current_file.modified_bytes)
-        old_inserted = set(current_file.inserted_bytes)
-        old_replaced = set(current_file.replaced_bytes)
+        # Handle column selection specially - process row by row to maintain shape
+        # Skip row-by-row processing if 'ignore' chosen without grid metadata
+        if (self.selection_start is not None and self.selection_end is not None and
+            self.column_selection_mode and self.column_sel_start_row is not None and
+            not (smart_paste_choice == 'ignore' and
+                 (self.clipboard_grid_rows is None or self.clipboard_grid_cols is None))):
 
-        # Clear and rebuild the sets with shifted positions
-        current_file.modified_bytes.clear()
-        current_file.inserted_bytes.clear()
-        current_file.replaced_bytes.clear()
+            min_row = min(self.column_sel_start_row, self.column_sel_end_row)
+            max_row = max(self.column_sel_start_row, self.column_sel_end_row)
+            min_col = min(self.column_sel_start_col, self.column_sel_end_col)
+            max_col = max(self.column_sel_start_col, self.column_sel_end_col)
 
-        for pos in old_modified:
-            if pos >= insert_position:
-                current_file.modified_bytes.add(pos + insert_count)
+            num_rows = max_row - min_row + 1
+            num_cols = max_col - min_col + 1
+
+            # Determine source dimensions for insertion
+            # If 'ignore' was chosen and clipboard has grid metadata, use source dimensions
+            use_source_grid = (smart_paste_choice == 'ignore' and
+                             self.clipboard_grid_rows is not None and
+                             self.clipboard_grid_cols is not None)
+
+            if use_source_grid:
+                src_rows = self.clipboard_grid_rows
+                src_cols = self.clipboard_grid_cols
             else:
-                current_file.modified_bytes.add(pos)
+                # For trim/pad operations with grid structure, use the updated clipboard dimensions
+                if self.clipboard_grid_rows is not None and self.clipboard_grid_cols is not None:
+                    src_rows = self.clipboard_grid_rows
+                    src_cols = self.clipboard_grid_cols
+                else:
+                    # No grid structure, use selection dimensions
+                    src_rows = num_rows
+                    src_cols = num_cols
 
-        for pos in old_inserted:
-            if pos >= insert_position:
-                current_file.inserted_bytes.add(pos + insert_count)
-            else:
+            # Process row by row to maintain the column structure
+            data_index = 0
+            cumulative_offset = 0  # Track cumulative position changes
+
+            for row_idx in range(src_rows):
+                target_row = min_row + row_idx
+
+                # For this row, delete the column selection bytes (only if within selection)
+                row_positions = []
+                if target_row <= max_row:
+                    for col in range(min_col, max_col + 1):
+                        pos = target_row * self.bytes_per_row + col + cumulative_offset
+                        if pos < len(current_file.file_data):
+                            row_positions.append(pos)
+
+                first_row_pos = (target_row * self.bytes_per_row + min_col + cumulative_offset
+                               if target_row <= max_row and row_positions
+                               else target_row * self.bytes_per_row + min_col + cumulative_offset)
+
+                # Delete this row's column bytes (from end to start) only if within selection
+                delete_count = 0
+                if target_row <= max_row and row_positions:
+                    for pos in sorted(row_positions, reverse=True):
+                        current_file.file_data.pop(pos)
+                        current_file.modified_bytes.discard(pos)
+                        current_file.inserted_bytes.discard(pos)
+                        current_file.replaced_bytes.discard(pos)
+                    delete_count = len(row_positions)
+
+                # Extract the bytes for this row from paste_data using source columns
+                row_paste_data = []
+                for _ in range(src_cols):
+                    if data_index < len(paste_data):
+                        row_paste_data.append(paste_data[data_index])
+                        data_index += 1
+                    else:
+                        break
+
+                # Insert the new bytes for this row
+                for i, byte in enumerate(row_paste_data):
+                    current_file.file_data.insert(first_row_pos + i, byte)
+                    current_file.inserted_bytes.add(first_row_pos + i)
+
+                # Update cumulative offset
+                cumulative_offset += len(row_paste_data) - delete_count
+
+            # Rebuild all tracking sets after the complex operation
+            # This is simpler than trying to track all the shifts
+            current_file.pattern_highlights_dirty = True
+
+        # If there's a normal linear selection (not column), delete it first before inserting
+        elif (self.selection_start is not None and self.selection_end is not None):
+            sel_start = min(self.selection_start, self.selection_end)
+            sel_end = max(self.selection_start, self.selection_end)
+
+            # Delete selected bytes (from end to start to maintain positions)
+            for pos in range(sel_end, sel_start - 1, -1):
+                if pos < len(current_file.file_data):
+                    current_file.file_data.pop(pos)
+                    # Remove from tracking sets
+                    current_file.modified_bytes.discard(pos)
+                    current_file.inserted_bytes.discard(pos)
+                    current_file.replaced_bytes.discard(pos)
+
+            # Shift all markers after the deleted range
+            delete_count = sel_end - sel_start + 1
+            old_modified = set(current_file.modified_bytes)
+            old_inserted = set(current_file.inserted_bytes)
+            old_replaced = set(current_file.replaced_bytes)
+
+            current_file.modified_bytes.clear()
+            current_file.inserted_bytes.clear()
+            current_file.replaced_bytes.clear()
+
+            for pos in old_modified:
+                if pos > sel_end:
+                    current_file.modified_bytes.add(pos - delete_count)
+                elif pos < sel_start:
+                    current_file.modified_bytes.add(pos)
+
+            for pos in old_inserted:
+                if pos > sel_end:
+                    current_file.inserted_bytes.add(pos - delete_count)
+                elif pos < sel_start:
+                    current_file.inserted_bytes.add(pos)
+
+            for pos in old_replaced:
+                if pos > sel_end:
+                    current_file.replaced_bytes.add(pos - delete_count)
+                elif pos < sel_start:
+                    current_file.replaced_bytes.add(pos)
+
+            # Shift non-pattern highlights
+            self.shift_non_pattern_highlights(current_file, sel_end + 1, -delete_count)
+
+            # Shift pattern labels
+            self.shift_pattern_labels(current_file, sel_end + 1, -delete_count)
+
+            # Shift signature pointers
+            self.shift_signature_pointers(sel_end + 1, -delete_count)
+
+            # Adjust fields
+            if hasattr(self, 'fields_widget'):
+                self.fields_widget.adjust_for_delete(sel_start, delete_count, self.current_tab_index)
+
+            # When inserting, we need to shift all existing markers that come after the insertion point
+            insert_count = len(paste_data)
+            old_modified = set(current_file.modified_bytes)
+            old_inserted = set(current_file.inserted_bytes)
+            old_replaced = set(current_file.replaced_bytes)
+
+            # Clear and rebuild the sets with shifted positions
+            current_file.modified_bytes.clear()
+            current_file.inserted_bytes.clear()
+            current_file.replaced_bytes.clear()
+
+            for pos in old_modified:
+                if pos >= insert_position:
+                    current_file.modified_bytes.add(pos + insert_count)
+                else:
+                    current_file.modified_bytes.add(pos)
+
+            for pos in old_inserted:
+                if pos >= insert_position:
+                    current_file.inserted_bytes.add(pos + insert_count)
+                else:
+                    current_file.inserted_bytes.add(pos)
+
+            for pos in old_replaced:
+                if pos >= insert_position:
+                    current_file.replaced_bytes.add(pos + insert_count)
+                else:
+                    current_file.replaced_bytes.add(pos)
+
+            # Shift non-pattern highlights
+            self.shift_non_pattern_highlights(current_file, insert_position, insert_count)
+
+            # Shift pattern labels
+            self.shift_pattern_labels(current_file, insert_position, insert_count)
+
+            # Shift signature pointers
+            self.shift_signature_pointers(insert_position, insert_count)
+
+            # Adjust fields
+            if hasattr(self, 'fields_widget'):
+                self.fields_widget.adjust_for_insert(insert_position, insert_count, self.current_tab_index)
+
+            # Insert bytes
+            for i, byte in enumerate(paste_data):
+                pos = insert_position + i
+                current_file.file_data.insert(pos, byte)
                 current_file.inserted_bytes.add(pos)
+        else:
+            # No selection, just insert at cursor
+            insert_count = len(paste_data)
+            old_modified = set(current_file.modified_bytes)
+            old_inserted = set(current_file.inserted_bytes)
+            old_replaced = set(current_file.replaced_bytes)
 
-        for pos in old_replaced:
-            if pos >= insert_position:
-                current_file.replaced_bytes.add(pos + insert_count)
-            else:
-                current_file.replaced_bytes.add(pos)
+            # Clear and rebuild the sets with shifted positions
+            current_file.modified_bytes.clear()
+            current_file.inserted_bytes.clear()
+            current_file.replaced_bytes.clear()
 
-        # Shift non-pattern highlights
-        self.shift_non_pattern_highlights(current_file, insert_position, insert_count)
+            for pos in old_modified:
+                if pos >= insert_position:
+                    current_file.modified_bytes.add(pos + insert_count)
+                else:
+                    current_file.modified_bytes.add(pos)
 
-        # Shift pattern labels
-        self.shift_pattern_labels(current_file, insert_position, insert_count)
+            for pos in old_inserted:
+                if pos >= insert_position:
+                    current_file.inserted_bytes.add(pos + insert_count)
+                else:
+                    current_file.inserted_bytes.add(pos)
 
-        # Shift signature pointers
-        self.shift_signature_pointers(insert_position, insert_count)
+            for pos in old_replaced:
+                if pos >= insert_position:
+                    current_file.replaced_bytes.add(pos + insert_count)
+                else:
+                    current_file.replaced_bytes.add(pos)
 
-        # Insert bytes
-        for i, byte in enumerate(paste_data):
-            pos = insert_position + i
-            current_file.file_data.insert(pos, byte)
-            current_file.inserted_bytes.add(pos)
+            # Shift non-pattern highlights
+            self.shift_non_pattern_highlights(current_file, insert_position, insert_count)
+
+            # Shift pattern labels
+            self.shift_pattern_labels(current_file, insert_position, insert_count)
+
+            # Shift signature pointers
+            self.shift_signature_pointers(insert_position, insert_count)
+
+            # Adjust fields
+            if hasattr(self, 'fields_widget'):
+                self.fields_widget.adjust_for_insert(insert_position, insert_count, self.current_tab_index)
+
+            # Insert bytes
+            for i, byte in enumerate(paste_data):
+                pos = insert_position + i
+                current_file.file_data.insert(pos, byte)
+                current_file.inserted_bytes.add(pos)
 
         current_file.modified = True
         current_file.pattern_highlights_dirty = True  # Mark pattern highlights for reapplication
@@ -8901,7 +6873,7 @@ class HexEditorQt(QMainWindow):
         self.display_hex(preserve_scroll=True)
         # Then scroll to result using proper QTextEdit scrolling, centered
         self.scroll_to_offset(pos, center=True)
-        self.update_data_inspector()
+        self.data_inspector.update()
 
     def show_replace_window(self):
         dialog = QDialog(self)
@@ -9153,7 +7125,7 @@ class HexEditorQt(QMainWindow):
                         self.display_hex(preserve_scroll=True)
 
                         self.update_cursor_highlight()
-                        self.update_data_inspector()
+                        self.data_inspector.update()
                         dialog.accept()
                     else:
                         QMessageBox.critical(dialog, "Error", "Offset out of range")
@@ -9214,6 +7186,27 @@ class HexEditorQt(QMainWindow):
 
         layout.addLayout(segment_layout)
 
+        
+        # Add boundaries button
+        layout.addSpacing(10)
+        separator2 = QFrame()
+        separator2.setFrameShape(QFrame.HLine)
+        separator2.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(separator2)
+
+        boundaries_label = QLabel("Column Boundaries")
+        boundaries_label.setFont(QFont("Arial", 10, QFont.Bold))
+        layout.addWidget(boundaries_label)
+
+        boundaries_help = QLabel("Set column-based editing constraints")
+        boundaries_help.setStyleSheet("color: #888; font-size: 9pt; padding: 5px;")
+        layout.addWidget(boundaries_help)
+
+        boundaries_button = QPushButton("Configure Boundaries...")
+        boundaries_button.setMinimumWidth(200)
+        boundaries_button.clicked.connect(lambda: [dialog.accept(), self.show_boundaries_config()])
+        layout.addWidget(boundaries_button)
+
         layout.addStretch()
 
         # Buttons
@@ -9242,6 +7235,151 @@ class HexEditorQt(QMainWindow):
         dialog.setLayout(layout)
         dialog.exec_()
 
+
+    def show_boundaries_config(self):
+        """Show the column boundaries configuration dialog"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Column Boundaries Configuration")
+        dialog.setModal(True)
+        dialog.resize(400, 250)
+
+        layout = QVBoxLayout()
+
+        # Title
+        title = QLabel("Column Editing Boundaries")
+        title.setFont(QFont("Arial", 11, QFont.Bold))
+        layout.addWidget(title)
+
+        # Help text
+        help_text = QLabel(
+            "Restrict editing to specific column ranges.\n"
+            "When enabled, cursor will wrap at column boundaries.\n"
+            f"Columns range from 0x00 to {self.bytes_per_row - 1:02X} (0-{self.bytes_per_row - 1})."
+        )
+        help_text.setWordWrap(True)
+        help_text.setStyleSheet("color: #888; font-size: 9pt; padding: 5px;")
+        layout.addWidget(help_text)
+
+        # Enable checkbox
+        enable_check = QCheckBox("Enable Column Boundaries")
+        enable_check.setChecked(self.boundary_enabled)
+        layout.addWidget(enable_check)
+
+        # Start column selection
+        start_layout = QHBoxLayout()
+        start_label = QLabel("Start Column (hex):")
+        start_label.setMinimumWidth(150)
+        start_layout.addWidget(start_label)
+        start_spin = QSpinBox()
+        start_spin.setRange(0, self.bytes_per_row - 1)
+        start_spin.setValue(self.boundary_start_col)
+        start_spin.setDisplayIntegerBase(16)
+        start_spin.setPrefix("0x")
+        start_spin.setMinimumWidth(100)
+        start_spin.setMinimumHeight(30)
+        start_layout.addWidget(start_spin)
+        start_layout.addStretch()
+        layout.addLayout(start_layout)
+
+        # End column selection
+        end_layout = QHBoxLayout()
+        end_label = QLabel("End Column (hex):")
+        end_label.setMinimumWidth(150)
+        end_layout.addWidget(end_label)
+        end_spin = QSpinBox()
+        end_spin.setRange(0, self.bytes_per_row - 1)
+        end_spin.setValue(self.boundary_end_col)
+        end_spin.setDisplayIntegerBase(16)
+        end_spin.setPrefix("0x")
+        end_spin.setMinimumWidth(100)
+        end_spin.setMinimumHeight(30)
+        end_layout.addWidget(end_spin)
+        end_layout.addStretch()
+        layout.addLayout(end_layout)
+
+        # Example label
+        example_text = QLabel()
+        def update_example():
+            if enable_check.isChecked():
+                example_text.setText(f"Example: Editing restricted to columns 0x{start_spin.value():02X} through 0x{end_spin.value():02X}")
+            else:
+                example_text.setText("Boundaries disabled - all columns available")
+        update_example()
+        example_text.setStyleSheet("color: #888; font-style: italic; padding: 10px;")
+        layout.addWidget(example_text)
+
+        # Update example when values change
+        enable_check.stateChanged.connect(update_example)
+        start_spin.valueChanged.connect(update_example)
+        end_spin.valueChanged.connect(update_example)
+
+        layout.addStretch()
+
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        # Make buttons larger
+        for button in buttons.buttons():
+            button.setMinimumHeight(35)
+            button.setMinimumWidth(80)
+
+        def apply_boundaries():
+            self.boundary_enabled = enable_check.isChecked()
+            self.boundary_start_col = start_spin.value()
+            self.boundary_end_col = end_spin.value()
+
+            # Validate that start <= end
+            if self.boundary_start_col > self.boundary_end_col:
+                QMessageBox.warning(dialog, "Invalid Range",
+                                  "Start column must be less than or equal to end column.")
+                return
+
+            # Update boundary overlay
+            if hasattr(self, 'boundary_overlay'):
+                self.boundary_overlay.set_boundaries(self.boundary_enabled, self.boundary_start_col, self.boundary_end_col)
+                self.boundary_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
+
+            self.display_hex(preserve_scroll=True)
+            self.save_settings()
+            dialog.accept()
+
+        buttons.accepted.connect(apply_boundaries)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def _serialize_subfields(self, subfields):
+        """Helper function to recursively serialize subfields for JSON export"""
+        serialized = []
+        for subfield in subfields:
+            subfield_dict = {
+                "name": subfield.name,
+                "start": subfield.start,
+                "end": subfield.end,
+                "data_type": subfield.data_type,
+                "endian": subfield.endian,
+                "subfields": self._serialize_subfields(subfield.subfields) if subfield.subfields else []
+            }
+            serialized.append(subfield_dict)
+        return serialized
+
+    def _deserialize_subfields(self, subfields_data):
+        """Helper function to recursively deserialize subfields from JSON"""
+        from datainspect.fields import Subfield
+        subfields = []
+        for subfield_data in subfields_data:
+            subfield = Subfield(
+                subfield_data["name"],
+                subfield_data["start"],
+                subfield_data["end"],
+                subfield_data["data_type"],
+                subfield_data["endian"]
+            )
+            subfield.subfields = self._deserialize_subfields(subfield_data.get("subfields", []))
+            subfields.append(subfield)
+        return subfields
+
     def save_json(self):
         if self.current_tab_index < 0:
             QMessageBox.warning(self, "No File", "Please open a file first")
@@ -9254,9 +7392,10 @@ class HexEditorQt(QMainWindow):
         has_pointers = hasattr(self, 'signature_widget') and self.signature_widget.pointers
         has_pattern_labels = current_file.pattern_labels
         has_delimiters = bool(self.hidden_delimiters)
+        has_fields = hasattr(self, 'fields_widget') and self.fields_widget.fields
 
-        if not has_highlights and not has_pointers and not has_pattern_labels and not has_delimiters:
-            QMessageBox.information(self, "No Data", "No highlights, pointers, pattern labels, or hidden delimiters to save")
+        if not has_highlights and not has_pointers and not has_pattern_labels and not has_delimiters and not has_fields:
+            QMessageBox.information(self, "No Data", "No highlights, pointers, pattern labels, hidden delimiters, or fields to save")
             return
 
         # Show dialog with checkboxes to select what to save
@@ -9298,6 +7437,12 @@ class HexEditorQt(QMainWindow):
             cb = QCheckBox("Hidden Delimiters")
             cb.setChecked(True)
             checkboxes['delimiters'] = cb
+            layout.addWidget(cb)
+
+        if has_fields:
+            cb = QCheckBox("Fields")
+            cb.setChecked(True)
+            checkboxes['fields'] = cb
             layout.addWidget(cb)
 
         layout.addSpacing(10)
@@ -9427,6 +7572,20 @@ class HexEditorQt(QMainWindow):
                 if selected.get('delimiters', False) and self.hidden_delimiters:
                     highlights_data["hidden_delimiters"] = self.hidden_delimiters
 
+                # Add fields section if selected
+                if selected.get('fields', False) and hasattr(self, 'fields_widget') and self.fields_widget.fields:
+                    fields_data = []
+                    for field in self.fields_widget.fields:
+                        field_dict = {
+                            "label": field.label,
+                            "start": field.start,
+                            "end": field.end,
+                            "tab_index": field.tab_index,
+                            "subfields": self._serialize_subfields(field.subfields)
+                        }
+                        fields_data.append(field_dict)
+                    highlights_data["fields"] = fields_data
+
                 with open(file_path, 'w') as f:
                     json.dump(highlights_data, f, indent=2)
 
@@ -9535,7 +7694,8 @@ class HexEditorQt(QMainWindow):
                                 pointer.offset,
                                 pointer.length,
                                 pointer.data_type,
-                                self.signature_widget.string_display_mode
+                                self.signature_widget.string_display_mode,
+                                pointer
                             )
                             self.signature_widget.pointers.append(pointer)
                             self.signature_widget.pointer_added.emit(pointer)
@@ -9558,6 +7718,23 @@ class HexEditorQt(QMainWindow):
                     # Convert string keys back to integers
                     self.hidden_delimiters = {int(k): v for k, v in json_data["hidden_delimiters"].items()}
 
+                # Load fields
+                fields_count = 0
+                if "fields" in json_data and hasattr(self, 'fields_widget'):
+                    self.fields_widget.fields.clear()
+                    for field_data in json_data["fields"]:
+                        from datainspect.fields import Field
+                        field = Field(
+                            field_data["label"],
+                            field_data["start"],
+                            field_data["end"],
+                            field_data["tab_index"]
+                        )
+                        field.subfields = self._deserialize_subfields(field_data.get("subfields", []))
+                        self.fields_widget.fields.append(field)
+                        fields_count += 1
+                    self.fields_widget.rebuild_tree()
+
                 self.display_hex()
 
                 # Build success message
@@ -9568,6 +7745,8 @@ class HexEditorQt(QMainWindow):
                     msg_parts.append(f"{pattern_count} pattern highlight(s)")
                 if pointer_count > 0:
                     msg_parts.append(f"{pointer_count} selection pointer(s)")
+                if fields_count > 0:
+                    msg_parts.append(f"{fields_count} field(s)")
 
                 msg = "Loaded: " + ", ".join(msg_parts) if msg_parts else "No data loaded"
 
@@ -9635,7 +7814,8 @@ class HexEditorQt(QMainWindow):
                         pointer.offset,
                         pointer.length,
                         pointer.data_type,
-                        self.signature_widget.string_display_mode
+                        self.signature_widget.string_display_mode,
+                        pointer
                     )
                     self.signature_widget.pointers.append(pointer)
                     total_loaded += 1
@@ -11406,11 +9586,31 @@ class HexEditorQt(QMainWindow):
             self.hex_display.setMinimumWidth(self.hex_column_width)
             self.hex_display.setMaximumWidth(self.hex_column_width)
 
+            # Update overlay geometries
+            if hasattr(self, 'segment_overlay'):
+                self.segment_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
+            if hasattr(self, 'header_segment_overlay'):
+                self.header_segment_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_header.height())
+            if hasattr(self, 'edit_box_overlay'):
+                self.edit_box_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
+            if hasattr(self, 'boundary_overlay'):
+                self.boundary_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
 
         # Update inspector overlay position
         self.position_inspector_overlay()
+
+        # Update overlay geometries for hex display
+        if hasattr(self, 'segment_overlay') and hasattr(self, 'hex_display'):
+            self.segment_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
+        if hasattr(self, 'header_segment_overlay') and hasattr(self, 'hex_header'):
+            self.header_segment_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_header.height())
+        if hasattr(self, 'edit_box_overlay') and hasattr(self, 'hex_display'):
+            self.edit_box_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
+        if hasattr(self, 'boundary_overlay') and hasattr(self, 'hex_display'):
+            self.boundary_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
 
         # Update search overlay position when window resizes (overlay spans hex and ASCII at bottom)
         if hasattr(self, 'results_overlay') and self.results_overlay is not None and self.results_overlay.isVisible():
@@ -11619,6 +9819,21 @@ class HexEditorQt(QMainWindow):
             self.apply_theme()
             self.save_settings()
 
+    def show_debug_window(self):
+        """Show debugging console window"""
+        if self.debug_window is None:
+            self.debug_window = DebugWindow(self)
+
+            # Setup output redirection if not already done
+            if self.debug_redirector is None:
+                self.debug_redirector = DebugOutputRedirector(self.debug_window.output_text)
+                sys.stdout = self.debug_redirector
+                sys.stderr = self.debug_redirector
+
+        self.debug_window.show()
+        self.debug_window.raise_()
+        self.debug_window.activateWindow()
+
     def show_about_dialog(self):
         """Show About dialog with application information"""
         dialog = QDialog(self)
@@ -11685,7 +9900,7 @@ class HexEditorQt(QMainWindow):
         main_layout.addSpacing(10)
 
         # Version section
-        version_label = QLabel("Version: 1.7.6.0 (Visual Build)")
+        version_label = QLabel("Version: 1.0.0.0 (Initial Build)")
         version_font = QFont("Arial", 9)
         version_label.setFont(version_font)
         version_label.setAlignment(Qt.AlignCenter)
@@ -11709,10 +9924,10 @@ class HexEditorQt(QMainWindow):
         main_layout.addSpacing(5)
 
         # Link
-        link_label = QLabel('<a href="https://github.com/Digitzaki/RxD_Editor">https://github.com/Digitzaki/RxD_Editor/</a>')
+        link_label = QLabel('<a href="https://digitzaki.github.io/">https://digitzaki.github.io/</a>')
         link_label.setOpenExternalLinks(True)
         link_label.setAlignment(Qt.AlignCenter)
-        link_font = QFont("Arial", 10)
+        link_font = QFont("Arial", 9)
         link_label.setFont(link_font)
         if self.is_dark_theme():
             link_label.setStyleSheet("color: #4a9eff;")
@@ -11780,6 +9995,11 @@ class HexEditorQt(QMainWindow):
                     segment_size = settings.get('segment_size', 0)
                     if segment_size in [0, 1, 2, 4, 8]:
                         self.segment_size = segment_size
+
+                    # Load boundary settings
+                    self.boundary_enabled = settings.get('boundary_enabled', False)
+                    self.boundary_start_col = settings.get('boundary_start_col', 0)
+                    self.boundary_end_col = settings.get('boundary_end_col', 15)
         except Exception as e:
             print(f"Error loading settings: {e}")
 
@@ -11815,6 +10035,9 @@ class HexEditorQt(QMainWindow):
             # Update settings
             settings['theme'] = self.current_theme
             settings['segment_size'] = self.segment_size
+            settings['boundary_enabled'] = self.boundary_enabled
+            settings['boundary_start_col'] = self.boundary_start_col
+            settings['boundary_end_col'] = self.boundary_end_col
 
             # Save settings
             with open(settings_file, 'w') as f:
@@ -11923,12 +10146,150 @@ class HexEditorQt(QMainWindow):
         if self.notes_window is not None:
             self.notes_window.apply_theme(self.is_dark_theme())
 
+        # Update tab scroll buttons theme
+        if hasattr(self, 'right_panel_tabs'):
+            self.update_tab_scroll_buttons_style()
+
         # Refresh display to update byte selection and data inspector colors
         if self.current_tab_index >= 0:
             self.display_hex(preserve_scroll=True)
 
         # Update pointer overlay colors
         self.update_signature_overlays()
+
+    def update_tab_scroll_buttons_style(self):
+        """Update tab scroll button styling to match current theme"""
+        theme_colors = get_theme_colors(self.current_theme)
+
+        # Use editor background or menubar background for buttons - ensure opaque
+        bg_color = theme_colors.get('editor_bg', '#252526')
+        if bg_color == 'transparent':
+            bg_color = theme_colors.get('menubar_bg', '#2d2d30')
+
+        # Use solid background color to prevent tabs from showing through
+        scroller_bg = theme_colors.get('background', '#1e1e1e')
+
+        # Ensure hover and pressed colors are fully opaque
+        hover_color = theme_colors.get('button_hover', '#3e3e42')
+        # Use button_bg for pressed state to ensure it's fully opaque
+        pressed_color = theme_colors.get('button_bg', '#0e639c')
+        foreground_color = theme_colors.get('foreground', '#d4d4d4')
+
+        # Style with triangular arrow symbols ◀ ▶
+        self.right_panel_tabs.setStyleSheet(f"""
+            QTabBar::scroller {{
+                width: 60px;
+                background-color: {scroller_bg};
+                border: none;
+            }}
+            QTabBar QToolButton {{
+                background-color: {bg_color};
+                border: 1px solid {theme_colors.get('border', '#3e3e42')};
+                border-radius: 2px;
+                margin: 1px;
+                padding: 2px;
+                min-width: 26px;
+                max-width: 26px;
+                min-height: 24px;
+                color: {foreground_color};
+                font-size: 14px;
+                font-weight: normal;
+                font-family: Arial, sans-serif;
+            }}
+            QTabBar QToolButton:hover {{
+                background-color: {hover_color};
+            }}
+            QTabBar QToolButton:pressed {{
+                background-color: {pressed_color};
+                border: 1px solid {pressed_color};
+            }}
+            QTabBar QToolButton::left-arrow {{
+                image: none;
+            }}
+            QTabBar QToolButton::right-arrow {{
+                image: none;
+            }}
+        """)
+
+        # Set arrow button text using a delayed call to ensure buttons exist
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(10, self._update_arrow_button_text)
+
+    def _update_arrow_button_text(self):
+        """Update the arrow button text to show < and > symbols"""
+        if not hasattr(self, 'right_panel_tabs'):
+            return
+
+        try:
+            # Find all QToolButton children in the tab bar
+            tab_bar = self.right_panel_tabs.tabBar()
+            if tab_bar:
+                for button in tab_bar.findChildren(QToolButton):
+                    # Check arrow type and set text with Unicode triangular arrows
+                    if button.arrowType() == Qt.LeftArrow:
+                        button.setText("◀")  # U+25C0 Black Left-Pointing Triangle
+                        button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+                    elif button.arrowType() == Qt.RightArrow:
+                        button.setText("▶")  # U+25B6 Black Right-Pointing Triangle
+                        button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        except Exception:
+            pass
+
+    def update_edit_box_overlay(self):
+        """Update the edit box overlay visualization"""
+        if not hasattr(self, 'edit_box_overlay'):
+            return
+
+        if not self.edit_box_active or self.edit_box_start is None:
+            self.edit_box_overlay.clear_edit_box()
+            return
+
+        # Calculate the visual rectangle for the edit box
+        try:
+            font_metrics = QFontMetrics(self.hex_display.font())
+            char_width = font_metrics.horizontalAdvance('0')
+            line_height = font_metrics.height()
+
+            # Calculate starting position
+            start_row = self.edit_box_start // self.bytes_per_row
+            start_col = self.edit_box_start % self.bytes_per_row
+            end_row = self.edit_box_end // self.bytes_per_row
+            end_col = self.edit_box_end % self.bytes_per_row
+
+            # Calculate relative row positions (accounting for rendered start)
+            rendered_start_row = self.rendered_start_byte // self.bytes_per_row
+            rendered_end_byte = self.rendered_start_byte + (self.visible_rows * self.bytes_per_row)
+            rendered_end_row = rendered_end_byte // self.bytes_per_row
+
+            # Check if edit box is visible in current viewport
+            if end_row < rendered_start_row or start_row > rendered_end_row:
+                # Edit box is not visible, hide it
+                self.edit_box_overlay.clear_edit_box()
+                return
+
+            visual_start_row = start_row - rendered_start_row
+            visual_end_row = end_row - rendered_start_row
+
+            # Clamp to visible area
+            if visual_start_row < 0:
+                visual_start_row = 0
+            if visual_end_row >= self.visible_rows:
+                visual_end_row = self.visible_rows - 1
+
+            # Hex display has 2 leading spaces (see display_hex line 5447)
+            # Each hex byte is 2 characters + 1 space (3 chars total)
+            leading_spaces = 2
+            x_start = (leading_spaces + start_col * 3) * char_width
+            # End should be 2 chars for the byte (not including trailing space)
+            x_end = (leading_spaces + end_col * 3 + 2.75) * char_width
+            y_start = visual_start_row * line_height
+            # Add slight padding to ensure full coverage without bleeding
+            y_end = (visual_end_row + 1) * line_height + 2.25
+
+            rect = QRect(int(x_start), int(y_start), int(x_end - x_start), int(y_end - y_start))
+            self.edit_box_overlay.set_edit_box(rect)
+        except Exception as e:
+            print(f"Error updating edit box overlay: {e}")
 
     def keyPressEvent(self, event):
         print(f"keyPressEvent: cursor_pos={self.cursor_position}, tab={self.current_tab_index}, key={event.key()}, text={event.text()}")
@@ -11948,10 +10309,68 @@ class HexEditorQt(QMainWindow):
                    Qt.Key_Return, Qt.Key_Enter, Qt.Key_CapsLock, Qt.Key_Tab,
                    Qt.Key_Escape, Qt.Key_Backspace, Qt.Key_Delete):
             # Let these be handled by their specific handlers below
-            pass
-        # Handle hex digit input (0-9, A-F) only if it's a valid single character
+            pass        # Handle hex digit input (0-9, A-F) only if it's a valid single character
         # and no modifiers are pressed (except Shift for letters)
         elif text in '0123456789ABCDEF' and len(text) == 1:
+            # Typing detection: Check if we're typing (not paste) and have a highlight
+            is_manual_typing = not (modifiers & Qt.ControlModifier)  # Not Ctrl+V or other paste
+
+            # If manual typing and we have a highlight but no edit box yet
+            # Only process if it's a REAL selection (start != end), not just a single click
+            if is_manual_typing and self.selection_start is not None and self.selection_end is not None:
+                if not self.edit_box_active and self.selection_start != self.selection_end:
+                    sel_start = min(self.selection_start, self.selection_end)
+                    sel_end = max(self.selection_start, self.selection_end)
+
+                    # ONLY activate edit box for column selections (Ctrl+Click+Drag)
+                    # For regular drag selections, just move cursor to start
+                    if self.column_selection_mode:
+                        # Column selection - activate edit box
+                        self.edit_box_active = True
+                        self.edit_box_start = sel_start
+                        self.edit_box_end = sel_end
+
+                        # Calculate row and column boundaries
+                        self.edit_box_start_row = sel_start // self.bytes_per_row
+                        self.edit_box_start_col = sel_start % self.bytes_per_row
+                        self.edit_box_end_row = sel_end // self.bytes_per_row
+                        self.edit_box_end_col = sel_end % self.bytes_per_row
+
+                        # Move cursor to start of highlight
+                        self.cursor_position = sel_start
+                        self.cursor_nibble = 0
+
+                        # Update edit box visual
+                        self.update_edit_box_overlay()
+
+                        print(f"Edit box activated for column selection: {sel_start} to {sel_end}")
+                    else:
+                        # Regular drag selection - move cursor to start, no edit box
+                        # Clear selection so cursor can advance normally
+                        self.cursor_position = sel_start
+                        self.cursor_nibble = 0
+                        self.selection_start = None
+                        self.selection_end = None
+                        print(f"Regular drag selection: moved cursor to start {sel_start}, clearing highlight")
+                elif self.selection_start == self.selection_end:
+                    # Single click selection - clear it so it doesn't show highlight
+                    self.selection_start = None
+                    self.selection_end = None
+                    print(f"Single click: clearing highlight")
+
+            # Check if we're within edit box boundaries (if edit box is active)
+            if self.edit_box_active:
+                if self.cursor_position < self.edit_box_start or self.cursor_position > self.edit_box_end:
+                    print(f"Cursor {self.cursor_position} outside edit box [{self.edit_box_start}, {self.edit_box_end}], ignoring input")
+                    return
+
+            # Check boundary constraints (if enabled)
+            if self.boundary_enabled:
+                current_col = self.cursor_position % self.bytes_per_row
+                if current_col < self.boundary_start_col or current_col > self.boundary_end_col:
+                    print(f"Cursor at col {current_col} outside boundaries [{self.boundary_start_col}, {self.boundary_end_col}], ignoring input")
+                    return
+
             print(f"Editing byte at {self.cursor_position}: nibble={self.cursor_nibble}")
             if self.cursor_position < len(current_file.file_data):
                 # Save for undo on first nibble of each byte
@@ -11991,13 +10410,51 @@ class HexEditorQt(QMainWindow):
                 # Schedule snapshot after edit
                 self.schedule_snapshot()
 
-                # Move cursor
+                # Move cursor with wrapping logic for edit box
                 if self.cursor_nibble == 0:
                     self.cursor_nibble = 1
                 else:
                     self.cursor_nibble = 0
-                    if self.cursor_position < len(current_file.file_data) - 1:
-                        self.cursor_position += 1
+
+                    # Check if we just finished editing the last byte of the edit box
+                    if self.edit_box_active and self.cursor_position == self.edit_box_end:
+                        # Deactivate edit box after completing the last byte
+                        self.edit_box_active = False
+                        if hasattr(self, 'edit_box_overlay'):
+                            self.edit_box_overlay.clear_edit_box()
+                        print(f"Edit box deactivated after completing last byte at {self.cursor_position}")
+                        # Clear selection
+                        self.selection_start = None
+                        self.selection_end = None
+                    elif self.cursor_position < len(current_file.file_data) - 1:
+                        next_pos = self.cursor_position + 1
+
+                        # Handle wrapping within edit box
+                        if self.edit_box_active:
+                            # Check if we're at the end of a row within the edit box
+                            current_row = self.cursor_position // self.bytes_per_row
+                            current_col = self.cursor_position % self.bytes_per_row
+
+                            # If at the end column of the edit box, wrap to start column of next row
+                            if current_col == self.edit_box_end_col and current_row < self.edit_box_end_row:
+                                next_pos = (current_row + 1) * self.bytes_per_row + self.edit_box_start_col
+                            # If we would go past the edit box end, wrap back to start
+                            elif next_pos > self.edit_box_end:
+                                next_pos = self.edit_box_start
+                                print(f"Edit box: wrapped from end {self.edit_box_end} to start {self.edit_box_start}")
+
+                        # Handle wrapping within boundaries
+                        elif self.boundary_enabled:
+                            current_col = self.cursor_position % self.bytes_per_row
+                            current_row = self.cursor_position // self.bytes_per_row
+
+                            # Check if we're at the end column of the boundary
+                            if current_col == self.boundary_end_col:
+                                # Wrap to start column of next row
+                                next_pos = (current_row + 1) * self.bytes_per_row + self.boundary_start_col
+                                print(f"Boundary wrap: at end col {self.boundary_end_col}, wrapping to next row pos {next_pos}")
+
+                        self.cursor_position = next_pos
 
                 self.display_hex(preserve_scroll=True)
                 self.scroll_to_offset(self.cursor_position)
@@ -12009,7 +10466,22 @@ class HexEditorQt(QMainWindow):
             if self.cursor_nibble == 1:
                 self.cursor_nibble = 0
             elif self.cursor_position > 0:
-                self.cursor_position -= 1
+                new_pos = self.cursor_position - 1
+                # Check edit box boundaries
+                if self.edit_box_active and new_pos < self.edit_box_start:
+                    print(f"Left arrow blocked by edit box boundary")
+                    new_pos = self.cursor_position
+                # Check boundary constraints (wrap to end of previous row if needed)
+                elif self.boundary_enabled:
+                    new_col = new_pos % self.bytes_per_row
+                    if new_col < self.boundary_start_col:
+                        # Wrap to end column of previous row
+                        new_row = (new_pos // self.bytes_per_row) - 1
+                        if new_row >= 0:
+                            new_pos = new_row * self.bytes_per_row + self.boundary_end_col
+                        else:
+                            new_pos = self.cursor_position  # Stay at current position
+                self.cursor_position = new_pos
                 self.cursor_nibble = 1
             print(f"Left arrow: {old_pos} -> {self.cursor_position}, nibble={self.cursor_nibble}")
             self.display_hex(preserve_scroll=True)
@@ -12021,7 +10493,22 @@ class HexEditorQt(QMainWindow):
             if self.cursor_nibble == 0:
                 self.cursor_nibble = 1
             elif self.cursor_position < len(current_file.file_data) - 1:
-                self.cursor_position += 1
+                new_pos = self.cursor_position + 1
+                # Check edit box boundaries
+                if self.edit_box_active and new_pos > self.edit_box_end:
+                    print(f"Right arrow blocked by edit box boundary")
+                    new_pos = self.cursor_position
+                # Check boundary constraints (wrap to start of next row if needed)
+                elif self.boundary_enabled:
+                    new_col = new_pos % self.bytes_per_row
+                    if new_col > self.boundary_end_col:
+                        # Wrap to start column of next row
+                        new_row = (new_pos // self.bytes_per_row) + 1
+                        if new_row * self.bytes_per_row + self.boundary_start_col < len(current_file.file_data):
+                            new_pos = new_row * self.bytes_per_row + self.boundary_start_col
+                        else:
+                            new_pos = self.cursor_position  # Stay at current position
+                self.cursor_position = new_pos
                 self.cursor_nibble = 0
             print(f"Right arrow: {old_pos} -> {self.cursor_position}, nibble={self.cursor_nibble}")
             self.display_hex(preserve_scroll=True)
@@ -12031,7 +10518,18 @@ class HexEditorQt(QMainWindow):
         elif key == Qt.Key_Up:
             old_pos = self.cursor_position
             if self.cursor_position >= self.bytes_per_row:
-                self.cursor_position -= self.bytes_per_row
+                new_pos = self.cursor_position - self.bytes_per_row
+                # Check edit box boundaries
+                if self.edit_box_active and new_pos < self.edit_box_start:
+                    print(f"Up arrow blocked by edit box boundary")
+                    new_pos = self.cursor_position
+                # Check boundary constraints (keep within column range)
+                elif self.boundary_enabled:
+                    new_col = new_pos % self.bytes_per_row
+                    if new_col < self.boundary_start_col or new_col > self.boundary_end_col:
+                        print(f"Up arrow would move outside column boundaries, staying in place")
+                        new_pos = self.cursor_position
+                self.cursor_position = new_pos
             print(f"Up arrow: {old_pos} -> {self.cursor_position}")
             self.display_hex(preserve_scroll=True)
             self.scroll_to_offset(self.cursor_position)
@@ -12040,7 +10538,18 @@ class HexEditorQt(QMainWindow):
         elif key == Qt.Key_Down:
             old_pos = self.cursor_position
             if self.cursor_position + self.bytes_per_row < len(current_file.file_data):
-                self.cursor_position += self.bytes_per_row
+                new_pos = self.cursor_position + self.bytes_per_row
+                # Check edit box boundaries
+                if self.edit_box_active and new_pos > self.edit_box_end:
+                    print(f"Down arrow blocked by edit box boundary")
+                    new_pos = self.cursor_position
+                # Check boundary constraints (keep within column range)
+                elif self.boundary_enabled:
+                    new_col = new_pos % self.bytes_per_row
+                    if new_col < self.boundary_start_col or new_col > self.boundary_end_col:
+                        print(f"Down arrow would move outside column boundaries, staying in place")
+                        new_pos = self.cursor_position
+                self.cursor_position = new_pos
             print(f"Down arrow: {old_pos} -> {self.cursor_position}")
             self.display_hex(preserve_scroll=True)
             self.scroll_to_offset(self.cursor_position)
@@ -12316,6 +10825,15 @@ class HexEditorQt(QMainWindow):
         for window in self.auxiliary_windows:
             if window and window.isVisible():
                 window.close()
+
+        # Close debug window if open
+        if self.debug_window:
+            self.debug_window.close()
+
+        # Restore stdout/stderr
+        if self.debug_redirector:
+            sys.stdout = self.original_stdout
+            sys.stderr = self.original_stderr
 
         # Close notebook window separately so it can be excluded if needed
         # The notebook window is not in auxiliary_windows list, so it stays open
