@@ -1,6 +1,5 @@
 # RxD Hex Editor
 
-<<<<<<< HEAD
 A modern, professional hex editor designed for clear, efficient binary file modification and analysis. RxD Editor delivers all the essential features of traditional hex editors while introducing enhanced visuals, advanced analysis tools, integrated version control, and workflow-improving productivity features.
 
 ## ✨ Features
