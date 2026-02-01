@@ -297,4 +297,3 @@ Shows current file state:
 5. **Scan** - Use Pattern Scan tab to analyze file structure
 6. **Highlight** - Mark important bytes with custom colors and labels (Ctrl+H)
 7. **Save** - Ctrl+S to save changes
->>>>>>> db7e5dae79940aa90d475eb0f67a2c703878512f
