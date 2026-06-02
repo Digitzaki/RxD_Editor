@@ -1,7 +1,7 @@
 import struct
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem,
                              QPushButton, QLabel, QLineEdit, QComboBox, QHBoxLayout,
-                             QMenu, QAction, QInputDialog, QAbstractItemView)
+                             QMenu, QAction, QInputDialog, QAbstractItemView, QCheckBox)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QColor
 
@@ -48,6 +48,7 @@ class Subfield:
         self.data_type = data_type
         self.endian = endian
         self.subfields = []
+        self.overlay_pointer = False
 
     def adjust_for_insert(self, insert_pos, insert_len):
         if insert_pos <= self.start:
@@ -80,44 +81,18 @@ class FieldTreeWidget(QTreeWidget):
         super().__init__(parent)
 
     def dropEvent(self, event):
-        drop_indicator = self.dropIndicatorPosition()
-        if drop_indicator == QAbstractItemView.OnItem:
-            event.ignore()
-            return
-
-        # Get the item being dragged
         dragged_item = self.currentItem()
         if not dragged_item:
             event.ignore()
             return
 
-        # Check if it's a subfield
-        item_type = dragged_item.data(0, Qt.UserRole)
-        if item_type == "subfield":
-            # Get the drop target
-            drop_target = self.itemAt(event.pos())
-
-            # If drop target is None (root level) or is not a child/descendant of the same field, reject
-            if drop_target is None:
-                event.ignore()
+        owner = self.parent()
+        if owner and hasattr(owner, "handle_tree_drop"):
+            if owner.handle_tree_drop(dragged_item, self.itemAt(event.pos()), self.dropIndicatorPosition()):
+                event.accept()
                 return
 
-            # Find the parent field of the dragged item
-            dragged_parent = dragged_item.parent()
-            while dragged_parent and dragged_parent.data(0, Qt.UserRole) != "field":
-                dragged_parent = dragged_parent.parent()
-
-            # Find the parent field of the drop target
-            drop_parent = drop_target
-            while drop_parent and drop_parent.data(0, Qt.UserRole) != "field":
-                drop_parent = drop_parent.parent()
-
-            # Only allow drop if both belong to the same parent field
-            if dragged_parent != drop_parent:
-                event.ignore()
-                return
-
-        super().dropEvent(event)
+        event.ignore()
 
 
 class FieldWidget(QWidget):
@@ -128,6 +103,7 @@ class FieldWidget(QWidget):
         self.fields = []
         self.parent_editor = None
         self.clipboard_segment = None
+        self.clipboard_subfield = None
         self.setup_ui()
 
     def setup_ui(self):
@@ -140,7 +116,7 @@ class FieldWidget(QWidget):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        self.tree = FieldTreeWidget()
+        self.tree = FieldTreeWidget(self)
         self.tree.setHeaderLabels(["Field / Subfield"])
         self.tree.setFont(QFont("Arial", 9))
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -164,7 +140,7 @@ class FieldWidget(QWidget):
         if item and item.data(0, Qt.UserRole) == "field":
             paste_action = QAction("Paste Subfield", self)
             paste_action.triggered.connect(lambda: self.paste_subfield(item))
-            paste_action.setEnabled(self.clipboard_segment is not None)
+            paste_action.setEnabled(self.clipboard_segment is not None or self.clipboard_subfield is not None)
             menu.addAction(paste_action)
 
             rename_action = QAction("Rename Field", self)
@@ -176,9 +152,13 @@ class FieldWidget(QWidget):
             menu.addAction(delete_action)
 
         elif item and item.data(0, Qt.UserRole) == "subfield":
+            copy_action = QAction("Copy Subfield", self)
+            copy_action.triggered.connect(lambda: self.copy_subfield(item))
+            menu.addAction(copy_action)
+
             paste_action = QAction("Paste Nested Subfield", self)
             paste_action.triggered.connect(lambda: self.paste_nested_subfield(item))
-            paste_action.setEnabled(self.clipboard_segment is not None)
+            paste_action.setEnabled(self.clipboard_segment is not None or self.clipboard_subfield is not None)
             menu.addAction(paste_action)
 
             delete_action = QAction("Delete Subfield", self)
@@ -219,69 +199,81 @@ class FieldWidget(QWidget):
 
     def delete_subfield(self, item):
         subfield = item.data(0, Qt.UserRole + 1)
-        parent_item = item.parent()
-        if subfield and parent_item:
-            parent_obj = parent_item.data(0, Qt.UserRole + 1)
-            if parent_obj and hasattr(parent_obj, 'subfields') and subfield in parent_obj.subfields:
-                parent_obj.subfields.remove(subfield)
-                self.rebuild_tree()
-                self.status_label.setText("Subfield deleted")
-                if self.parent_editor:
-                    self.parent_editor.display_hex()
+        parent_list = self.find_subfield_parent_list(subfield)
+        if subfield and parent_list and subfield in parent_list:
+            parent_list.remove(subfield)
+            self.rebuild_tree()
+            self.status_label.setText("Subfield deleted")
+            if self.parent_editor:
+                self.parent_editor.display_hex()
+
+    def copy_subfield(self, item):
+        subfield = item.data(0, Qt.UserRole + 1)
+        if subfield:
+            self.clipboard_subfield = self.clone_subfield(subfield)
+            self.clipboard_segment = None
+            self.status_label.setText(f"Copied subfield '{subfield.name}'")
 
     def paste_subfield(self, field_item):
-        if not self.clipboard_segment or not self.parent_editor:
+        if (not self.clipboard_segment and not self.clipboard_subfield) or not self.parent_editor:
             return
 
         field = field_item.data(0, Qt.UserRole + 1)
         if not field:
             return
 
-        start, end, tab_index = self.clipboard_segment
-
-        if tab_index != self.parent_editor.current_tab_index:
-            self.status_label.setText("Cannot paste from different file")
+        subfield = self.build_subfield_from_clipboard(f"Subfield_{len(field.subfields) + 1}")
+        if not subfield:
             return
-
-        length = end - start
-        data_type = "Hex"
-        endian = "LE"
-
-        subfield = Subfield(f"Subfield_{len(field.subfields) + 1}", start, end, data_type, endian)
         field.subfields.append(subfield)
 
         self.rebuild_tree()
-        self.status_label.setText(f"Subfield added at 0x{start:X}-0x{end:X}")
+        self.status_label.setText(f"Subfield pasted into '{field.label}'")
 
         if self.parent_editor:
             self.parent_editor.display_hex()
 
     def paste_nested_subfield(self, subfield_item):
-        if not self.clipboard_segment or not self.parent_editor:
+        if (not self.clipboard_segment and not self.clipboard_subfield) or not self.parent_editor:
             return
 
         parent_subfield = subfield_item.data(0, Qt.UserRole + 1)
         if not parent_subfield:
             return
 
-        start, end, tab_index = self.clipboard_segment
-
-        if tab_index != self.parent_editor.current_tab_index:
-            self.status_label.setText("Cannot paste from different file")
+        nested_subfield = self.build_subfield_from_clipboard(f"Nested_{len(parent_subfield.subfields) + 1}")
+        if not nested_subfield:
             return
-
-        length = end - start
-        data_type = "Hex"
-        endian = "LE"
-
-        nested_subfield = Subfield(f"Nested_{len(parent_subfield.subfields) + 1}", start, end, data_type, endian)
         parent_subfield.subfields.append(nested_subfield)
 
         self.rebuild_tree()
-        self.status_label.setText(f"Nested subfield added at 0x{start:X}-0x{end:X}")
+        self.status_label.setText(f"Nested subfield pasted into '{parent_subfield.name}'")
 
         if self.parent_editor:
             self.parent_editor.display_hex()
+
+    def build_subfield_from_clipboard(self, fallback_name):
+        if self.clipboard_subfield:
+            clone = self.clone_subfield(self.clipboard_subfield)
+            if not clone.name:
+                clone.name = fallback_name
+            return clone
+
+        if not self.clipboard_segment or not self.parent_editor:
+            return None
+
+        start, end, tab_index = self.clipboard_segment
+        if tab_index != self.parent_editor.current_tab_index:
+            self.status_label.setText("Cannot paste from different file")
+            return None
+
+        return Subfield(fallback_name, start, end, "Hex", "LE")
+
+    def clone_subfield(self, subfield):
+        clone = Subfield(subfield.name, subfield.start, subfield.end, subfield.data_type, subfield.endian)
+        clone.overlay_pointer = getattr(subfield, "overlay_pointer", False)
+        clone.subfields = [self.clone_subfield(child) for child in subfield.subfields]
+        return clone
 
     def add_field(self, label, start, end, tab_index):
         print(f"DEBUG add_field called: label={label}, start={start} (0x{start:X}), end={end} (0x{end:X})")
@@ -331,28 +323,9 @@ class FieldWidget(QWidget):
             self.parent_editor.display_hex()
 
     def copy_segment(self, start, end, tab_index):
-        containing_field = None
-        for field in self.fields:
-            if field.tab_index == tab_index and field.start <= start and end <= field.end:
-                containing_field = field
-                break
-
-        if containing_field:
-            subfield = Subfield(
-                f"Subfield_{len(containing_field.subfields) + 1}",
-                start,
-                end,
-                "Hex",
-                "LE"
-            )
-            containing_field.subfields.append(subfield)
-            self.rebuild_tree()
-            self.status_label.setText(f"Subfield auto-added to '{containing_field.label}'")
-            if self.parent_editor:
-                self.parent_editor.display_hex()
-        else:
-            self.clipboard_segment = (start, end, tab_index)
-            self.status_label.setText(f"Copied segment 0x{start:X}-0x{end:X}")
+        self.clipboard_segment = (start, end, tab_index)
+        self.clipboard_subfield = None
+        self.status_label.setText(f"Copied segment 0x{start:X}-0x{end:X}; right-click a field to paste")
 
     def save_expansion_state(self, item, expanded_items):
         obj = item.data(0, Qt.UserRole + 1)
@@ -361,6 +334,106 @@ class FieldWidget(QWidget):
         for i in range(item.childCount()):
             child = item.child(i)
             self.save_expansion_state(child, expanded_items)
+
+    def find_subfield_parent_list(self, subfield, subfields=None):
+        if subfields is None:
+            for field in self.fields:
+                found = self.find_subfield_parent_list(subfield, field.subfields)
+                if found is not None:
+                    return found
+            return None
+
+        if subfield in subfields:
+            return subfields
+
+        for child in subfields:
+            found = self.find_subfield_parent_list(subfield, child.subfields)
+            if found is not None:
+                return found
+        return None
+
+    def is_descendant_subfield(self, possible_parent, possible_child):
+        if possible_parent is possible_child:
+            return True
+        for child in possible_parent.subfields:
+            if self.is_descendant_subfield(child, possible_child):
+                return True
+        return False
+
+    def normalize_drop_target(self, target_item):
+        while target_item and target_item.data(0, Qt.UserRole) not in ("field", "subfield"):
+            target_item = target_item.parent()
+        return target_item
+
+    def handle_tree_drop(self, dragged_item, target_item, drop_indicator):
+        dragged_type = dragged_item.data(0, Qt.UserRole)
+        if dragged_type not in ("field", "subfield"):
+            return False
+
+        target_item = self.normalize_drop_target(target_item)
+        target_type = target_item.data(0, Qt.UserRole) if target_item else None
+
+        if dragged_type == "field":
+            field = dragged_item.data(0, Qt.UserRole + 1)
+            if field not in self.fields:
+                return False
+
+            old_index = self.fields.index(field)
+            insert_index = len(self.fields)
+            if target_type == "field":
+                target_field = target_item.data(0, Qt.UserRole + 1)
+                if target_field in self.fields:
+                    insert_index = self.fields.index(target_field)
+                    if drop_indicator == QAbstractItemView.BelowItem:
+                        insert_index += 1
+            if old_index < insert_index:
+                insert_index -= 1
+            self.fields.remove(field)
+            self.fields.insert(insert_index, field)
+            self.rebuild_tree(preserve_expansion=True)
+            self.status_label.setText(f"Moved field '{field.label}'")
+            return True
+
+        subfield = dragged_item.data(0, Qt.UserRole + 1)
+        source_list = self.find_subfield_parent_list(subfield)
+        if source_list is None:
+            return False
+
+        if target_type == "subfield":
+            target_subfield = target_item.data(0, Qt.UserRole + 1)
+            if self.is_descendant_subfield(subfield, target_subfield):
+                self.status_label.setText("Cannot move a subfield into itself")
+                return False
+            if drop_indicator == QAbstractItemView.OnItem:
+                destination_list = target_subfield.subfields
+                insert_index = len(destination_list)
+            else:
+                destination_list = self.find_subfield_parent_list(target_subfield)
+                if destination_list is None:
+                    return False
+                insert_index = destination_list.index(target_subfield)
+                if drop_indicator == QAbstractItemView.BelowItem:
+                    insert_index += 1
+        elif target_type == "field":
+            target_field = target_item.data(0, Qt.UserRole + 1)
+            destination_list = target_field.subfields
+            insert_index = 0 if drop_indicator == QAbstractItemView.AboveItem else len(destination_list)
+        else:
+            return False
+
+        if destination_list is source_list:
+            old_index = source_list.index(subfield)
+            if old_index < insert_index:
+                insert_index -= 1
+        source_list.remove(subfield)
+        if insert_index > len(destination_list):
+            insert_index = len(destination_list)
+        destination_list.insert(insert_index, subfield)
+        self.rebuild_tree(preserve_expansion=True)
+        self.status_label.setText(f"Moved subfield '{subfield.name}'")
+        if self.parent_editor:
+            self.parent_editor.display_hex(preserve_scroll=True)
+        return True
 
     def rebuild_tree(self, preserve_expansion=False):
         expanded_items = set()
@@ -510,6 +583,13 @@ class FieldWidget(QWidget):
             endian_btn.clicked.connect(lambda checked, sf=subfield: self.toggle_endian(sf))
             type_layout.addWidget(endian_btn)
 
+        overlay_check = QCheckBox("Overlay")
+        overlay_check.setFont(QFont("Arial", 8))
+        overlay_check.setToolTip("Show this subfield as an editable pointer overlay in the hex view")
+        overlay_check.setChecked(getattr(subfield, "overlay_pointer", False))
+        overlay_check.stateChanged.connect(lambda state, sf=subfield: self.on_overlay_changed(sf, state))
+        type_layout.addWidget(overlay_check)
+
         type_layout.addStretch()
         type_widget.setLayout(type_layout)
         self.tree.setItemWidget(type_item, 0, type_widget)
@@ -575,6 +655,14 @@ class FieldWidget(QWidget):
         self.rebuild_tree(preserve_expansion=True)
         if self.parent_editor:
             self.parent_editor.display_hex()
+
+    def on_overlay_changed(self, subfield, state):
+        subfield.overlay_pointer = (state == Qt.Checked)
+        if self.parent_editor:
+            self.parent_editor.display_hex(preserve_scroll=True)
+        self.status_label.setText(
+            f"Overlay {'enabled' if subfield.overlay_pointer else 'disabled'} for '{subfield.name}'"
+        )
 
     def toggle_endian(self, subfield):
         subfield.endian = "BE" if subfield.endian == "LE" else "LE"
@@ -882,3 +970,32 @@ class FieldWidget(QWidget):
         for field in self.fields:
             if field.tab_index == tab_index:
                 field.adjust_for_delete(delete_pos, delete_len)
+
+    def get_overlay_pointers(self, tab_index):
+        from datainspect.pointers import SignaturePointer
+
+        pointers = []
+
+        def collect(subfields):
+            for subfield in subfields:
+                if getattr(subfield, "overlay_pointer", False):
+                    pointer_type = subfield.data_type
+                    if self.needs_endianness(pointer_type):
+                        pointer_type = f"{pointer_type} {subfield.endian}"
+                    pointer = SignaturePointer(
+                        subfield.start,
+                        subfield.end - subfield.start,
+                        pointer_type,
+                        subfield.name,
+                        category="Fields",
+                        endianness=subfield.endian
+                    )
+                    pointer.field_subfield = subfield
+                    pointers.append(pointer)
+                collect(subfield.subfields)
+
+        for field in self.fields:
+            if field.tab_index == tab_index:
+                collect(field.subfields)
+
+        return pointers

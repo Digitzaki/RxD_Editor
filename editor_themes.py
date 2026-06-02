@@ -5,14 +5,18 @@ Defines color schemes for the hex editor application
 
 import json
 import os
+import sys
+import ctypes
 from pathlib import Path
+from rxd_paths import migrated_storage_path
 
 try:
-    from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+    from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
                                  QPushButton, QLineEdit, QScrollArea, QWidget,
                                  QColorDialog, QFrame, QMessageBox, QComboBox,
-                                 QFileDialog, QCheckBox)
-    from PyQt5.QtCore import Qt, pyqtSignal
+                                 QFileDialog, QCheckBox, QSlider, QGroupBox,
+                                 QSizePolicy)
+    from PyQt5.QtCore import Qt, pyqtSignal, QTimer
     from PyQt5.QtGui import QColor, QPalette, QLinearGradient, QBrush
     PYQT_AVAILABLE = True
 except ImportError:
@@ -169,6 +173,7 @@ THEMES = {
             "button_bg": "#ff2a6d",
             "button_hover": "#ff5c8d",
             "button_disabled": "#1a1d4a",
+            "button_text": "#0a0e27",
             "modified_byte": "#ff2a6d",
             "inserted_byte": "#01cdfe",
             "replaced_byte": "#fffb96"
@@ -777,7 +782,10 @@ THEMES = {
 
 
 # Custom themes configuration file
-CUSTOM_THEMES_FILE = Path.home() / ".hex_editor_custom_themes.json"
+CUSTOM_THEMES_FILE = Path(migrated_storage_path(
+    "custom_themes.json",
+    [Path.home() / ".hex_editor_custom_themes.json"]
+))
 
 
 def load_custom_themes():
@@ -798,20 +806,91 @@ def save_custom_themes(custom_themes):
             json.dump(custom_themes, f, indent=2)
         return True
     except Exception:
-        return False
+            return False
+
+
+def with_theme_defaults(theme):
+    """Return a copy with newer theme fields filled for older/custom themes."""
+    normalized = dict(theme or {})
+    normalized.setdefault("byte_hover", normalized.get("selection_bg", normalized.get("button_bg", "#404040")))
+    return normalized
+
+
+def _solid_theme_value(value):
+    if value is None:
+        return ""
+    value = str(value).strip()
+    if not value or value.lower() == "transparent":
+        return ""
+    return value
+
+
+def get_theme_surface_colors(theme_or_name):
+    """Return solid surface colors for dialogs and controls, even for gradient themes."""
+    theme = resolve_theme(theme_or_name) if isinstance(theme_or_name, str) else with_theme_defaults(theme_or_name)
+    gradient_base = ""
+    gradient_colors = theme.get("gradient_colors") or []
+    if gradient_colors:
+        gradient_base = _solid_theme_value(gradient_colors[0])
+
+    surface = (
+        _solid_theme_value(theme.get("inspector_bg")) or
+        _solid_theme_value(theme.get("background")) or
+        _solid_theme_value(theme.get("menubar_bg")) or
+        gradient_base or
+        "#1f1f1f"
+    )
+    control = (
+        _solid_theme_value(theme.get("editor_bg")) or
+        _solid_theme_value(theme.get("inspector_bg")) or
+        _solid_theme_value(theme.get("menubar_bg")) or
+        surface
+    )
+    return {
+        "surface": surface,
+        "control": control,
+        "text": theme.get("foreground", theme.get("editor_fg", "#ffffff")),
+        "control_text": theme.get("editor_fg", theme.get("foreground", "#ffffff")),
+    }
+
+
+def get_builtin_themes_flat():
+    """Get built-in themes flattened without custom themes."""
+    themes = {}
+    for category, category_themes in THEMES.items():
+        for name, theme in category_themes.items():
+            themes[name] = with_theme_defaults(theme)
+    return themes
+
+
+def resolve_theme(theme_name):
+    """Resolve built-in/custom theme ids without letting duplicate names shadow built-ins."""
+    theme_name = theme_name or "Dark"
+    builtins = get_builtin_themes_flat()
+    custom_themes = load_custom_themes()
+
+    if isinstance(theme_name, str) and theme_name.startswith("custom:"):
+        custom_name = theme_name.split(":", 1)[1]
+        return with_theme_defaults(custom_themes.get(custom_name, builtins["Dark"]))
+    if isinstance(theme_name, str) and theme_name.startswith("builtin:"):
+        builtin_name = theme_name.split(":", 1)[1]
+        return with_theme_defaults(builtins.get(builtin_name, builtins["Dark"]))
+
+    if theme_name in builtins:
+        return with_theme_defaults(builtins[theme_name])
+    if theme_name in custom_themes:
+        return with_theme_defaults(custom_themes[theme_name])
+    return with_theme_defaults(builtins["Dark"])
 
 
 def get_all_themes():
     """Get all themes including custom ones, flattened from categories"""
-    all_themes = {}
+    all_themes = get_builtin_themes_flat()
 
-    # Flatten built-in categorized themes
-    for category, themes in THEMES.items():
-        all_themes.update(themes)
-
-    # Add custom themes
     custom_themes = load_custom_themes()
-    all_themes.update(custom_themes)
+    for name, theme in custom_themes.items():
+        if name not in all_themes:
+            all_themes[name] = with_theme_defaults(theme)
 
     return all_themes
 
@@ -834,19 +913,27 @@ def get_theme_categories():
 
 def get_theme_stylesheet(theme_name):
     """Generate Qt stylesheet for a given theme"""
-    all_themes = get_all_themes()
+    theme = resolve_theme(theme_name)
+    surfaces = get_theme_surface_colors(theme)
+    dialog_bg = surfaces["surface"]
+    control_bg = surfaces["control"]
+    dialog_fg = surfaces["text"]
+    control_fg = surfaces["control_text"]
 
-    if theme_name not in all_themes:
-        theme_name = "Dark"
-
-    theme = all_themes[theme_name]
-
-    # Handle gradient themes
-    if theme.get("gradient", False):
+    # Handle full-editor visual backgrounds (gradient or app background image)
+    if theme.get("gradient", False) or theme.get("app_bg_image", ""):
         return f"""
             QMainWindow, QWidget {{
                 background-color: transparent;
                 color: {theme['foreground']};
+            }}
+            QDialog, QMessageBox {{
+                background-color: {dialog_bg};
+                color: {dialog_fg};
+            }}
+            QDialog QWidget, QMessageBox QWidget {{
+                background-color: {dialog_bg};
+                color: {dialog_fg};
             }}
             QTextEdit {{
                 background-color: transparent;
@@ -900,9 +987,16 @@ def get_theme_stylesheet(theme_name):
                 background-color: {theme['button_disabled']};
                 color: #666;
             }}
+            QDialog QTextEdit, QDialog QPlainTextEdit, QDialog QListWidget,
+            QDialog QTreeWidget, QDialog QTableWidget, QMessageBox QLabel {{
+                background-color: {control_bg};
+                color: {control_fg};
+                border: 1px solid {theme['border']};
+                selection-background-color: {theme['selection_bg']};
+            }}
             QLineEdit, QSpinBox, QComboBox, QTextEdit#notes {{
-                background-color: {theme['menubar_bg']};
-                color: {theme['foreground']};
+                background-color: {control_bg};
+                color: {control_fg};
                 border: 1px solid {theme['border']};
                 padding: 4px;
             }}
@@ -921,8 +1015,8 @@ def get_theme_stylesheet(theme_name):
                 margin-right: 6px;
             }}
             QComboBox QAbstractItemView {{
-                background-color: {theme['menubar_bg']};
-                color: {theme['foreground']};
+                background-color: {control_bg};
+                color: {control_fg};
                 border: 1px solid {theme['border']};
                 selection-background-color: {theme['button_bg']};
                 selection-color: {theme.get('button_text', 'white')};
@@ -1036,10 +1130,91 @@ def get_theme_stylesheet(theme_name):
 
 def get_theme_colors(theme_name):
     """Get color values for a theme"""
-    all_themes = get_all_themes()
-    if theme_name not in all_themes:
-        theme_name = "Dark"
-    return all_themes[theme_name]
+    return resolve_theme(theme_name)
+
+
+def get_image_background_style(image_path, tint_color, tint_opacity, fit_mode='fill'):
+    """
+    Generate CSS style for image background with optional tinting.
+
+    Args:
+        image_path: Path to the background image file
+        tint_color: Hex color for tinting (e.g., '#000000')
+        tint_opacity: Opacity of the tint overlay (0.0 to 1.0)
+
+    Returns:
+        CSS style string for background with image and tint overlay
+    """
+    if not image_path:
+        return ""
+
+    # Convert file path to an encoded file URL so spaces/special chars still load as a pixmap.
+    from urllib.parse import quote
+    url_path = quote(os.path.abspath(image_path).replace('\\', '/'), safe='/:')
+    bg_size = {
+        'fit': 'contain',
+        'stretch': '100% 100%',
+        'fill': 'cover'
+    }.get((fit_mode or 'fill').lower(), 'cover')
+
+    if tint_opacity > 0:
+        # Parse hex color to RGB
+        tint_color = tint_color.lstrip('#')
+        r = int(tint_color[0:2], 16)
+        g = int(tint_color[2:4], 16)
+        b = int(tint_color[4:6], 16)
+
+        # Create a style with both image and color overlay
+        return f"""
+            background-image:
+                linear-gradient(rgba({r}, {g}, {b}, {tint_opacity}), rgba({r}, {g}, {b}, {tint_opacity})),
+                url("file:///{url_path}");
+            background-size: {bg_size};
+            background-position: center;
+            background-repeat: no-repeat;
+        """
+    else:
+        # Just the image without tint
+        return f"""
+            background-image: url("file:///{url_path}");
+            background-size: {bg_size};
+            background-position: center;
+            background-repeat: no-repeat;
+        """
+
+
+def get_theme_image_backgrounds(theme_name):
+    """
+    Get image background information for a theme.
+
+    Returns:
+        dict with keys:
+            - hex_bytes_style: CSS style for hex bytes area background
+            - offset_ascii_style: CSS style for offset/ASCII/surrounding area background
+            - inspector_style: CSS style for data inspector background
+    """
+    theme = resolve_theme(theme_name)
+
+    return {
+        'app_style': get_image_background_style(
+            theme.get('app_bg_image', ''),
+            theme.get('app_bg_tint_color', '#000000'),
+            theme.get('app_bg_tint_opacity', 0),
+            theme.get('app_bg_fit', 'fill')
+        ),
+        'hex_bytes_style': get_image_background_style(
+            theme.get('hex_bytes_bg_image', ''),
+            theme.get('hex_bytes_tint_color', '#000000'),
+            theme.get('hex_bytes_tint_opacity', 0),
+            theme.get('hex_bytes_fit', 'fill')
+        ),
+        'offset_ascii_style': get_image_background_style(
+            theme.get('offset_ascii_bg_image', ''),
+            theme.get('offset_ascii_tint_color', '#000000'),
+            theme.get('offset_ascii_tint_opacity', 0),
+            theme.get('offset_ascii_fit', 'fill')
+        )
+    }
 
 
 # Theme parameter labels for user-friendly display
@@ -1050,6 +1225,7 @@ THEME_PARAM_LABELS = {
     "editor_bg": "Editor Background",
     "editor_fg": "Editor Text Color",
     "selection_bg": "Selection Background",
+    "byte_hover": "Byte Hover",
     "border": "Border Color",
     "grid_line": "Grid/Separator Lines",
     "menubar_bg": "Menu Bar Background",
@@ -1064,6 +1240,30 @@ THEME_PARAM_LABELS = {
 
 
 if PYQT_AVAILABLE:
+    IMAGE_FILTER = "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;All Files (*)"
+    IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp'}
+
+
+    def apply_native_titlebar_theme(window, dark=True):
+        """Apply Windows native dark/light titlebar flag for standalone theme dialogs."""
+        if sys.platform != "win32" or window is None:
+            return
+        try:
+            dark_enabled = ctypes.c_int(1 if dark else 0)
+            hwnd = int(window.winId())
+            for attribute in (20, 19):
+                result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    ctypes.c_void_p(hwnd),
+                    ctypes.c_uint(attribute),
+                    ctypes.byref(dark_enabled),
+                    ctypes.sizeof(dark_enabled)
+                )
+                if result == 0:
+                    break
+        except Exception:
+            pass
+
+
     class ColorButton(QPushButton):
         """A button that displays and allows selecting a color"""
         colorChanged = pyqtSignal(str)
@@ -1071,27 +1271,45 @@ if PYQT_AVAILABLE:
         def __init__(self, color="#000000", parent=None):
             super().__init__(parent)
             self.color = color
-            self.setFixedSize(40, 30)
+            self.setObjectName("themeColorButton")
+            self.setFixedSize(14, 14)
             self.clicked.connect(self.choose_color)
             self.update_color()
 
         def update_color(self):
             """Update button style to show current color"""
             self.setStyleSheet(f"""
-                QPushButton {{
+                QPushButton#themeColorButton {{
                     background-color: {self.color};
-                    border: 2px solid #999;
+                    border: 1px solid #999;
                     border-radius: 3px;
+                    min-width: 14px;
+                    max-width: 14px;
+                    min-height: 14px;
+                    max-height: 14px;
+                    padding: 0px;
                 }}
-                QPushButton:hover {{
-                    border: 2px solid #fff;
+                QPushButton#themeColorButton:hover {{
+                    border: 1px solid #fff;
                 }}
             """)
 
         def choose_color(self):
             """Open color picker dialog"""
-            color = QColorDialog.getColor(QColor(self.color), self, "Choose Color")
-            if color.isValid():
+            owner = self.window()
+            parent_editor = getattr(owner, "parent_editor", None)
+            if parent_editor and hasattr(parent_editor, "get_theme_color_dialog"):
+                dialog = parent_editor.get_theme_color_dialog(QColor(self.color), self)
+            else:
+                dialog = QColorDialog(QColor(self.color), self)
+                dialog.setOption(QColorDialog.DontUseNativeDialog, False)
+            dialog.setWindowTitle("Select Color")
+            dark = True
+            if parent_editor and hasattr(parent_editor, "system_uses_dark_titlebar"):
+                dark = parent_editor.system_uses_dark_titlebar()
+            QTimer.singleShot(0, lambda: apply_native_titlebar_theme(dialog, dark))
+            if dialog.exec_() == QDialog.Accepted:
+                color = dialog.selectedColor()
                 self.color = color.name()
                 self.update_color()
                 self.colorChanged.emit(self.color)
@@ -1109,7 +1327,15 @@ if PYQT_AVAILABLE:
         def __init__(self, parent=None, base_theme=None):
             super().__init__(parent)
             self.setWindowTitle("Custom Theme Editor")
-            self.setMinimumSize(700, 700)
+            self.setMinimumSize(640, 500)
+            self.resize(700, 540)
+            self.parent_editor = parent
+            self.setFont(parent.font() if parent and hasattr(parent, 'font') else self.font())
+            self.setAcceptDrops(True)
+            self._loading_theme = False
+            self.original_custom_name = base_theme.split(":", 1)[1] if isinstance(base_theme, str) and base_theme.startswith("custom:") else None
+            self._temporary_live_storage = self.original_custom_name is None
+            self._live_storage_name = self.original_custom_name or "__RxD Live Preview__"
 
             # Apply parent's theme stylesheet if available - use Light or Dark based on brightness
             if parent and hasattr(parent, 'current_theme'):
@@ -1118,11 +1344,11 @@ if PYQT_AVAILABLE:
                 else:
                     base_theme_name = "Light"
                 style = get_theme_stylesheet(base_theme_name)
-                self.setStyleSheet(style)
+                self.setStyleSheet(style + self.compact_editor_stylesheet(get_theme_colors(base_theme_name)))
 
             # Start with a base theme or Dark theme
-            if base_theme and base_theme in get_all_themes():
-                self.current_theme = get_all_themes()[base_theme].copy()
+            if base_theme:
+                self.current_theme = resolve_theme(base_theme).copy()
             else:
                 self.current_theme = THEMES["Dark"]["Dark"].copy()
 
@@ -1133,67 +1359,170 @@ if PYQT_AVAILABLE:
             self.color_buttons = {}
             self.gradient_enabled = False
             self.gradient_colors = []
-            self.background_row = None  # Track background color row widget
+            self.background_row = None
+
+            # Image background properties
+            self.app_bg_image_path = self.current_theme.get('app_bg_image', '')
+            self.app_bg_tint_color = self.current_theme.get('app_bg_tint_color', '#000000')
+            self.app_bg_tint_opacity = self.current_theme.get('app_bg_tint_opacity', 0)
+            self.app_bg_fit = self.current_theme.get('app_bg_fit', 'fill')
+            self.app_bg_gif_quality = self.current_theme.get('app_bg_gif_quality', 'optimized')
+
+            self.hex_bytes_image_path = self.current_theme.get('hex_bytes_bg_image', '')
+            self.hex_bytes_tint_color = self.current_theme.get('hex_bytes_tint_color', '#000000')
+            self.hex_bytes_tint_opacity = self.current_theme.get('hex_bytes_tint_opacity', 0)
+            self.hex_bytes_fit = self.current_theme.get('hex_bytes_fit', 'fill')
+            self.hex_bytes_gif_quality = self.current_theme.get('hex_bytes_gif_quality', 'optimized')
+
+            self.offset_ascii_image_path = self.current_theme.get('offset_ascii_bg_image', '')
+            self.offset_ascii_tint_color = self.current_theme.get('offset_ascii_tint_color', '#000000')
+            self.offset_ascii_tint_opacity = self.current_theme.get('offset_ascii_tint_opacity', 0)
+            self.offset_ascii_fit = self.current_theme.get('offset_ascii_fit', 'fill')
+            self.offset_ascii_gif_quality = self.current_theme.get('offset_ascii_gif_quality', 'optimized')
+
             self.setup_ui()
+
+        def showEvent(self, event):
+            super().showEvent(event)
+            if self.parent_editor and hasattr(self.parent_editor, "system_uses_dark_titlebar"):
+                dark = self.parent_editor.system_uses_dark_titlebar()
+            elif self.parent_editor and hasattr(self.parent_editor, "is_dark_theme"):
+                dark = self.parent_editor.is_dark_theme()
+            else:
+                dark = True
+            apply_native_titlebar_theme(self, dark)
+            QTimer.singleShot(0, self.apply_theme_live)
+
+        def compact_editor_stylesheet(self, theme):
+            surfaces = get_theme_surface_colors(theme)
+            button_text = theme.get('button_text', theme.get('foreground', '#ffffff'))
+            dialog_bg = surfaces["surface"]
+            panel_bg = surfaces["control"]
+            fg = surfaces["text"]
+            editor_fg = surfaces["control_text"]
+            border = theme.get('border', '#555555')
+            return f"""
+                QDialog {{
+                    background-color: {dialog_bg};
+                    color: {fg};
+                    font-family: Arial;
+                    font-size: 9pt;
+                }}
+                QWidget {{
+                    background-color: {dialog_bg};
+                    color: {fg};
+                }}
+                QLabel {{
+                    background-color: transparent;
+                    color: {fg};
+                    font-size: 9pt;
+                }}
+                QPushButton {{
+                    padding: 3px 8px;
+                    min-height: 20px;
+                    font-size: 9pt;
+                }}
+                QPushButton#themeColorButton {{
+                    min-width: 14px;
+                    max-width: 14px;
+                    min-height: 14px;
+                    max-height: 14px;
+                    padding: 0px;
+                }}
+                QLineEdit, QComboBox {{
+                    background-color: {panel_bg};
+                    color: {editor_fg};
+                    border: 1px solid {border};
+                    padding: 2px 4px;
+                    min-height: 20px;
+                    font-size: 9pt;
+                }}
+                QComboBox QAbstractItemView {{
+                    background-color: {panel_bg};
+                    color: {editor_fg};
+                    border: 1px solid {border};
+                }}
+                QSlider::groove:horizontal {{
+                    height: 4px;
+                }}
+                QSlider::handle:horizontal {{
+                    width: 10px;
+                    margin: -4px 0px;
+                }}
+                QWidget#themePanel {{
+                    background-color: {panel_bg};
+                }}
+            """
 
         def setup_ui(self):
             """Setup the user interface"""
-            layout = QVBoxLayout()
-            layout.setSpacing(10)
+            main_layout = QVBoxLayout()
+            main_layout.setSpacing(5)
+            main_layout.setContentsMargins(8, 8, 8, 8)
 
-            # Theme name section
-            name_layout = QHBoxLayout()
-            name_layout.addWidget(QLabel("Theme Name:"))
+            # Header section - compact
+            header_layout = QHBoxLayout()
+            header_layout.addWidget(QLabel("Theme Name:"))
             self.theme_name_input = QLineEdit()
             self.theme_name_input.setPlaceholderText("Enter custom theme name")
             self.theme_name_input.setText(self.current_theme.get("name", "Custom Theme"))
-            name_layout.addWidget(self.theme_name_input)
-            layout.addLayout(name_layout)
+            self.theme_name_input.setMinimumWidth(150)
+            # Connect to update theme name in real-time
+            self.theme_name_input.textChanged.connect(self.on_theme_name_changed)
+            header_layout.addWidget(self.theme_name_input)
 
-            # Base theme selection
-            base_layout = QHBoxLayout()
-            base_layout.addWidget(QLabel("Start from:"))
+            header_layout.addSpacing(20)
+            header_layout.addWidget(QLabel("Start from:"))
             self.base_theme_combo = QComboBox()
             all_theme_names = sorted(get_all_themes().keys())
             self.base_theme_combo.addItems(all_theme_names)
+            if self.current_theme.get("name") in all_theme_names:
+                self.base_theme_combo.setCurrentText(self.current_theme.get("name"))
             self.base_theme_combo.currentTextChanged.connect(self.load_base_theme)
-            base_layout.addWidget(self.base_theme_combo)
-            base_layout.addStretch()
-            layout.addLayout(base_layout)
+            self.base_theme_combo.setMinimumWidth(120)
+            header_layout.addWidget(self.base_theme_combo)
+            header_layout.addStretch()
+            main_layout.addLayout(header_layout)
 
-            # Gradient/Image support section
-            gradient_layout = QHBoxLayout()
-            self.gradient_checkbox = QCheckBox("Use Gradient Background")
-            self.gradient_checkbox.setChecked(self.current_theme.get("gradient", False))
-            self.gradient_checkbox.stateChanged.connect(self.toggle_gradient)
-            gradient_layout.addWidget(self.gradient_checkbox)
-            gradient_layout.addStretch()
-            layout.addLayout(gradient_layout)
+            # Main content area with side-by-side layout
+            content_layout = QHBoxLayout()
+            content_layout.setSpacing(8)
 
-            # Inspector gradient option
-            inspector_gradient_layout = QHBoxLayout()
-            self.inspector_gradient_checkbox = QCheckBox("Use Gradient for Inspector Background")
-            # Check if inspector_bg is transparent (uses gradient)
-            self.inspector_gradient_checkbox.setChecked(
-                self.current_theme.get("inspector_bg", "") == "transparent"
-            )
-            self.inspector_gradient_checkbox.stateChanged.connect(self.toggle_inspector_gradient)
-            inspector_gradient_layout.addWidget(self.inspector_gradient_checkbox)
-            inspector_gradient_layout.addStretch()
-            layout.addLayout(inspector_gradient_layout)
+            # LEFT PANEL - Background Options
+            left_panel = QWidget()
+            left_panel.setObjectName("themePanel")
+            left_layout = QVBoxLayout(left_panel)
+            left_layout.setContentsMargins(0, 0, 0, 0)
+            left_layout.setSpacing(5)
 
-            # Gradient colors section (initially hidden)
+            # Main background type selection - compact
+            bg_type_layout = QHBoxLayout()
+            bg_type_layout.addWidget(QLabel("Background:"))
+            self.main_bg_combo = QComboBox()
+            self.main_bg_combo.addItems(["Color", "Gradient", "Image"])
+
+            # Determine current type
+            if self.current_theme.get("gradient", False):
+                self.main_bg_combo.setCurrentText("Gradient")
+            elif self.app_bg_image_path:
+                self.main_bg_combo.setCurrentText("Image")
+            else:
+                self.main_bg_combo.setCurrentText("Color")
+
+            self.main_bg_combo.currentTextChanged.connect(self.on_main_bg_type_changed)
+            bg_type_layout.addWidget(self.main_bg_combo)
+            left_layout.addLayout(bg_type_layout)
+
+            # Gradient colors section
             self.gradient_widget = QWidget()
-            gradient_colors_layout = QVBoxLayout(self.gradient_widget)
-            gradient_colors_layout.addWidget(QLabel("Gradient Colors (top to bottom):"))
+            gradient_layout = QVBoxLayout(self.gradient_widget)
+            gradient_layout.setContentsMargins(0, 3, 0, 3)
+            gradient_layout.setSpacing(4)
 
             self.gradient_colors_layout = QHBoxLayout()
             self.gradient_color_buttons = []
 
-            # Default gradient colors (sunset palette)
             default_gradient = ["#ff6b35", "#ff8c42", "#ffa94d", "#ffc75f", "#f9c74f"]
-
-            # Create 5 gradient color pickers with defaults
             for i in range(5):
                 initial_color = default_gradient[i]
                 color_btn = ColorButton(initial_color)
@@ -1201,35 +1530,208 @@ if PYQT_AVAILABLE:
                 self.gradient_color_buttons.append(color_btn)
                 self.gradient_colors_layout.addWidget(color_btn)
 
-            gradient_colors_layout.addLayout(self.gradient_colors_layout)
-            self.gradient_widget.setVisible(self.current_theme.get("gradient", False))
-            layout.addWidget(self.gradient_widget)
+            gradient_layout.addLayout(self.gradient_colors_layout)
+            left_layout.addWidget(self.gradient_widget)
 
-            # Separator
-            separator = QFrame()
-            separator.setFrameShape(QFrame.HLine)
-            separator.setFrameShadow(QFrame.Sunken)
-            layout.addWidget(separator)
+            # Whole-editor background image section
+            self.app_image_widget = QWidget()
+            app_image_layout = QVBoxLayout(self.app_image_widget)
+            app_image_layout.setContentsMargins(0, 3, 0, 3)
+            app_image_layout.setSpacing(4)
 
-            # Scrollable area for color parameters
-            scroll = QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            app_btn_layout = QHBoxLayout()
+            app_bg_browse_btn = QPushButton("Editor Background...")
+            app_bg_browse_btn.clicked.connect(self.browse_app_bg_image)
+            app_btn_layout.addWidget(app_bg_browse_btn)
+            app_bg_clear_btn = QPushButton("Clear")
+            app_bg_clear_btn.clicked.connect(self.clear_app_bg_image)
+            app_btn_layout.addWidget(app_bg_clear_btn)
+            app_image_layout.addLayout(app_btn_layout)
 
-            scroll_widget = QWidget()
-            scroll_layout = QVBoxLayout(scroll_widget)
-            scroll_layout.setSpacing(8)
+            self.app_bg_image_label = QLabel(os.path.basename(self.app_bg_image_path) if self.app_bg_image_path else "No editor background image")
+            self.app_bg_image_label.setStyleSheet("padding: 2px; font-size: 8pt; color: #888;")
+            self.app_bg_image_label.setWordWrap(True)
+            self.app_bg_image_label.setMaximumHeight(30)
+            app_image_layout.addWidget(self.app_bg_image_label)
 
-            # Create color pickers for each theme parameter
-            for param, label in THEME_PARAM_LABELS.items():
-                # Create a container widget for this row
+            app_tint_layout = QHBoxLayout()
+            app_tint_layout.addWidget(QLabel("Tint:"))
+            self.app_bg_tint_btn = ColorButton(self.app_bg_tint_color)
+            self.app_bg_tint_btn.colorChanged.connect(self.on_app_bg_tint_changed)
+            app_tint_layout.addWidget(self.app_bg_tint_btn)
+            app_tint_layout.addWidget(QLabel("Opacity:"))
+            self.app_bg_opacity_slider = QSlider(Qt.Horizontal)
+            self.app_bg_opacity_slider.setRange(0, 100)
+            self.app_bg_opacity_slider.setValue(int(self.app_bg_tint_opacity * 100))
+            self.app_bg_opacity_slider.valueChanged.connect(self.on_app_bg_opacity_changed)
+            app_tint_layout.addWidget(self.app_bg_opacity_slider, 1)
+            self.app_bg_opacity_label = QLabel(f"{int(self.app_bg_tint_opacity * 100)}%")
+            self.app_bg_opacity_label.setMinimumWidth(30)
+            app_tint_layout.addWidget(self.app_bg_opacity_label)
+            app_image_layout.addLayout(app_tint_layout)
+            app_fit_layout = QHBoxLayout()
+            app_fit_layout.addWidget(QLabel("Size:"))
+            self.app_bg_fit_combo = QComboBox()
+            self.app_bg_fit_combo.addItems(["Fill", "Fit", "Stretch"])
+            self.app_bg_fit_combo.setCurrentText(self.app_bg_fit.capitalize())
+            self.app_bg_fit_combo.currentTextChanged.connect(lambda text: self.on_fit_mode_changed('app_bg_fit', text))
+            app_fit_layout.addWidget(self.app_bg_fit_combo)
+            app_fit_layout.addWidget(QLabel("Quality:"))
+            self.app_bg_gif_quality_combo = QComboBox()
+            self.app_bg_gif_quality_combo.addItems(["Optimized", "Smooth", "Full"])
+            self.app_bg_gif_quality_combo.setCurrentText(self.app_bg_gif_quality.capitalize())
+            self.app_bg_gif_quality_combo.currentTextChanged.connect(lambda text: self.on_gif_quality_changed('app_bg_gif_quality', text))
+            app_fit_layout.addWidget(self.app_bg_gif_quality_combo)
+            app_fit_layout.addStretch()
+            app_image_layout.addLayout(app_fit_layout)
+            left_layout.addWidget(self.app_image_widget)
+
+            # Hex display image section - always visible
+            hex_image_label = QLabel("Hex Display Image:")
+            hex_image_label.setStyleSheet("font-weight: bold; font-size: 9pt; margin-top: 3px;")
+            left_layout.addWidget(hex_image_label)
+            self.image_widget = QWidget()
+            image_layout = QVBoxLayout(self.image_widget)
+            image_layout.setContentsMargins(0, 3, 0, 3)
+            image_layout.setSpacing(4)
+
+            img_btn_layout = QHBoxLayout()
+            hex_bytes_browse_btn = QPushButton("Select Image...")
+            hex_bytes_browse_btn.clicked.connect(self.browse_hex_bytes_image)
+            img_btn_layout.addWidget(hex_bytes_browse_btn)
+            hex_bytes_clear_btn = QPushButton("Clear")
+            hex_bytes_clear_btn.clicked.connect(self.clear_hex_bytes_image)
+            img_btn_layout.addWidget(hex_bytes_clear_btn)
+            image_layout.addLayout(img_btn_layout)
+
+            self.hex_bytes_image_label = QLabel("No image selected")
+            self.hex_bytes_image_label.setStyleSheet("padding: 4px; border: 1px solid #555; font-size: 10px;")
+            self.hex_bytes_image_label.setWordWrap(True)
+            self.hex_bytes_image_label.setMaximumHeight(35)
+            image_layout.addWidget(self.hex_bytes_image_label)
+
+            tint_layout = QHBoxLayout()
+            tint_layout.addWidget(QLabel("Tint:"))
+            self.hex_bytes_tint_btn = ColorButton(self.hex_bytes_tint_color)
+            self.hex_bytes_tint_btn.colorChanged.connect(self.on_hex_bytes_tint_changed)
+            tint_layout.addWidget(self.hex_bytes_tint_btn)
+            tint_layout.addWidget(QLabel("Opacity:"))
+            self.hex_bytes_opacity_slider = QSlider(Qt.Horizontal)
+            self.hex_bytes_opacity_slider.setRange(0, 100)
+            self.hex_bytes_opacity_slider.setValue(int(self.hex_bytes_tint_opacity * 100))
+            self.hex_bytes_opacity_slider.valueChanged.connect(self.on_hex_bytes_opacity_changed)
+            tint_layout.addWidget(self.hex_bytes_opacity_slider, 1)
+            self.hex_bytes_opacity_label = QLabel(f"{int(self.hex_bytes_tint_opacity * 100)}%")
+            self.hex_bytes_opacity_label.setMinimumWidth(35)
+            tint_layout.addWidget(self.hex_bytes_opacity_label)
+            image_layout.addLayout(tint_layout)
+            hex_fit_layout = QHBoxLayout()
+            hex_fit_layout.addWidget(QLabel("Size:"))
+            self.hex_bytes_fit_combo = QComboBox()
+            self.hex_bytes_fit_combo.addItems(["Fill", "Fit", "Stretch"])
+            self.hex_bytes_fit_combo.setCurrentText(self.hex_bytes_fit.capitalize())
+            self.hex_bytes_fit_combo.currentTextChanged.connect(lambda text: self.on_fit_mode_changed('hex_bytes_fit', text))
+            hex_fit_layout.addWidget(self.hex_bytes_fit_combo)
+            hex_fit_layout.addWidget(QLabel("Quality:"))
+            self.hex_bytes_gif_quality_combo = QComboBox()
+            self.hex_bytes_gif_quality_combo.addItems(["Optimized", "Smooth", "Full"])
+            self.hex_bytes_gif_quality_combo.setCurrentText(self.hex_bytes_gif_quality.capitalize())
+            self.hex_bytes_gif_quality_combo.currentTextChanged.connect(lambda text: self.on_gif_quality_changed('hex_bytes_gif_quality', text))
+            hex_fit_layout.addWidget(self.hex_bytes_gif_quality_combo)
+            hex_fit_layout.addStretch()
+            image_layout.addLayout(hex_fit_layout)
+
+            left_layout.addWidget(self.image_widget)
+
+            # Additional overlay images - compact collapsible sections
+            overlay_label = QLabel("Additional Overlays:")
+            overlay_label.setStyleSheet("font-weight: bold; font-size: 9pt; margin-top: 3px;")
+            left_layout.addWidget(overlay_label)
+
+            # Offset/ASCII compact section
+            offset_btn_layout = QHBoxLayout()
+            offset_browse_btn = QPushButton("Offset/ASCII Image...")
+            offset_browse_btn.clicked.connect(self.browse_offset_ascii_image)
+            offset_btn_layout.addWidget(offset_browse_btn)
+            offset_clear_btn = QPushButton("×")
+            offset_clear_btn.setMaximumWidth(30)
+            offset_clear_btn.clicked.connect(self.clear_offset_ascii_image)
+            offset_btn_layout.addWidget(offset_clear_btn)
+            left_layout.addLayout(offset_btn_layout)
+
+            self.offset_ascii_image_label = QLabel("No image")
+            self.offset_ascii_image_label.setStyleSheet("padding: 2px; font-size: 9px; color: #888;")
+            left_layout.addWidget(self.offset_ascii_image_label)
+
+            offset_tint_layout = QHBoxLayout()
+            self.offset_ascii_tint_btn = ColorButton(self.offset_ascii_tint_color)
+            self.offset_ascii_tint_btn.colorChanged.connect(self.on_offset_ascii_tint_changed)
+            offset_tint_layout.addWidget(self.offset_ascii_tint_btn)
+            self.offset_ascii_opacity_slider = QSlider(Qt.Horizontal)
+            self.offset_ascii_opacity_slider.setRange(0, 100)
+            self.offset_ascii_opacity_slider.setValue(int(self.offset_ascii_tint_opacity * 100))
+            self.offset_ascii_opacity_slider.valueChanged.connect(self.on_offset_ascii_opacity_changed)
+            offset_tint_layout.addWidget(self.offset_ascii_opacity_slider, 1)
+            self.offset_ascii_opacity_label = QLabel(f"{int(self.offset_ascii_tint_opacity * 100)}%")
+            self.offset_ascii_opacity_label.setMinimumWidth(30)
+            offset_tint_layout.addWidget(self.offset_ascii_opacity_label)
+            left_layout.addLayout(offset_tint_layout)
+            offset_fit_layout = QHBoxLayout()
+            offset_fit_layout.addWidget(QLabel("Size:"))
+            self.offset_ascii_fit_combo = QComboBox()
+            self.offset_ascii_fit_combo.addItems(["Fill", "Fit", "Stretch"])
+            self.offset_ascii_fit_combo.setCurrentText(self.offset_ascii_fit.capitalize())
+            self.offset_ascii_fit_combo.currentTextChanged.connect(lambda text: self.on_fit_mode_changed('offset_ascii_fit', text))
+            offset_fit_layout.addWidget(self.offset_ascii_fit_combo)
+            offset_fit_layout.addWidget(QLabel("Quality:"))
+            self.offset_ascii_gif_quality_combo = QComboBox()
+            self.offset_ascii_gif_quality_combo.addItems(["Optimized", "Smooth", "Full"])
+            self.offset_ascii_gif_quality_combo.setCurrentText(self.offset_ascii_gif_quality.capitalize())
+            self.offset_ascii_gif_quality_combo.currentTextChanged.connect(lambda text: self.on_gif_quality_changed('offset_ascii_gif_quality', text))
+            offset_fit_layout.addWidget(self.offset_ascii_gif_quality_combo)
+            offset_fit_layout.addStretch()
+            left_layout.addLayout(offset_fit_layout)
+
+            self.offset_drop_widgets = [offset_browse_btn, offset_clear_btn, self.offset_ascii_image_label, self.offset_ascii_tint_btn, self.offset_ascii_opacity_slider]
+
+            left_layout.addStretch()
+
+            # Update visibility
+            self.update_bg_widgets_visibility()
+
+            left_panel.setMinimumWidth(230)
+            content_layout.addWidget(left_panel)
+
+            # RIGHT PANEL - Color Configuration (no scrolling needed!)
+            right_panel = QWidget()
+            right_panel.setObjectName("themePanel")
+            right_layout = QVBoxLayout(right_panel)
+            right_layout.setContentsMargins(0, 0, 0, 0)
+            right_layout.setSpacing(4)
+
+            colors_label = QLabel("Theme Colors")
+            colors_label.setStyleSheet("font-weight: bold; font-size: 10pt;")
+            right_layout.addWidget(colors_label)
+
+            # Create color grid - 2 columns for efficient space use
+            colors_grid = QWidget()
+            colors_grid.setObjectName("themePanel")
+            colors_grid.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+            grid_layout = QGridLayout(colors_grid)
+            grid_layout.setHorizontalSpacing(10)
+            grid_layout.setVerticalSpacing(3)
+            grid_layout.setContentsMargins(0, 6, 0, 0)
+
+            # Create color pickers in compact grid
+            for index, (param, label) in enumerate(THEME_PARAM_LABELS.items()):
                 row_widget = QWidget()
                 param_layout = QHBoxLayout(row_widget)
                 param_layout.setContentsMargins(0, 0, 0, 0)
+                param_layout.setSpacing(4)
 
                 # Label
                 param_label = QLabel(label + ":")
-                param_label.setMinimumWidth(180)
+                param_label.setMinimumWidth(104)
                 param_layout.addWidget(param_label)
 
                 # Color button
@@ -1240,65 +1742,42 @@ if PYQT_AVAILABLE:
 
                 # Color hex value display
                 color_value = QLineEdit(self.current_theme.get(param, "#000000"))
-                color_value.setMaximumWidth(80)
+                color_value.setFixedWidth(66)
                 color_value.setReadOnly(True)
-                color_value.setStyleSheet("background: #2d2d30; color: #d4d4d4; border: 1px solid #555;")
+                color_value.setStyleSheet("background: #2d2d30; color: #d4d4d4; border: 1px solid #555; font-size: 8pt; padding: 1px 3px;")
                 self.color_buttons[param].color_value_label = color_value
                 param_layout.addWidget(color_value)
 
                 param_layout.addStretch()
-                scroll_layout.addWidget(row_widget)
+                grid_layout.addWidget(row_widget, index // 2, index % 2)
 
                 # Store reference to background row
                 if param == "background":
                     self.background_row = row_widget
 
-            scroll_layout.addStretch()
-            scroll.setWidget(scroll_widget)
-            layout.addWidget(scroll)
+            right_layout.addWidget(colors_grid, 0, Qt.AlignTop)
+            right_layout.addStretch()
 
-            # Preview section
-            preview_label = QLabel("Live Preview:")
-            preview_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
-            layout.addWidget(preview_label)
+            content_layout.addWidget(right_panel, 1, Qt.AlignTop)
+            main_layout.addLayout(content_layout)
 
-            self.preview_widget = QWidget()
-            self.preview_widget.setMinimumHeight(80)
-            self.preview_layout = QVBoxLayout(self.preview_widget)
-
-            preview_text = QLabel("This is a preview of your custom theme")
-            preview_text.setAlignment(Qt.AlignCenter)
-            self.preview_layout.addWidget(preview_text)
-
-            preview_button = QPushButton("Sample Button")
-            self.preview_layout.addWidget(preview_button)
-
-            layout.addWidget(self.preview_widget)
-
-            # Buttons
+            # Bottom buttons - compact
             button_layout = QHBoxLayout()
+            button_layout.setSpacing(8)
 
             save_button = QPushButton("Save Theme")
             save_button.clicked.connect(self.save_theme)
             button_layout.addWidget(save_button)
 
-            delete_button = QPushButton("Delete Theme")
-            delete_button.clicked.connect(self.delete_theme)
-            button_layout.addWidget(delete_button)
-
             button_layout.addStretch()
 
-            cancel_button = QPushButton("Cancel")
-            cancel_button.clicked.connect(self.reject)
-            button_layout.addWidget(cancel_button)
+            close_button = QPushButton("Close")
+            close_button.clicked.connect(self.accept)
+            button_layout.addWidget(close_button)
 
-            apply_button = QPushButton("Apply")
-            apply_button.clicked.connect(self.apply_theme)
-            button_layout.addWidget(apply_button)
+            main_layout.addLayout(button_layout)
 
-            layout.addLayout(button_layout)
-
-            self.setLayout(layout)
+            self.setLayout(main_layout)
 
             # Load gradient colors if theme has them, otherwise keep defaults
             if self.current_theme.get("gradient", False):
@@ -1317,67 +1796,71 @@ if PYQT_AVAILABLE:
                 if "inspector_bg" in self.color_buttons:
                     self.color_buttons["inspector_bg"].setEnabled(False)
 
-            self.update_preview()
+            self.apply_theme_live()
 
-        def toggle_gradient(self, state):
-            """Toggle gradient background mode"""
-            self.gradient_enabled = state == Qt.Checked
-            self.gradient_widget.setVisible(self.gradient_enabled)
-            self.current_theme["gradient"] = self.gradient_enabled
-
-            if self.gradient_enabled:
-                # Set editor background to transparent
-                self.current_theme["editor_bg"] = "transparent"
-                if "editor_bg" in self.color_buttons:
-                    self.color_buttons["editor_bg"].setEnabled(False)
-
-                # Hide the main background color row since gradient will be used instead
-                if self.background_row:
-                    self.background_row.setVisible(False)
-
-                # Get gradient colors
-                gradient_colors = [btn.color for btn in self.gradient_color_buttons]
-                self.current_theme["gradient_colors"] = gradient_colors
-            else:
-                if "editor_bg" in self.color_buttons:
-                    self.color_buttons["editor_bg"].setEnabled(True)
-
-                # Show the main background color row again
-                if self.background_row:
-                    self.background_row.setVisible(True)
-
+        def on_main_bg_type_changed(self, bg_type):
+            """Handle main background type change"""
+            if bg_type == "Color":
+                self.current_theme["gradient"] = False
                 if "gradient_colors" in self.current_theme:
                     del self.current_theme["gradient_colors"]
-                # Restore editor_bg to a solid color if it was transparent
                 if self.current_theme.get("editor_bg") == "transparent":
                     self.current_theme["editor_bg"] = self.current_theme.get("background", "#1e1e1e")
 
-            self.update_preview()
+            elif bg_type == "Gradient":
+                self.current_theme["gradient"] = True
+                self.current_theme["editor_bg"] = "transparent"
+                gradient_colors = [btn.color for btn in self.gradient_color_buttons]
+                self.current_theme["gradient_colors"] = gradient_colors
 
-        def toggle_inspector_gradient(self, state):
-            """Toggle gradient for inspector background"""
-            use_gradient = state == Qt.Checked
+            elif bg_type == "Image":
+                self.current_theme["gradient"] = False
+                if "gradient_colors" in self.current_theme:
+                    del self.current_theme["gradient_colors"]
 
-            if use_gradient:
-                # Set inspector background to transparent to use gradient
-                self.current_theme["inspector_bg"] = "transparent"
-                if "inspector_bg" in self.color_buttons:
-                    self.color_buttons["inspector_bg"].setEnabled(False)
-            else:
-                # Restore inspector background to a solid color
-                if "inspector_bg" in self.color_buttons:
-                    self.color_buttons["inspector_bg"].setEnabled(True)
-                # Use current background or a default
-                if self.current_theme.get("inspector_bg") == "transparent":
-                    self.current_theme["inspector_bg"] = self.current_theme.get("background", "#1e1e1e")
+            self.update_bg_widgets_visibility()
+            self.apply_theme_live()
 
-            self.update_preview()
+        def update_bg_widgets_visibility(self):
+            """Update visibility of background widgets based on selection"""
+            bg_type = self.main_bg_combo.currentText()
+
+            self.gradient_widget.setVisible(bg_type == "Gradient")
+            self.app_image_widget.setVisible(bg_type == "Image")
+            self.image_widget.setVisible(True)
+
+            # Show/hide main background color row
+            if self.background_row:
+                self.background_row.setVisible(bg_type == "Color")
+
+        def apply_theme_live(self):
+            """Apply theme changes to parent editor in real-time"""
+            theme_name = self.current_theme.get("name", "Custom Theme")
+            preview_theme_id = f"custom:{self._live_storage_name}" if self._live_storage_name else None
+            if self._live_storage_name:
+                custom_themes = load_custom_themes()
+                custom_themes[self._live_storage_name] = self.current_theme
+                save_custom_themes(custom_themes)
+
+            self.setStyleSheet(
+                get_theme_stylesheet(preview_theme_id or theme_name) +
+                self.compact_editor_stylesheet(get_theme_colors(preview_theme_id or theme_name))
+            )
+            self.style().unpolish(self)
+            self.style().polish(self)
+            self.update()
+
+            if self.parent_editor and hasattr(self.parent_editor, 'apply_theme'):
+                # Update parent's current theme and apply
+                if preview_theme_id:
+                    self.parent_editor.current_theme = preview_theme_id
+                    self.parent_editor.apply_theme()
 
         def update_gradient_color(self, index, color):
             """Update a gradient color"""
             gradient_colors = [btn.color for btn in self.gradient_color_buttons]
             self.current_theme["gradient_colors"] = gradient_colors
-            self.update_preview()
+            self.apply_theme_live()
 
         def load_base_theme(self, theme_name):
             """Load a base theme to start customizing from"""
@@ -1390,6 +1873,47 @@ if PYQT_AVAILABLE:
                 if 'inspector_bg' not in self.current_theme:
                     self.current_theme['inspector_bg'] = self.current_theme.get('background', '#1e1e1e')
 
+                # Load image properties
+                self.app_bg_image_path = self.current_theme.get('app_bg_image', '')
+                self.app_bg_tint_color = self.current_theme.get('app_bg_tint_color', '#000000')
+                self.app_bg_tint_opacity = self.current_theme.get('app_bg_tint_opacity', 0)
+                self.app_bg_fit = self.current_theme.get('app_bg_fit', 'fill')
+                self.app_bg_gif_quality = self.current_theme.get('app_bg_gif_quality', 'optimized')
+
+                self.hex_bytes_image_path = self.current_theme.get('hex_bytes_bg_image', '')
+                self.hex_bytes_tint_color = self.current_theme.get('hex_bytes_tint_color', '#000000')
+                self.hex_bytes_tint_opacity = self.current_theme.get('hex_bytes_tint_opacity', 0)
+                self.hex_bytes_fit = self.current_theme.get('hex_bytes_fit', 'fill')
+                self.hex_bytes_gif_quality = self.current_theme.get('hex_bytes_gif_quality', 'optimized')
+
+                self.offset_ascii_image_path = self.current_theme.get('offset_ascii_bg_image', '')
+                self.offset_ascii_tint_color = self.current_theme.get('offset_ascii_tint_color', '#000000')
+                self.offset_ascii_tint_opacity = self.current_theme.get('offset_ascii_tint_opacity', 0)
+                self.offset_ascii_fit = self.current_theme.get('offset_ascii_fit', 'fill')
+                self.offset_ascii_gif_quality = self.current_theme.get('offset_ascii_gif_quality', 'optimized')
+
+                # Update image UI elements
+                self.app_bg_image_label.setText(os.path.basename(self.app_bg_image_path) if self.app_bg_image_path else "No editor background image")
+                self.app_bg_tint_btn.set_color(self.app_bg_tint_color)
+                self.app_bg_opacity_slider.setValue(int(self.app_bg_tint_opacity * 100))
+                self.app_bg_opacity_label.setText(f"{int(self.app_bg_tint_opacity * 100)}%")
+                self.app_bg_fit_combo.setCurrentText(self.app_bg_fit.capitalize())
+                self.app_bg_gif_quality_combo.setCurrentText(self.app_bg_gif_quality.capitalize())
+
+                self.hex_bytes_image_label.setText(self.hex_bytes_image_path or "No image selected")
+                self.hex_bytes_tint_btn.set_color(self.hex_bytes_tint_color)
+                self.hex_bytes_opacity_slider.setValue(int(self.hex_bytes_tint_opacity * 100))
+                self.hex_bytes_opacity_label.setText(f"{int(self.hex_bytes_tint_opacity * 100)}%")
+                self.hex_bytes_fit_combo.setCurrentText(self.hex_bytes_fit.capitalize())
+                self.hex_bytes_gif_quality_combo.setCurrentText(self.hex_bytes_gif_quality.capitalize())
+
+                self.offset_ascii_image_label.setText(self.offset_ascii_image_path or "No image selected")
+                self.offset_ascii_tint_btn.set_color(self.offset_ascii_tint_color)
+                self.offset_ascii_opacity_slider.setValue(int(self.offset_ascii_tint_opacity * 100))
+                self.offset_ascii_opacity_label.setText(f"{int(self.offset_ascii_tint_opacity * 100)}%")
+                self.offset_ascii_fit_combo.setCurrentText(self.offset_ascii_fit.capitalize())
+                self.offset_ascii_gif_quality_combo.setCurrentText(self.offset_ascii_gif_quality.capitalize())
+
                 # Update all color buttons
                 for param, button in self.color_buttons.items():
                     color = self.current_theme.get(param, "#000000")
@@ -1398,16 +1922,14 @@ if PYQT_AVAILABLE:
                         if hasattr(button, 'color_value_label'):
                             button.color_value_label.setText(color)
 
-                # Update gradient checkbox
+                # Determine and set background type
                 is_gradient = self.current_theme.get("gradient", False)
-                self.gradient_checkbox.setChecked(is_gradient)
-                self.gradient_widget.setVisible(is_gradient)
-
-                # Update inspector gradient checkbox
-                inspector_uses_gradient = self.current_theme.get("inspector_bg", "") == "transparent"
-                self.inspector_gradient_checkbox.setChecked(inspector_uses_gradient)
-                if "inspector_bg" in self.color_buttons:
-                    self.color_buttons["inspector_bg"].setEnabled(not inspector_uses_gradient)
+                if is_gradient:
+                    self.main_bg_combo.setCurrentText("Gradient")
+                elif self.app_bg_image_path:
+                    self.main_bg_combo.setCurrentText("Image")
+                else:
+                    self.main_bg_combo.setCurrentText("Color")
 
                 # Update gradient colors if present, otherwise use defaults
                 default_gradient = ["#ff6b35", "#ff8c42", "#ffa94d", "#ffc75f", "#f9c74f"]
@@ -1419,12 +1941,116 @@ if PYQT_AVAILABLE:
                 for i in range(min(len(gradient_colors), len(self.gradient_color_buttons))):
                     self.gradient_color_buttons[i].set_color(gradient_colors[i])
 
-                # Hide or show main background color row based on gradient status
-                if self.background_row:
-                    has_gradient = self.current_theme.get("gradient", False)
-                    self.background_row.setVisible(not has_gradient)
+                # Update visibility
+                self.update_bg_widgets_visibility()
+                self.apply_theme_live()
 
-                self.update_preview()
+        def on_theme_name_changed(self, text):
+            """Handle theme name change in real-time"""
+            self.current_theme["name"] = text or "Custom Theme"
+
+        def is_image_file(self, file_path):
+            return os.path.splitext(file_path)[1].lower() in IMAGE_EXTENSIONS
+
+        def dragEnterEvent(self, event):
+            if event.mimeData().hasUrls():
+                for url in event.mimeData().urls():
+                    if url.isLocalFile() and self.is_image_file(url.toLocalFile()):
+                        event.acceptProposedAction()
+                        return
+            event.ignore()
+
+        def dragMoveEvent(self, event):
+            self.dragEnterEvent(event)
+
+        def dropEvent(self, event):
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    file_path = url.toLocalFile()
+                    if self.is_image_file(file_path):
+                        self.set_dropped_image(file_path, self.drop_target_for_pos(event.pos()))
+                        event.acceptProposedAction()
+                        return
+            event.ignore()
+
+        def widget_matches_drop_list(self, widget, widgets):
+            while widget is not None and widget is not self:
+                if widget in widgets:
+                    return True
+                widget = widget.parent()
+            return False
+
+        def drop_target_for_pos(self, pos):
+            widget = self.childAt(pos)
+            if widget is not None:
+                if self.widget_matches_drop_list(widget, getattr(self, 'offset_drop_widgets', [])):
+                    return 'offset'
+            if self.app_image_widget.isVisible() and self.app_image_widget.geometry().contains(self.app_image_widget.parent().mapFrom(self, pos)):
+                return 'app'
+            if self.image_widget.geometry().contains(self.image_widget.parent().mapFrom(self, pos)):
+                return 'hex'
+            return 'hex'
+
+        def set_dropped_image(self, file_path, target):
+            if target == 'app':
+                self.app_bg_image_path = file_path
+                self.app_bg_image_label.setText(os.path.basename(file_path))
+                self.current_theme['app_bg_image'] = file_path
+            elif target == 'offset':
+                self.offset_ascii_image_path = file_path
+                self.offset_ascii_image_label.setText(os.path.basename(file_path))
+                self.current_theme['offset_ascii_bg_image'] = file_path
+            else:
+                self.hex_bytes_image_path = file_path
+                self.hex_bytes_image_label.setText(os.path.basename(file_path))
+                self.current_theme['hex_bytes_bg_image'] = file_path
+            self.apply_theme_live()
+
+        def browse_app_bg_image(self):
+            """Browse for whole-editor background image"""
+            file_path, _ = QFileDialog.getOpenFileName(
+                self, "Select Editor Background Image", "",
+                IMAGE_FILTER
+            )
+            if file_path:
+                if not os.path.exists(file_path):
+                    QMessageBox.warning(self, "Image Error", "That image path does not exist.")
+                    return
+                self.app_bg_image_path = file_path
+                self.app_bg_image_label.setText(os.path.basename(file_path))
+                self.current_theme['app_bg_image'] = file_path
+                self.apply_theme_live()
+
+        def clear_app_bg_image(self):
+            """Clear whole-editor background image"""
+            self.app_bg_image_path = ""
+            self.app_bg_image_label.setText("No editor background image")
+            if 'app_bg_image' in self.current_theme:
+                del self.current_theme['app_bg_image']
+            self.apply_theme_live()
+
+        def on_app_bg_tint_changed(self, color):
+            """Handle whole-editor background tint color change"""
+            self.app_bg_tint_color = color
+            self.current_theme['app_bg_tint_color'] = color
+            self.apply_theme_live()
+
+        def on_app_bg_opacity_changed(self, value):
+            """Handle whole-editor background tint opacity change"""
+            self.app_bg_tint_opacity = value / 100.0
+            self.app_bg_opacity_label.setText(f"{value}%")
+            self.current_theme['app_bg_tint_opacity'] = self.app_bg_tint_opacity
+            self.apply_theme_live()
+
+        def on_fit_mode_changed(self, key, text):
+            """Handle image sizing mode changes."""
+            self.current_theme[key] = text.lower()
+            self.apply_theme_live()
+
+        def on_gif_quality_changed(self, key, text):
+            """Handle animated GIF playback quality changes."""
+            self.current_theme[key] = text.lower()
+            self.apply_theme_live()
 
         def on_color_changed(self, param, color):
             """Handle color change for a parameter"""
@@ -1432,41 +2058,75 @@ if PYQT_AVAILABLE:
             if hasattr(self.color_buttons[param], 'color_value_label'):
                 self.color_buttons[param].color_value_label.setText(color)
 
-            self.update_preview()
+            self.apply_theme_live()
             self.themeChanged.emit(self.current_theme)
 
-        def update_preview(self):
-            """Update the preview widget with current theme colors"""
-            theme = self.current_theme
+        def browse_hex_bytes_image(self):
+            """Browse for hex bytes background image"""
+            file_path, _ = QFileDialog.getOpenFileName(
+                self, "Select Hex Bytes Background Image", "",
+                IMAGE_FILTER
+            )
+            if file_path:
+                self.hex_bytes_image_path = file_path
+                # Show just filename
+                self.hex_bytes_image_label.setText(os.path.basename(file_path))
+                self.current_theme['hex_bytes_bg_image'] = file_path
+                self.apply_theme_live()
 
-            if theme.get("gradient", False):
-                # Show gradient preview
-                bg_color = theme.get('menubar_bg', '#1e1e1e')
-            else:
-                bg_color = theme.get('background', '#1e1e1e')
+        def clear_hex_bytes_image(self):
+            """Clear hex bytes background image"""
+            self.hex_bytes_image_path = ""
+            self.hex_bytes_image_label.setText("No image selected")
+            if 'hex_bytes_bg_image' in self.current_theme:
+                del self.current_theme['hex_bytes_bg_image']
+            self.apply_theme_live()
 
-            self.preview_widget.setStyleSheet(f"""
-                QWidget {{
-                    background-color: {bg_color};
-                    color: {theme.get('foreground', '#d4d4d4')};
-                    border: 2px solid {theme.get('border', '#3e3e42')};
-                    border-radius: 5px;
-                }}
-                QLabel {{
-                    color: {theme.get('foreground', '#d4d4d4')};
-                    border: none;
-                }}
-                QPushButton {{
-                    background-color: {theme.get('button_bg', '#0e639c')};
-                    color: {theme.get('button_text', 'white')};
-                    border: none;
-                    padding: 6px 16px;
-                    border-radius: 3px;
-                }}
-                QPushButton:hover {{
-                    background-color: {theme.get('button_hover', '#1177bb')};
-                }}
-            """)
+        def on_hex_bytes_tint_changed(self, color):
+            """Handle hex bytes tint color change"""
+            self.hex_bytes_tint_color = color
+            self.current_theme['hex_bytes_tint_color'] = color
+            self.apply_theme_live()
+
+        def on_hex_bytes_opacity_changed(self, value):
+            """Handle hex bytes tint opacity change"""
+            self.hex_bytes_tint_opacity = value / 100.0
+            self.hex_bytes_opacity_label.setText(f"{value}%")
+            self.current_theme['hex_bytes_tint_opacity'] = self.hex_bytes_tint_opacity
+            self.apply_theme_live()
+
+        def browse_offset_ascii_image(self):
+            """Browse for offset/ASCII background image"""
+            file_path, _ = QFileDialog.getOpenFileName(
+                self, "Select Offset/ASCII Background Image", "",
+                IMAGE_FILTER
+            )
+            if file_path:
+                self.offset_ascii_image_path = file_path
+                self.offset_ascii_image_label.setText(os.path.basename(file_path))
+                self.current_theme['offset_ascii_bg_image'] = file_path
+                self.apply_theme_live()
+
+        def clear_offset_ascii_image(self):
+            """Clear offset/ASCII background image"""
+            self.offset_ascii_image_path = ""
+            self.offset_ascii_image_label.setText("No image")
+            if 'offset_ascii_bg_image' in self.current_theme:
+                del self.current_theme['offset_ascii_bg_image']
+            self.apply_theme_live()
+
+        def on_offset_ascii_tint_changed(self, color):
+            """Handle offset/ASCII tint color change"""
+            self.offset_ascii_tint_color = color
+            self.current_theme['offset_ascii_tint_color'] = color
+            self.apply_theme_live()
+
+        def on_offset_ascii_opacity_changed(self, value):
+            """Handle offset/ASCII tint opacity change"""
+            self.offset_ascii_tint_opacity = value / 100.0
+            self.offset_ascii_opacity_label.setText(f"{value}%")
+            self.current_theme['offset_ascii_tint_opacity'] = self.offset_ascii_tint_opacity
+            self.apply_theme_live()
 
         def save_theme(self):
             """Save the current theme to custom themes file"""
@@ -1487,10 +2147,17 @@ if PYQT_AVAILABLE:
 
             # Load existing custom themes
             custom_themes = load_custom_themes()
+            if self.original_custom_name and self.original_custom_name != theme_name:
+                custom_themes.pop(self.original_custom_name, None)
+            if self._temporary_live_storage:
+                custom_themes.pop(self._live_storage_name, None)
             custom_themes[theme_name] = self.current_theme
 
             # Save to file
             if save_custom_themes(custom_themes):
+                self.original_custom_name = theme_name
+                self._temporary_live_storage = False
+                self._live_storage_name = theme_name
                 QMessageBox.information(self, "Success", f"Theme '{theme_name}' saved successfully!")
             else:
                 QMessageBox.warning(self, "Error", "Failed to save theme.")
@@ -1498,44 +2165,48 @@ if PYQT_AVAILABLE:
         def delete_theme(self):
             """Delete the current custom theme"""
             theme_name = self.theme_name_input.text().strip()
+            theme_key = self.original_custom_name or theme_name
             if not theme_name:
                 QMessageBox.warning(self, "Invalid Name", "Please enter a theme name.")
                 return
 
-            # Check if it's a built-in theme
+            custom_themes = load_custom_themes()
+
+            if theme_key in custom_themes:
+                theme_name = theme_key
+            elif theme_name in custom_themes:
+                theme_key = theme_name
+            else:
+                theme_key = theme_name
+
+            # Only block built-ins when there is no same-named custom theme to delete.
             builtin_names = [name for cat in THEMES.values() for name in cat.keys()]
-            if theme_name in builtin_names:
+            if theme_key in builtin_names and theme_key not in custom_themes:
                 QMessageBox.warning(self, "Cannot Delete",
                                   "Cannot delete built-in themes.")
                 return
 
-            # Load custom themes
-            custom_themes = load_custom_themes()
-
-            if theme_name not in custom_themes:
+            if theme_key not in custom_themes:
                 QMessageBox.warning(self, "Not Found",
-                                  f"Custom theme '{theme_name}' not found.")
+                                  f"Custom theme '{theme_key}' not found.")
                 return
 
             # Confirm deletion
             reply = QMessageBox.question(self, "Confirm Delete",
-                                        f"Are you sure you want to delete theme '{theme_name}'?",
+                                        f"Are you sure you want to delete theme '{theme_key}'?",
                                         QMessageBox.Yes | QMessageBox.No)
 
             if reply == QMessageBox.Yes:
-                del custom_themes[theme_name]
+                del custom_themes[theme_key]
                 if save_custom_themes(custom_themes):
                     QMessageBox.information(self, "Success",
-                                          f"Theme '{theme_name}' deleted successfully!")
+                                          f"Theme '{theme_key}' deleted successfully!")
                     self.reject()
                 else:
                     QMessageBox.warning(self, "Error", "Failed to delete theme.")
 
-        def apply_theme(self):
-            """Apply the current theme"""
-            self.current_theme["name"] = self.theme_name_input.text().strip() or "Custom Theme"
-            self.accept()
-
         def get_theme(self):
             """Get the current theme configuration"""
+            theme_name = self.theme_name_input.text().strip() or self.current_theme.get("name", "Custom Theme")
+            self.current_theme["name"] = theme_name
             return self.current_theme

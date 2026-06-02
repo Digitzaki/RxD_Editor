@@ -14,11 +14,13 @@ Features:
 """
 
 import struct
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QRect, QTimer
+import html as html_lib
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QRect, QTimer, QPoint
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                               QProgressBar, QTreeWidget, QTreeWidgetItem, QLineEdit,
-                              QComboBox, QCheckBox, QMenu, QInputDialog)
-from PyQt5.QtGui import QFont, QPainter, QPen, QColor
+                              QComboBox, QCheckBox, QMenu, QInputDialog, QColorDialog,
+                              QToolTip)
+from PyQt5.QtGui import QFont, QPainter, QPen, QColor, QBrush, QPalette
 
 
 class SignaturePointer:
@@ -64,6 +66,55 @@ class SignaturePointer:
         self.reference_tab_index = reference_tab_index
 
 
+class CategorizedTypeButton(QPushButton):
+    """Compact type picker with submenu categories, while acting like a combo box."""
+    currentTextChanged = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._current_text = ""
+        self._categories = {}
+        self.clicked.connect(self.show_type_menu)
+        self.setMinimumWidth(66)
+        self.setMaximumWidth(82)
+        self.setMaximumHeight(25)
+
+    def set_categories(self, categories):
+        self._categories = categories
+        first = next((items[0] for items in categories.values() if items), "")
+        if not self._current_text and first:
+            self.setCurrentText(first)
+        elif self._current_text and not any(self._current_text in items for items in categories.values()):
+            self.setCurrentText(first)
+
+    def addItems(self, items):
+        self.set_categories({"Types": list(items)})
+
+    def currentText(self):
+        return self._current_text
+
+    def setCurrentText(self, text):
+        if not text:
+            return
+        if text == self._current_text:
+            self.setText(text)
+            return
+        self._current_text = text
+        self.setText(text)
+        self.currentTextChanged.emit(text)
+
+    def show_type_menu(self):
+        menu = QMenu(self)
+        for category, items in self._categories.items():
+            if not items:
+                continue
+            submenu = menu.addMenu(category)
+            for type_name in items:
+                action = submenu.addAction(type_name)
+                action.triggered.connect(lambda _checked=False, t=type_name: self.setCurrentText(t))
+        menu.exec_(self.mapToGlobal(self.rect().bottomLeft()))
+
+
 class ClickableOverlay(QLineEdit):
     """
     Editable overlay widget for signature pointer values.
@@ -99,16 +150,20 @@ class ClickableOverlay(QLineEdit):
         self.hex_display_parent = parent
         dtype_lower = pointer.data_type.lower()
         self.is_offset_type = dtype_lower.startswith("offset") or dtype_lower == "segment" or dtype_lower == "string (offset)" or dtype_lower == "string (ref.)"
+        self.is_color_type = dtype_lower in ("rgb24", "rgba32", "bgr24", "bgra32", "argb32", "abgr32", "hsv")
         self.is_editing = False
         self.original_geometry = None
         self.original_text = ""
+        self.custom_tooltip_text = ""
+        self.custom_tooltip_bg = QColor("#000000")
+        self.custom_tooltip_fg = QColor("#ffffff")
 
-        if self.is_offset_type:
+        if self.is_color_type or self.is_offset_type:
             self.setCursor(Qt.PointingHandCursor)
         else:
             self.setCursor(Qt.IBeamCursor)
 
-        self.setReadOnly(False)
+        self.setReadOnly(self.is_color_type)
         self.setFrame(False)
         self.setAlignment(Qt.AlignCenter)
 
@@ -116,7 +171,32 @@ class ClickableOverlay(QLineEdit):
         self.returnPressed.connect(self._on_editing_finished)
         self.textChanged.connect(self._on_text_changed)
 
+    def set_custom_tooltip(self, text, background_color, foreground_color):
+        self.custom_tooltip_text = text or ""
+        self.custom_tooltip_bg = QColor(background_color)
+        self.custom_tooltip_fg = QColor(foreground_color)
+        self.setToolTip("")
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        if not self.custom_tooltip_text:
+            return
+        palette = QPalette()
+        palette.setColor(QPalette.ToolTipBase, self.custom_tooltip_bg)
+        palette.setColor(QPalette.ToolTipText, self.custom_tooltip_fg)
+        QToolTip.setPalette(palette)
+        escaped = html_lib.escape(self.custom_tooltip_text).replace("\n", "<br>")
+        html_text = f'<span style="color: {self.custom_tooltip_fg.name()};">{escaped}</span>'
+        QToolTip.showText(self.mapToGlobal(QPoint(self.width() // 2, -4)), html_text, self)
+
+    def leaveEvent(self, event):
+        QToolTip.hideText()
+        super().leaveEvent(event)
+
     def focusInEvent(self, event):
+        if self.is_color_type:
+            event.ignore()
+            return
         super().focusInEvent(event)
         self.is_editing = True
         self.original_text = self.text()
@@ -150,6 +230,10 @@ class ClickableOverlay(QLineEdit):
             self._expand_for_editing()
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.is_color_type:
+            self.open_color_picker()
+            event.accept()
+            return
         if event.button() == Qt.LeftButton and not self.is_editing:
             self.clicked.emit(self.pointer)
             # For segment types, accept the event to prevent text selection
@@ -158,7 +242,29 @@ class ClickableOverlay(QLineEdit):
                 return
         super().mousePressEvent(event)
 
+    def open_color_picker(self):
+        color = self.palette().color(self.backgroundRole())
+        text = str(getattr(self.pointer, "value", "")).strip()
+        if text.startswith("#"):
+            color = QColor(text.split()[0])
+        parent_editor = None
+        try:
+            parent_editor = self.window()
+        except RuntimeError:
+            parent_editor = None
+        if parent_editor and hasattr(parent_editor, "get_theme_color_dialog"):
+            dialog = parent_editor.get_theme_color_dialog(color, self)
+        else:
+            dialog = QColorDialog(color, self)
+            dialog.setOption(QColorDialog.DontUseNativeDialog, False)
+        dialog.setWindowTitle("Select Color")
+        if dialog.exec_() == QColorDialog.Accepted:
+            selected = dialog.selectedColor()
+            self.value_changed.emit(self.pointer, selected.name(QColor.HexRgb))
+
     def _on_editing_finished(self):
+        if self.is_color_type:
+            return
         try:
             new_value = self.text()
             self.value_changed.emit(self.pointer, new_value)
@@ -316,11 +422,11 @@ class SignatureWidget(QWidget):
         if length >= 1:
             types.extend(["int8", "uint8"])
         if length >= 2:
-            types.extend(["int16", "uint16", "Offset"])
+            types.extend(["int16", "uint16", "float16", "Offset"])
         if length >= 3:
-            types.extend(["int24", "uint24"])
+            types.extend(["int24", "uint24", "RGB24", "BGR24", "HSV"])
         if length >= 4:
-            types.extend(["int32", "uint32", "float32", "Segment", "String (Offset)", "String (Ref.)"])
+            types.extend(["int32", "uint32", "float32", "RGBA32", "BGRA32", "ARGB32", "ABGR32", "Segment", "String (Offset)", "String (Ref.)"])
         if length >= 8:
             types.extend(["int64", "uint64", "float64"])
         if length >= 1:
@@ -328,8 +434,23 @@ class SignatureWidget(QWidget):
 
         return types
 
+    def get_type_categories_for_length(self, length):
+        available = set(self.get_valid_types_for_length(length))
+        categories = {
+            "Raw": ["Hex", "String"],
+            "Integers": ["int8", "uint8", "int16", "uint16", "int24", "uint24", "int32", "uint32", "int64", "uint64"],
+            "Floats": ["float16", "float32", "float64"],
+            "Pointers / Ranges": ["Offset", "Segment", "String (Offset)", "String (Ref.)"],
+            "Colors": ["RGB24", "RGBA32", "BGR24", "BGRA32", "ARGB32", "ABGR32", "HSV"],
+        }
+        return {name: [item for item in items if item in available] for name, items in categories.items()}
+
     def needs_endianness(self, base_type):
-        return base_type.lower() in ["int16", "uint16", "int24", "uint24", "int32", "uint32", "int64", "uint64", "float32", "float64"]
+        return base_type.lower() in [
+            "int16", "uint16", "int24", "uint24", "int32", "uint32", "int64", "uint64",
+            "float16", "float32", "float64", "vector2", "vector3", "vector4",
+            "quaternion", "bounding box"
+        ]
 
     def get_full_type_name(self, base_type, endianness):
         if self.needs_endianness(base_type):
@@ -342,10 +463,13 @@ class SignatureWidget(QWidget):
 
         type_lengths = {
             "int8": 1, "uint8": 1,
-            "int16": 2, "uint16": 2, "offset": 2,
-            "int24": 3, "uint24": 3,
-            "int32": 4, "uint32": 4, "float32": 4, "segment": 4,
-            "int64": 8, "uint64": 8, "float64": 8,
+            "int16": 2, "uint16": 2, "float16": 2, "offset": 2,
+            "int24": 3, "uint24": 3, "rgb24": 3, "bgr24": 3, "hsv": 3,
+            "int32": 4, "uint32": 4, "float32": 4, "rgba32": 4, "bgra32": 4, "argb32": 4, "abgr32": 4, "segment": 4,
+            "int64": 8, "uint64": 8, "float64": 8, "vector2": 8,
+            "vector3": 12,
+            "vector4": 16, "quaternion": 16,
+            "bounding": 24,
             "hex": 1, "string": 1
         }
 
@@ -370,10 +494,13 @@ class SignatureWidget(QWidget):
         mode_label.setFont(QFont("Arial", 8))
         mode_layout.addWidget(mode_label)
 
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Selection", "Search"])
-        self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
-        mode_layout.addWidget(self.mode_combo)
+        self.mode_toggle = QPushButton("Select")
+        self.mode_toggle.setFont(QFont("Arial", 9))
+        self.mode_toggle.setMinimumWidth(85)
+        self.mode_toggle.setMaximumHeight(25)
+        self.mode_toggle.setCheckable(True)
+        self.mode_toggle.clicked.connect(self.on_mode_toggle)
+        mode_layout.addWidget(self.mode_toggle)
 
         mode_layout.addSpacing(15)
 
@@ -381,9 +508,9 @@ class SignatureWidget(QWidget):
         self.sel_type_label.setFont(QFont("Arial", 8))
         mode_layout.addWidget(self.sel_type_label)
 
-        self.selection_type_combo = QComboBox()
+        self.selection_type_combo = CategorizedTypeButton()
         self.selection_type_combo.setFont(QFont("Arial", 8))
-        self.selection_type_combo.addItems(self.get_valid_types_for_length(16))
+        self.selection_type_combo.set_categories(self.get_type_categories_for_length(32))
         self.selection_type_combo.setCurrentText("int32")
         self.selection_type_combo.currentTextChanged.connect(self.on_selection_type_changed)
         mode_layout.addWidget(self.selection_type_combo)
@@ -451,9 +578,9 @@ class SignatureWidget(QWidget):
         type_label.setFont(QFont("Arial", 8))
         search_layout.addWidget(type_label)
 
-        self.type_combo = QComboBox()
+        self.type_combo = CategorizedTypeButton()
         self.type_combo.setFont(QFont("Arial", 8))
-        self.type_combo.addItems(self.get_valid_types_for_length(16))
+        self.type_combo.set_categories(self.get_type_categories_for_length(32))
         self.type_combo.setCurrentText("int32")
         self.type_combo.currentTextChanged.connect(self.on_search_type_changed)
         search_layout.addWidget(self.type_combo)
@@ -569,8 +696,11 @@ class SignatureWidget(QWidget):
 
         self.setLayout(layout)
 
-    def on_mode_changed(self, mode):
-        is_search = mode == "Search"
+    def on_mode_toggle(self):
+        is_search = self.mode_toggle.isChecked()
+
+        # Update button text
+        self.mode_toggle.setText("Search" if is_search else "Select")
 
         self.sel_type_label.setVisible(not is_search)
         self.selection_type_combo.setVisible(not is_search)
@@ -596,10 +726,10 @@ class SignatureWidget(QWidget):
         current_file = self.parent_editor.open_files[self.parent_editor.current_tab_index]
         file_data = current_file.file_data
 
-        mode = self.mode_combo.currentText()
+        is_search = self.mode_toggle.isChecked()
         new_pointers = []
 
-        if mode == "Selection":
+        if not is_search:
             if self.parent_editor.selection_start is None or self.parent_editor.selection_end is None:
                 self.status_label.setText("No bytes selected")
                 return
@@ -622,7 +752,10 @@ class SignatureWidget(QWidget):
                 sel_end = max(self.parent_editor.selection_start, self.parent_editor.selection_end)
                 selection_length = sel_end - sel_start + 1
 
-            length = selection_length
+            if base_type.lower() in ["offset", "string", "string (offset)", "string (ref.)", "hex", "segment"]:
+                length = selection_length
+            else:
+                length = self.get_length_for_type(data_type)
 
             pattern_bytes = bytes(file_data[sel_start:sel_start + length]) if sel_start + length <= len(file_data) else b''
 
@@ -832,8 +965,16 @@ class SignatureWidget(QWidget):
                     "int24 le": 3, "uint24 le": 3, "int24 be": 3, "uint24 be": 3,
                     "int32 le": 4, "uint32 le": 4, "int32 be": 4, "uint32 be": 4,
                     "int64 le": 8, "uint64 le": 8, "int64 be": 8, "uint64 be": 8,
+                    "float16 le": 2, "float16 be": 2,
                     "float32 le": 4, "float32 be": 4,
                     "float64 le": 8, "float64 be": 8,
+                    "rgb24": 3, "bgr24": 3, "hsv": 3,
+                    "rgba32": 4, "bgra32": 4, "argb32": 4, "abgr32": 4,
+                    "vector2 le": 8, "vector2 be": 8,
+                    "vector3 le": 12, "vector3 be": 12,
+                    "vector4 le": 16, "vector4 be": 16,
+                    "quaternion le": 16, "quaternion be": 16,
+                    "bounding box le": 24, "bounding box be": 24,
                 }
                 expected_length = expected_lengths.get(dtype_lower)
                 if expected_length is not None and length != expected_length:
@@ -881,6 +1022,12 @@ class SignatureWidget(QWidget):
                 return struct.unpack('>q', value_bytes[:8])[0]
             elif dtype_lower == "uint64 be":
                 return struct.unpack('>Q', value_bytes[:8])[0]
+            elif dtype_lower == "float16 le":
+                val = struct.unpack('<e', value_bytes[:2])[0]
+                return f"{val:.6f}"
+            elif dtype_lower == "float16 be":
+                val = struct.unpack('>e', value_bytes[:2])[0]
+                return f"{val:.6f}"
             elif dtype_lower == "float32 le":
                 val = struct.unpack('<f', value_bytes[:4])[0]
                 return f"{val:.3f}"
@@ -893,6 +1040,14 @@ class SignatureWidget(QWidget):
             elif dtype_lower == "float64 be":
                 val = struct.unpack('>d', value_bytes[:8])[0]
                 return f"{val:.3f}"
+            elif dtype_lower in ("rgb24", "rgba32", "bgr24", "bgra32", "argb32", "abgr32", "hsv"):
+                return self.format_color_value(value_bytes, dtype_lower)
+            elif dtype_lower in (
+                "vector2 le", "vector2 be", "vector3 le", "vector3 be",
+                "vector4 le", "vector4 be", "quaternion le", "quaternion be",
+                "bounding box le", "bounding box be"
+            ):
+                return self.format_vector_value(value_bytes, dtype_lower)
             elif dtype_lower == "offset":
                 hex_str = ''.join(f'{b:02X}' for b in value_bytes)
                 return format(int(hex_str, 16), 'X')
@@ -1159,6 +1314,127 @@ class SignatureWidget(QWidget):
                 self.sel_ref_combo.addItem(f"{i}: {tab_name}", i)
                 self.search_ref_combo.addItem(f"{i}: {tab_name}", i)
 
+    def color_components_from_bytes(self, value_bytes, dtype_lower):
+        if dtype_lower == "rgb24":
+            r, g, b = value_bytes[:3]
+            a = 255
+        elif dtype_lower == "bgr24":
+            b, g, r = value_bytes[:3]
+            a = 255
+        elif dtype_lower == "rgba32":
+            r, g, b, a = value_bytes[:4]
+        elif dtype_lower == "bgra32":
+            b, g, r, a = value_bytes[:4]
+        elif dtype_lower == "argb32":
+            a, r, g, b = value_bytes[:4]
+        elif dtype_lower == "abgr32":
+            a, b, g, r = value_bytes[:4]
+        elif dtype_lower == "hsv":
+            h, s, v = value_bytes[:3]
+            color = QColor()
+            color.setHsv(h * 360 // 255, s, v)
+            r, g, b, a = color.red(), color.green(), color.blue(), 255
+        else:
+            return None
+        return r, g, b, a
+
+    def format_color_value(self, value_bytes, dtype_lower):
+        components = self.color_components_from_bytes(value_bytes, dtype_lower)
+        if not components:
+            return "N/A"
+        r, g, b, a = components
+        if dtype_lower in ("rgb24", "bgr24", "hsv"):
+            return f"#{r:02X}{g:02X}{b:02X}  ({r}, {g}, {b})"
+        return f"#{r:02X}{g:02X}{b:02X}{a:02X}  ({r}, {g}, {b}, {a})"
+
+    def vector_values_from_bytes(self, value_bytes, dtype_lower):
+        endian = "<" if dtype_lower.endswith(" le") else ">"
+        base = dtype_lower.replace(" le", "").replace(" be", "")
+        counts = {
+            "vector2": 2,
+            "vector3": 3,
+            "vector4": 4,
+            "quaternion": 4,
+            "bounding box": 6,
+        }
+        count = counts.get(base)
+        if not count or len(value_bytes) < count * 4:
+            return None
+        return struct.unpack(f"{endian}{'f' * count}", value_bytes[:count * 4])
+
+    def format_vector_value(self, value_bytes, dtype_lower):
+        values = self.vector_values_from_bytes(value_bytes, dtype_lower)
+        if values is None:
+            return "N/A"
+        base = dtype_lower.replace(" le", "").replace(" be", "")
+        if base == "bounding box":
+            labels = ("MinX", "MinY", "MinZ", "MaxX", "MaxY", "MaxZ")
+        elif base == "quaternion":
+            labels = ("X", "Y", "Z", "W")
+        else:
+            labels = ("X", "Y", "Z", "W")[:len(values)]
+        return ", ".join(f"{label}:{value:.3f}" for label, value in zip(labels, values))
+
+    def parse_component_values(self, value_str):
+        cleaned = value_str.strip()
+        if ":" in cleaned:
+            parts = []
+            for chunk in cleaned.split(","):
+                parts.append(chunk.split(":", 1)[-1].strip())
+            return parts
+        return [part.strip() for part in cleaned.replace(";", ",").split(",") if part.strip()]
+
+    def color_value_to_bytes(self, value_str, dtype_lower):
+        text = value_str.strip()
+        if text.startswith("#"):
+            hex_text = text[1:].split()[0]
+            if len(hex_text) == 6:
+                r, g, b = bytes.fromhex(hex_text)
+                a = 255
+            elif len(hex_text) == 8:
+                r, g, b, a = bytes.fromhex(hex_text)
+            else:
+                return None
+        else:
+            values = [int(float(part)) for part in self.parse_component_values(text)]
+            if len(values) < 3:
+                return None
+            r, g, b = [max(0, min(255, value)) for value in values[:3]]
+            a = max(0, min(255, values[3])) if len(values) > 3 else 255
+
+        if dtype_lower == "rgb24":
+            return bytes([r, g, b])
+        if dtype_lower == "bgr24":
+            return bytes([b, g, r])
+        if dtype_lower == "rgba32":
+            return bytes([r, g, b, a])
+        if dtype_lower == "bgra32":
+            return bytes([b, g, r, a])
+        if dtype_lower == "argb32":
+            return bytes([a, r, g, b])
+        if dtype_lower == "abgr32":
+            return bytes([a, b, g, r])
+        if dtype_lower == "hsv":
+            color = QColor(r, g, b)
+            return bytes([color.hue() * 255 // 359 if color.hue() >= 0 else 0, color.saturation(), color.value()])
+        return None
+
+    def vector_value_to_bytes(self, value_str, dtype_lower):
+        values = [float(part) for part in self.parse_component_values(value_str)]
+        base = dtype_lower.replace(" le", "").replace(" be", "")
+        counts = {
+            "vector2": 2,
+            "vector3": 3,
+            "vector4": 4,
+            "quaternion": 4,
+            "bounding box": 6,
+        }
+        count = counts.get(base)
+        if not count or len(values) < count:
+            return None
+        endian = "<" if dtype_lower.endswith(" le") else ">"
+        return struct.pack(f"{endian}{'f' * count}", *values[:count])
+
     def add_pointer_to_category(self, pointer, category_item):
         item = QTreeWidgetItem(category_item)
 
@@ -1190,6 +1466,16 @@ class SignatureWidget(QWidget):
                 item.setText(3, str(pointer.value))
         else:
             item.setText(3, str(pointer.value))
+
+        color_components = self.color_components_from_bytes(
+            bytes(self.parent_editor.open_files[self.parent_editor.current_tab_index].file_data[pointer.offset:pointer.offset + pointer.length])
+            if self.parent_editor and self.parent_editor.current_tab_index >= 0 else b"",
+            pointer.data_type.lower()
+        )
+        if color_components:
+            r, g, b, _a = color_components
+            item.setBackground(3, QBrush(QColor(r, g, b, 120)))
+            item.setForeground(3, QBrush(QColor(0, 0, 0) if (r + g + b) / 3 > 150 else QColor(255, 255, 255)))
 
         item.setData(0, Qt.UserRole, pointer)
         self.pointer_tree.setItemWidget(item, 0, label_edit)
@@ -1286,9 +1572,13 @@ class SignatureWidget(QWidget):
             elif dtype_lower == "uint64 le":
                 return struct.pack('<Q', int(value_str))
             elif dtype_lower == "int64 be":
-                return struct.unpack('>q', int(value_str))
+                return struct.pack('>q', int(value_str))
             elif dtype_lower == "uint64 be":
                 return struct.pack('>Q', int(value_str))
+            elif dtype_lower == "float16 le":
+                return struct.pack('<e', float(value_str))
+            elif dtype_lower == "float16 be":
+                return struct.pack('>e', float(value_str))
             elif dtype_lower == "float32 le":
                 return struct.pack('<f', float(value_str))
             elif dtype_lower == "float32 be":
@@ -1297,6 +1587,14 @@ class SignatureWidget(QWidget):
                 return struct.pack('<d', float(value_str))
             elif dtype_lower == "float64 be":
                 return struct.pack('>d', float(value_str))
+            elif dtype_lower in ("rgb24", "rgba32", "bgr24", "bgra32", "argb32", "abgr32", "hsv"):
+                return self.color_value_to_bytes(value_str, dtype_lower)
+            elif dtype_lower in (
+                "vector2 le", "vector2 be", "vector3 le", "vector3 be",
+                "vector4 le", "vector4 be", "quaternion le", "quaternion be",
+                "bounding box le", "bounding box be"
+            ):
+                return self.vector_value_to_bytes(value_str, dtype_lower)
             elif dtype_lower == "offset":
                 hex_str = value_str.strip().upper()
 

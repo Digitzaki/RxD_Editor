@@ -39,4 +39,17 @@ Open Source
 
 from .data_inspector import DataInspector
 
-__all__ = ['DataInspector']
+# Lazy import to avoid circular dependencies
+def __getattr__(name):
+    if name == 'FieldWidget':
+        from .fields import FieldWidget
+        return FieldWidget
+    elif name == 'Field':
+        from .fields import Field
+        return Field
+    elif name == 'Subfield':
+        from .fields import Subfield
+        return Subfield
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+__all__ = ['DataInspector', 'FieldWidget', 'Field', 'Subfield']

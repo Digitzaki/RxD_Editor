@@ -77,18 +77,32 @@ import struct
 import json
 import mmap
 import math
+import ctypes
+import html
+import gzip
+import zlib
+import zipfile
 from collections import Counter
+
+from PyQt5 import QtCore
 from PyQt5.QtWidgets import *
+from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import *
 from PyQt5.QtCore import *
 from editor_themes import (THEMES, get_theme_stylesheet, get_theme_colors,
                            get_all_themes, CustomThemeEditor, load_custom_themes,
-                           save_custom_themes, get_theme_categories)
+                           save_custom_themes, get_theme_categories,
+                           get_theme_surface_colors)
 from datainspect import DataInspector
 from datainspect.pattern_scan import PatternScanner, PatternScanWidget, PatternResult
 from datainspect.pointers import SignaturePointer, SignatureWidget, SignatureScanner, ClickableOverlay
 from datainspect.statistics import StatisticsWidget
 from datainspect.fields import FieldWidget
+from action_scripts import (
+    ActionScriptManager, HotkeyCaptureEdit, ScriptManagerDialog,
+    ScriptEditorDialog, normalize_hotkey
+)
+from rxd_paths import migrated_storage_dir, migrated_storage_path
 
 try:
     import magic
@@ -104,6 +118,333 @@ try:
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
+
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_ICON_PATH = os.path.join(APP_DIR, "rxd.ico")
+SETTINGS_PATH = migrated_storage_path(
+    "settings.json",
+    [os.path.join(os.path.expanduser("~"), ".hex_editor_settings.json")]
+)
+CONTROL_SHORTCUTS_PATH = migrated_storage_path(
+    "control_shortcuts.json",
+    [os.path.join(APP_DIR, "control_shortcuts.json")]
+)
+IMPORTED_THEME_ASSETS_DIR = migrated_storage_dir(
+    "imported_theme_assets",
+    [os.path.join(APP_DIR, "imported_theme_assets")]
+)
+THEME_IMAGE_KEYS = ("app_bg_image", "hex_bytes_bg_image", "offset_ascii_bg_image")
+
+
+def safe_export_filename(name, extension=".json"):
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", str(name or "export")).strip().strip(".")
+    if not cleaned:
+        cleaned = "export"
+    if not cleaned.lower().endswith(extension):
+        cleaned += extension
+    return cleaned
+
+
+def system_uses_dark_titlebar_fallback():
+    """Return Windows app theme preference for native title bars."""
+    if sys.platform != "win32":
+        return False
+
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        ) as key:
+            apps_use_light, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            return apps_use_light == 0
+    except Exception:
+        return False
+
+
+def apply_native_titlebar_theme(window, dark=None):
+    """Apply the native Windows dark/light titlebar flag to any top-level widget."""
+    if sys.platform != "win32" or window is None:
+        return
+
+    try:
+        hwnd = int(window.winId())
+        dark_enabled = ctypes.c_int(1 if (system_uses_dark_titlebar_fallback() if dark is None else dark) else 0)
+        for attribute in (20, 19):
+            result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                ctypes.c_void_p(hwnd),
+                ctypes.c_uint(attribute),
+                ctypes.byref(dark_enabled),
+                ctypes.sizeof(dark_enabled)
+            )
+            if result == 0:
+                break
+    except Exception:
+        pass
+
+
+def compact_dialog_layouts(layout):
+    """Tighten dialog layout margins/spacings without changing the main editor."""
+    if layout is None:
+        return
+
+    left, top, right, bottom = layout.getContentsMargins()
+    layout.setContentsMargins(min(left, 8), min(top, 8), min(right, 8), min(bottom, 8))
+    if layout.spacing() < 0 or layout.spacing() > 6:
+        layout.setSpacing(5)
+
+    for i in range(layout.count()):
+        item = layout.itemAt(i)
+        if item and item.layout():
+            compact_dialog_layouts(item.layout())
+
+
+def compact_dialog_stylesheet(parent=None):
+    """Small, editor-sized controls for utility dialogs."""
+    if parent is not None and hasattr(parent, "current_theme"):
+        theme = get_theme_colors(parent.current_theme)
+    else:
+        theme = get_theme_colors("Dark")
+
+    button_text = "#000000" if getattr(parent, "current_theme", "") == "Matrix" else theme.get("button_text", theme.get("foreground", "#ffffff"))
+    surfaces = get_theme_surface_colors(theme)
+    dialog_bg = surfaces["surface"]
+    editor_bg = surfaces["control"]
+    dialog_fg = surfaces["text"]
+    editor_fg = surfaces["control_text"]
+    border = theme.get("border", "#555555")
+    selection_bg = theme.get("selection_bg", theme.get("button_bg", "#990000"))
+    selection_fg = theme.get("selection_fg", dialog_fg)
+    return f"""
+        QDialog {{
+            background-color: {dialog_bg};
+            color: {dialog_fg};
+            font-family: Arial;
+            font-size: 9pt;
+        }}
+        QDialog QWidget {{
+            background-color: {dialog_bg};
+            color: {dialog_fg};
+        }}
+        QDialog QLabel {{
+            background-color: transparent;
+            color: {dialog_fg};
+            font-size: 9pt;
+        }}
+        QDialog QLabel[role="title"] {{
+            font-size: 10pt;
+            font-weight: bold;
+        }}
+        QDialog QPushButton {{
+            background-color: {theme.get('button_bg', '#990000')};
+            color: {button_text};
+            border: none;
+            border-radius: 3px;
+            padding: 3px 12px;
+            min-width: 58px;
+            min-height: 20px;
+            font-size: 9pt;
+        }}
+        QDialog QPushButton:hover {{
+            background-color: {theme.get('button_hover', '#b00000')};
+        }}
+        QDialog QPushButton:disabled {{
+            background-color: {theme.get('button_disabled', '#444444')};
+            color: #777777;
+        }}
+        QDialog QLineEdit,
+        QDialog QSpinBox,
+        QDialog QDoubleSpinBox,
+        QDialog QComboBox {{
+            background-color: {editor_bg};
+            color: {editor_fg};
+            border: 1px solid {border};
+            padding: 2px 4px;
+            min-height: 20px;
+            font-size: 9pt;
+            selection-background-color: {selection_bg};
+            selection-color: {selection_fg};
+        }}
+        QDialog QComboBox::drop-down {{
+            border-left: 1px solid {border};
+            width: 18px;
+        }}
+        QDialog QComboBox QAbstractItemView {{
+            background-color: {editor_bg};
+            color: {editor_fg};
+            border: 1px solid {border};
+            selection-background-color: {selection_bg};
+            selection-color: {selection_fg};
+        }}
+        QDialog QTextEdit,
+        QDialog QPlainTextEdit,
+        QDialog QListWidget,
+        QDialog QTreeWidget,
+        QDialog QTableWidget {{
+            background-color: {editor_bg};
+            color: {editor_fg};
+            border: 1px solid {border};
+            selection-background-color: {selection_bg};
+            selection-color: {selection_fg};
+        }}
+        QDialog QCheckBox,
+        QDialog QRadioButton {{
+            background-color: transparent;
+            color: {dialog_fg};
+            spacing: 4px;
+            font-size: 9pt;
+        }}
+        QDialog QCheckBox::indicator,
+        QDialog QRadioButton::indicator {{
+            width: 13px;
+            height: 13px;
+        }}
+        QDialog QGroupBox {{
+            background-color: {dialog_bg};
+            color: {dialog_fg};
+            border: 1px solid {border};
+            font-size: 9pt;
+            font-weight: bold;
+            margin-top: 8px;
+            padding-top: 8px;
+        }}
+        QDialog QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: 6px;
+            padding: 0 3px;
+            background-color: {dialog_bg};
+        }}
+        QDialog QTabBar::tab {{
+            padding: 5px 10px;
+            font-size: 9pt;
+        }}
+    """
+
+
+_BaseQDialog = QDialog
+
+
+def aspect_fill_source_rect(pixmap, target_size):
+    """Return a centered source rect that covers target_size without empty edges."""
+    if pixmap.isNull() or target_size.width() <= 0 or target_size.height() <= 0:
+        return pixmap.rect()
+
+    source = pixmap.rect()
+    source_ratio = source.width() / max(1, source.height())
+    target_ratio = target_size.width() / max(1, target_size.height())
+
+    if source_ratio > target_ratio:
+        crop_width = int(source.height() * target_ratio)
+        x = source.x() + max(0, (source.width() - crop_width) // 2)
+        return QRect(x, source.y(), crop_width, source.height())
+
+    crop_height = int(source.width() / target_ratio)
+    y = source.y() + max(0, (source.height() - crop_height) // 2)
+    return QRect(source.x(), y, source.width(), crop_height)
+
+
+class ThemedDialog(_BaseQDialog):
+    """QDialog that follows the Windows system titlebar theme."""
+    def showEvent(self, event):
+        super().showEvent(event)
+        parent = self.parent()
+        dark = parent.system_uses_dark_titlebar() if hasattr(parent, "system_uses_dark_titlebar") else None
+        apply_native_titlebar_theme(self, dark)
+        if not self.property("compactDialogStyleApplied"):
+            self.setFont(QFont("Arial", 9))
+            compact_dialog_layouts(self.layout())
+            existing_style = self.styleSheet() or ""
+            self.setStyleSheet(existing_style + "\n" + compact_dialog_stylesheet(parent))
+            self.setProperty("compactDialogStyleApplied", True)
+
+
+QDialog = ThemedDialog
+
+
+_BaseQMessageBox = QMessageBox
+
+
+class ThemedMessageBox(_BaseQMessageBox):
+    """Compact QMessageBox with the same titlebar/theme treatment as app dialogs."""
+    @staticmethod
+    def _show(parent, icon, title, text, buttons=_BaseQMessageBox.Ok, default_button=_BaseQMessageBox.NoButton):
+        box = _BaseQMessageBox(parent)
+        box.setIcon(icon)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setStandardButtons(buttons)
+        if default_button != _BaseQMessageBox.NoButton:
+            box.setDefaultButton(default_button)
+        box.setFont(QFont("Arial", 9))
+        compact_dialog_layouts(box.layout())
+        box.setStyleSheet(compact_dialog_stylesheet(parent))
+        dark = parent.system_uses_dark_titlebar() if hasattr(parent, "system_uses_dark_titlebar") else None
+        QTimer.singleShot(0, lambda: apply_native_titlebar_theme(box, dark))
+        return box.exec_()
+
+    @staticmethod
+    def information(parent, title, text, buttons=_BaseQMessageBox.Ok, defaultButton=_BaseQMessageBox.NoButton):
+        return ThemedMessageBox._show(parent, _BaseQMessageBox.Information, title, text, buttons, defaultButton)
+
+    @staticmethod
+    def warning(parent, title, text, buttons=_BaseQMessageBox.Ok, defaultButton=_BaseQMessageBox.NoButton):
+        return ThemedMessageBox._show(parent, _BaseQMessageBox.Warning, title, text, buttons, defaultButton)
+
+    @staticmethod
+    def critical(parent, title, text, buttons=_BaseQMessageBox.Ok, defaultButton=_BaseQMessageBox.NoButton):
+        return ThemedMessageBox._show(parent, _BaseQMessageBox.Critical, title, text, buttons, defaultButton)
+
+    @staticmethod
+    def question(parent, title, text, buttons=_BaseQMessageBox.StandardButtons(_BaseQMessageBox.Yes | _BaseQMessageBox.No), defaultButton=_BaseQMessageBox.NoButton):
+        return ThemedMessageBox._show(parent, _BaseQMessageBox.Question, title, text, buttons, defaultButton)
+
+
+QMessageBox = ThemedMessageBox
+
+
+class FileLoaderThread(QThread):
+    """Thread for loading large files without freezing UI"""
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(object, object, bool)
+    error = pyqtSignal(str)
+
+    def __init__(self, file_path):
+        super().__init__()
+        self.file_path = file_path
+        self.use_mmap = False
+
+    def run(self):
+        try:
+            file_size = os.path.getsize(self.file_path)
+            mmap_threshold = 10 * 1024 * 1024  # 10 MB
+
+            self.use_mmap = file_size > mmap_threshold
+
+            if self.use_mmap:
+                self.progress.emit(50)
+                file_handle = open(self.file_path, 'r+b' if os.access(self.file_path, os.W_OK) else 'rb')
+                self.progress.emit(100)
+                self.finished.emit(file_handle, None, True)
+            else:
+                chunk_size = 1024 * 1024  # 1MB chunks
+                file_data = bytearray()
+
+                with open(self.file_path, 'rb') as f:
+                    bytes_read = 0
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        file_data.extend(chunk)
+                        bytes_read += len(chunk)
+                        progress_percent = int((bytes_read / file_size) * 100)
+                        self.progress.emit(progress_percent)
+
+                self.finished.emit(None, bytes(file_data), False)
+
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class FileTab:
@@ -142,11 +483,13 @@ class FileTab:
         self.file_handle = file_handle
         self.mmap = None
         self.use_mmap = use_mmap
+        self.mmap_writable = False
 
         if use_mmap and file_handle:
             # Memory-mapped file for large files (efficient for files >100MB)
             try:
-                self.mmap = mmap.mmap(file_handle.fileno(), 0, access=mmap.ACCESS_READ)
+                self.mmap_writable = True
+                self.mmap = mmap.mmap(file_handle.fileno(), 0, access=mmap.ACCESS_COPY)
                 self.file_data = self.mmap  # Acts like bytearray but memory-mapped
                 self.original_data = None  # Don't duplicate large files in memory
             except:
@@ -161,6 +504,7 @@ class FileTab:
 
         self.modified = False
         self.edits = {}  # For mmap mode: {offset: byte_value} - track modifications
+        self.mmap_original_bytes = {}  # Original byte cache for edited mmap offsets
         self.inserted_bytes = set()
         self.modified_bytes = set()
         self.replaced_bytes = set()  # Bytes modified by replace operation (blue)
@@ -172,6 +516,12 @@ class FileTab:
         self.pattern_labels = {}  # Pattern scan labels: {offset: label}
         self.pattern_scan_results = []  # Store pattern scan results per file
         self.inspector_pointers = []  # Store inspector pointers per file
+        self.search_results = []  # Store current search results: list of (offset, length) tuples
+        self.search_result_sets = []  # Named result sets for the search results overlay
+        self.active_search_result_set = -1
+
+        self._highlight_cache = {}
+        self._highlight_cache_version = 0
 
     def get_byte(self, offset):
         """Get byte at offset, checking edits first if using mmap"""
@@ -182,10 +532,23 @@ class FileTab:
     def set_byte(self, offset, value):
         """Set byte at offset"""
         if self.use_mmap:
+            if offset not in self.mmap_original_bytes:
+                self.mmap_original_bytes[offset] = self.file_data[offset]
+            self.file_data[offset] = value
             self.edits[offset] = value
             self.modified = True
         else:
             self.file_data[offset] = value
+
+    def get_original_byte(self, offset):
+        """Return the original byte for modified-state checks without copying mmap data."""
+        if self.use_mmap:
+            if offset in self.mmap_original_bytes:
+                return self.mmap_original_bytes[offset]
+            return self.file_data[offset] if offset < len(self.file_data) else None
+        if self.original_data is not None and offset < len(self.original_data):
+            return self.original_data[offset]
+        return None
 
     def __del__(self):
         """Clean up mmap and file handle"""
@@ -207,20 +570,25 @@ class NotesWindow(QWidget):
     def setup_ui(self):
         self.setWindowTitle("Notes")
 
-        # Use size policy instead of fixed resize
-        self.setMinimumSize(600, 400)
+        self.setMinimumSize(460, 300)
+        self.resize(560, 360)
 
         layout = QVBoxLayout()
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(5)
 
         # Toolbar
         toolbar = QWidget()
         toolbar_layout = QHBoxLayout()
-        toolbar_layout.setContentsMargins(5, 5, 5, 5)
+        toolbar_layout.setContentsMargins(2, 2, 2, 2)
+        toolbar_layout.setSpacing(4)
 
         toolbar_layout.addWidget(QLabel("Size:"))
         self.font_size_spin = QSpinBox()
         self.font_size_spin.setRange(6, 72)
         self.font_size_spin.setValue(10)
+        self.font_size_spin.setMaximumWidth(46)
+        self.font_size_spin.setMaximumHeight(22)
         self.font_size_spin.valueChanged.connect(self.change_font_size)
         toolbar_layout.addWidget(self.font_size_spin)
 
@@ -247,7 +615,8 @@ class NotesWindow(QWidget):
         color_btn.clicked.connect(self.show_text_color_picker)
         toolbar_layout.addWidget(color_btn)
 
-        highlight_btn = QPushButton("Highlight")
+        highlight_btn = QPushButton("Mark")
+        highlight_btn.setToolTip("Highlight selected note text")
         highlight_btn.clicked.connect(self.show_highlight_color_picker)
         toolbar_layout.addWidget(highlight_btn)
 
@@ -283,10 +652,43 @@ class NotesWindow(QWidget):
         # Track current format for new text
         self.current_char_format = QTextCharFormat()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        dark = self.hex_editor.system_uses_dark_titlebar() if hasattr(self.hex_editor, "system_uses_dark_titlebar") else None
+        apply_native_titlebar_theme(self, dark)
+        compact_dialog_layouts(self.layout())
+
     def apply_theme(self, dark=bool):
         # Apply theme from hex editor
         if self.hex_editor:
-            self.setStyleSheet(get_theme_stylesheet(self.hex_editor.current_theme))
+            self.setStyleSheet(
+                get_theme_stylesheet(self.hex_editor.current_theme) + "\n" +
+                compact_dialog_stylesheet(self.hex_editor) + "\n" +
+                """
+                NotesWindow, QWidget {
+                    font-size: 8pt;
+                }
+                NotesWindow QPushButton {
+                    padding: 2px 6px;
+                    min-height: 18px;
+                    max-height: 22px;
+                    font-size: 8pt;
+                }
+                NotesWindow QCheckBox {
+                    spacing: 3px;
+                    font-size: 8pt;
+                }
+                NotesWindow QSpinBox {
+                    padding: 1px 2px;
+                    min-height: 18px;
+                    max-height: 22px;
+                    font-size: 8pt;
+                }
+                NotesWindow QTextEdit {
+                    font-size: 9pt;
+                }
+                """
+            )
 
     def eventFilter(self, obj, event):
         # Detect when user types space or newline to create hyperlinks
@@ -415,8 +817,9 @@ class NotesWindow(QWidget):
             self.text_edit.setCurrentCharFormat(self.current_char_format)
 
     def show_text_color_picker(self):
-        color = QColorDialog.getColor()
-        if color.isValid():
+        picker = self.hex_editor.get_theme_color_dialog(parent=self) if hasattr(self.hex_editor, "get_theme_color_dialog") else QColorDialog(parent=self)
+        if picker.exec_() == QDialog.Accepted:
+            color = picker.selectedColor()
             cursor = self.text_edit.textCursor()
             fmt = QTextCharFormat()
             fmt.setForeground(color)
@@ -429,8 +832,9 @@ class NotesWindow(QWidget):
                 self.text_edit.setCurrentCharFormat(self.current_char_format)
 
     def show_highlight_color_picker(self):
-        color = QColorDialog.getColor()
-        if color.isValid():
+        picker = self.hex_editor.get_theme_color_dialog(parent=self) if hasattr(self.hex_editor, "get_theme_color_dialog") else QColorDialog(parent=self)
+        if picker.exec_() == QDialog.Accepted:
+            color = picker.selectedColor()
             cursor = self.text_edit.textCursor()
             fmt = QTextCharFormat()
             fmt.setBackground(color)
@@ -808,6 +1212,45 @@ class SmoothScrollBar(QWidget):
                 self.update()
 
 
+class SearchResultsResizeHandle(QLabel):
+    """Small top-edge drag handle for resizing the search results overlay."""
+
+    def __init__(self, editor, parent=None):
+        super().__init__("↕", parent)
+        self.editor = editor
+        self.dragging = False
+        self.drag_start_y = 0
+        self.start_height = 0
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(Qt.SizeVerCursor)
+        self.setFixedHeight(10)
+        self.setToolTip("Drag to resize search results")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.dragging = True
+            self.drag_start_y = event.globalY()
+            self.start_height = getattr(self.editor, 'search_results_overlay_height', 200)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.dragging:
+            delta = self.drag_start_y - event.globalY()
+            self.editor.set_search_results_overlay_height(self.start_height + delta)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.dragging:
+            self.dragging = False
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+
 class HexTextEdit(QTextEdit):
     clicked = pyqtSignal(QMouseEvent)
     rightClicked = pyqtSignal(QMouseEvent)
@@ -829,19 +1272,124 @@ class HexTextEdit(QTextEdit):
         self.editor = None  # Will be set to parent HexEditorQt instance
         self.gradient_colors = None  # For gradient backgrounds
         self.background_image = None  # For image backgrounds
+        self.tint_color = "#000000"  # Tint color for image
+        self.tint_opacity = 0.0  # Tint opacity (0.0 to 1.0)
+        self.image_fit_mode = "fill"
+        self.gif_quality = "optimized"
+        self.background_movie = None
+        self._background_static_pixmap = QPixmap()
+        self._background_scaled_pixmap = QPixmap()
+        self._background_scaled_cache_key = None
+        self._background_last_frame_ms = 0
+        self.background_layer = QWidget(self)
+        self.background_layer.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.background_layer.paintEvent = self.paintEventBackgroundLayer
+        self.background_layer.lower()
+        self.grid_line_overlay = QWidget(self)
+        self.grid_line_overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.grid_line_overlay.setAttribute(Qt.WA_TranslucentBackground)
+        self.grid_line_overlay.paintEvent = self.paint_grid_line_overlay
+        self.grid_line_overlay.hide()
 
     def set_gradient_colors(self, colors):
         """Set gradient colors for the background"""
         self.gradient_colors = colors
         self.viewport().update()
 
-    def set_background_image(self, image_path):
-        """Set background image"""
+    def set_background_image(self, image_path, tint_color=None, tint_opacity=None, fit_mode="fill", gif_quality="optimized"):
+        """Set background image with optional tinting"""
+        if self.background_movie:
+            self.background_movie.stop()
+            self.background_movie = None
+        self._background_static_pixmap = QPixmap()
+        self._background_scaled_pixmap = QPixmap()
+        self._background_scaled_cache_key = None
+
         if image_path and os.path.isfile(image_path):
             self.background_image = image_path
+            if image_path.lower().endswith(".gif"):
+                self.background_movie = QMovie(image_path)
+                self.background_movie.setCacheMode(QMovie.CacheAll)
+                self.background_movie.frameChanged.connect(self._update_animated_background)
+                self.background_movie.start()
+            else:
+                self._background_static_pixmap = QPixmap(image_path)
+            if tint_color is not None:
+                self.tint_color = tint_color
+            if tint_opacity is not None:
+                self.tint_opacity = tint_opacity
+            self.image_fit_mode = fit_mode or "fill"
+            self.gif_quality = (gif_quality or "optimized").lower()
         else:
             self.background_image = None
+        self.update_background_layer()
         self.viewport().update()
+
+    def _update_animated_background(self, _frame):
+        quality_delay = {"optimized": 66, "smooth": 33, "full": 0}.get(self.gif_quality, 66)
+        if quality_delay:
+            now = QDateTime.currentMSecsSinceEpoch()
+            if now - self._background_last_frame_ms < quality_delay:
+                return
+            self._background_last_frame_ms = now
+        self._background_scaled_cache_key = None
+        self.background_layer.update()
+        self.viewport().update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_background_layer()
+        self.grid_line_overlay.hide()
+
+    def update_background_layer(self):
+        if self.background_image:
+            self.background_layer.setGeometry(self.rect())
+            self.background_layer.show()
+            self.background_layer.lower()
+            self.background_layer.update()
+        else:
+            self.background_layer.hide()
+        self.grid_line_overlay.hide()
+        if self.editor and hasattr(self.editor, 'pane_separator_overlay'):
+            self.editor.pane_separator_overlay.refresh()
+
+    def paint_grid_line_overlay(self, event):
+        return
+
+    def paint_background_image(self, painter, target_rect, target_size):
+        if not self.background_image or not os.path.isfile(self.background_image):
+            self.background_image = None
+            return
+
+        pixmap = self.background_movie.currentPixmap() if self.background_movie else self._background_static_pixmap
+        if pixmap.isNull():
+            self.background_image = None
+            return
+
+        fit_mode = (self.image_fit_mode or "fill").lower()
+        if fit_mode == "stretch":
+            painter.drawPixmap(target_rect, pixmap)
+        else:
+            aspect_mode = Qt.KeepAspectRatio if fit_mode == "fit" else Qt.KeepAspectRatioByExpanding
+            frame = self.background_movie.currentFrameNumber() if self.background_movie else -1
+            cache_key = (frame, target_size.width(), target_size.height(), fit_mode, pixmap.cacheKey())
+            if cache_key != self._background_scaled_cache_key or self._background_scaled_pixmap.isNull():
+                self._background_scaled_pixmap = pixmap.scaled(target_size, aspect_mode, Qt.SmoothTransformation)
+                self._background_scaled_cache_key = cache_key
+            scaled_pixmap = self._background_scaled_pixmap
+            x = target_rect.x() + (target_rect.width() - scaled_pixmap.width()) // 2
+            y = target_rect.y() + (target_rect.height() - scaled_pixmap.height()) // 2
+            painter.drawPixmap(x, y, scaled_pixmap)
+
+        if self.tint_opacity > 0:
+            tint_qcolor = QColor(self.tint_color)
+            tint_qcolor.setAlphaF(self.tint_opacity)
+            painter.fillRect(target_rect, tint_qcolor)
+
+    def paintEventBackgroundLayer(self, event):
+        painter = QPainter(self.background_layer)
+        self.paint_background_image(painter, self.background_layer.rect(), self.background_layer.size())
+        painter.end()
 
     def paintEvent(self, event):
         """Custom paint event to handle gradient/image backgrounds"""
@@ -859,26 +1407,7 @@ class HexTextEdit(QTextEdit):
                 painter.fillRect(self.viewport().rect(), gradient)
 
             elif self.background_image:
-                # Load and draw background image
-                try:
-                    if os.path.isfile(self.background_image):
-                        pixmap = QPixmap(self.background_image)
-                        if not pixmap.isNull():
-                            scaled_pixmap = pixmap.scaled(
-                                self.viewport().size(),
-                                Qt.KeepAspectRatioByExpanding,
-                                Qt.SmoothTransformation
-                            )
-                            painter.drawPixmap(self.viewport().rect(), scaled_pixmap)
-                        else:
-                            # Image failed to load, clear the background image
-                            self.background_image = None
-                    else:
-                        # File no longer exists, clear the background image
-                        self.background_image = None
-                except Exception:
-                    # Any error loading the image, clear it to prevent future crashes
-                    self.background_image = None
+                self.paint_background_image(painter, self.viewport().rect(), self.viewport().size())
 
             painter.end()
 
@@ -886,29 +1415,44 @@ class HexTextEdit(QTextEdit):
         super().paintEvent(event)
 
     def wheelEvent(self, event):
-        """Handle mouse wheel events to scroll by 4 rows at a time"""
+        """Handle mouse wheel events through the editor's virtual row scroller."""
         if self.editor is None:
             event.ignore()
             return
 
-        # Get scroll direction from wheel delta
         delta = event.angleDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
 
-        # Scroll by 4 rows
-        rows_to_scroll = 4 if delta < 0 else -4
+        # Standard wheels report 120 units per notch. Trackpads can report
+        # smaller deltas, so keep at least one row of motion.
+        notches = delta / 120
+        rows_to_scroll = int(round(-notches * 3))
+        if rows_to_scroll == 0:
+            rows_to_scroll = -1 if delta > 0 else 1
         self.editor.scroll_by_rows(rows_to_scroll)
         event.accept()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.clicked.emit(event)
+            event.accept()
+            return
         elif event.button() == Qt.RightButton:
             self.rightClicked.emit(event)
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         self.hovered.emit(event)
+        event.accept()
+        return
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        event.accept()
 
 
 class SmartPasteDialog(QDialog):
@@ -923,7 +1467,7 @@ class SmartPasteDialog(QDialog):
         self.padding_value = bytes([0x00])  # Default padding
 
         self.setWindowTitle("Smart Paste")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(350)
 
         # Apply parent's theme stylesheet if available - use Light or Dark based on brightness
         if parent and hasattr(parent, 'current_theme'):
@@ -1379,13 +1923,6 @@ class SegmentOverlay(QWidget):
             extra_spacing = -4.0
             x = round(base_x + extra_spacing)
 
-            # Debug output
-            if segment == 1:  # Only print for first line to avoid spam
-                print(f"Segment line debug: segment_size={self.segment_size}, segment={segment}, byte_pos={byte_pos}")
-                print(f"  char_width={self.char_width}, leading_spaces={self.leading_spaces}")
-                print(f"  base_x={base_x}, extra_spacing={extra_spacing}, final_x={x}")
-                print(f"  overlay width={self.width()}, spacing_multiplier={self.spacing_multiplier}")
-
             # Draw line from top to bottom
             painter.drawLine(x, 0, x, self.height())
 
@@ -1510,24 +2047,214 @@ class BoundaryOverlay(QWidget):
             painter.drawLine(x, 0, x, self.height())
 
 
+class HighlightUnderlineOverlay(QWidget):
+    """Draw thicker, lower underlines for user byte highlights."""
+    def __init__(self, editor, parent=None):
+        super().__init__(parent)
+        self.editor = editor
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setStyleSheet("background: transparent;")
+
+    def paintEvent(self, event):
+        if self.editor.current_tab_index < 0:
+            return
+
+        current_file = self.editor.open_files[self.editor.current_tab_index]
+        if not current_file.byte_highlights:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        font_metrics = self.editor.hex_display.fontMetrics()
+        char_width = font_metrics.horizontalAdvance('0')
+        line_height = font_metrics.height()
+        scroll_value = self.editor.hex_display.verticalScrollBar().value()
+        bytes_per_row = self.editor.bytes_per_row
+        max_byte = min(self.editor.rendered_end_byte, len(current_file.file_data))
+
+        for byte_index in range(self.editor.rendered_start_byte, max_byte):
+            highlight_info = current_file.byte_highlights.get(byte_index)
+            if not highlight_info:
+                continue
+            if not highlight_info.get("underline", False):
+                continue
+
+            row = (byte_index - self.editor.rendered_start_byte) // bytes_per_row
+            col = byte_index % bytes_per_row
+            row_top = 2 + row * line_height - scroll_value
+            if row_top > self.height() or row_top + line_height < 0:
+                continue
+
+            color = QColor(highlight_info.get("color", "#ff4444"))
+            color.setAlpha(80)
+            pen = QPen(color, 2, Qt.SolidLine, Qt.RoundCap)
+            painter.setPen(pen)
+
+            x = 4 + (2 + col * 3) * char_width
+            y = int(row_top + line_height - 1)
+            painter.drawLine(int(x), y, int(x + (2 * char_width)), y)
+
+
+class PaneSeparatorOverlay(QWidget):
+    """Draw one shared separator layer over image-backed editor panes."""
+    def __init__(self, editor, parent=None):
+        super().__init__(parent)
+        self.editor = editor
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setStyleSheet("background: transparent;")
+
+    def refresh(self):
+        if hasattr(self.editor, 'hex_ascii_container'):
+            self.setGeometry(self.editor.hex_ascii_container.rect())
+        self.show()
+        self.raise_()
+        self.update()
+
+    def has_media_background(self):
+        widgets = [
+            getattr(self.editor, 'offset_display', None),
+            getattr(self.editor, 'hex_display', None),
+            getattr(self.editor, 'ascii_display', None),
+            getattr(self.editor, 'central_widget', None),
+        ]
+        for widget in widgets:
+            if not widget:
+                continue
+            if getattr(widget, 'background_image', None):
+                return True
+        return False
+
+    def paintEvent(self, event):
+        if not self.has_media_background():
+            return
+
+        theme_colors = get_theme_colors(self.editor.current_theme)
+        color = QColor(theme_colors.get('grid_line', theme_colors.get('border', '#444444')))
+        color.setAlpha(255)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setPen(QPen(color, 2, Qt.SolidLine))
+
+        y1 = 0
+        y2 = max(0, self.height() - 1)
+        positions = []
+        offset_display = getattr(self.editor, 'offset_display', None)
+        ascii_display = getattr(self.editor, 'ascii_display', None)
+        if offset_display:
+            positions.append(offset_display.geometry().right())
+        if ascii_display:
+            positions.append(ascii_display.geometry().left())
+            positions.append(ascii_display.geometry().right())
+
+        for position in positions:
+            x = min(max(position, 0), max(0, self.width() - 1))
+            painter.drawLine(x, y1, x, y2)
+
+        painter.end()
+
+
+class CompareSeparatorOverlay(QWidget):
+    """Draw compare-view separators over the monospaced compare text."""
+    def __init__(self, display, grid_color, parent=None):
+        super().__init__(parent or display.viewport())
+        self.display = display
+        self.grid_color = QColor(grid_color)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setStyleSheet("background: transparent;")
+        self.offset_x = 0
+        self.decoded_x = 0
+
+    def set_positions(self, offset_x, decoded_x):
+        self.offset_x = int(offset_x)
+        self.decoded_x = int(decoded_x)
+        self.refresh()
+
+    def refresh(self):
+        self.setGeometry(self.display.viewport().rect())
+        self.show()
+        self.raise_()
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        color = QColor(self.grid_color)
+        color.setAlpha(255)
+        painter.setPen(QPen(color, 2, Qt.SolidLine))
+
+        right_x = max(0, self.width() - 1)
+        bottom_y = max(0, self.height() - 1)
+
+        for x in (self.offset_x, self.decoded_x):
+            x = min(max(0, x), right_x)
+            painter.drawLine(x, 0, x, bottom_y)
+        painter.end()
+
+
 class GradientWidget(QWidget):
     """Custom widget that supports gradient backgrounds"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.gradient_colors = None
         self.background_image = None
+        self.background_tint_color = None
+        self.background_tint_opacity = 0.0
+        self.background_fit_mode = "fill"
+        self.gif_quality = "optimized"
+        self.background_movie = None
+        self._background_static_pixmap = QPixmap()
+        self._background_scaled_pixmap = QPixmap()
+        self._background_scaled_cache_key = None
+        self._background_last_frame_ms = 0
 
     def set_gradient_colors(self, colors):
         """Set gradient colors for the background"""
         self.gradient_colors = colors
         self.update()
 
-    def set_background_image(self, image_path):
+    def set_background_image(self, image_path, tint_color=None, tint_opacity=0.0, fit_mode="fill", gif_quality="optimized"):
         """Set background image"""
+        if self.background_movie:
+            self.background_movie.stop()
+            self.background_movie = None
+        self._background_static_pixmap = QPixmap()
+        self._background_scaled_pixmap = QPixmap()
+        self._background_scaled_cache_key = None
+
         if image_path and os.path.isfile(image_path):
             self.background_image = image_path
+            if image_path.lower().endswith(".gif"):
+                self.background_movie = QMovie(image_path)
+                self.background_movie.setCacheMode(QMovie.CacheAll)
+                self.background_movie.frameChanged.connect(self._update_animated_background)
+                self.background_movie.start()
+            else:
+                self._background_static_pixmap = QPixmap(image_path)
+            self.background_tint_color = tint_color
+            self.background_tint_opacity = tint_opacity or 0.0
+            self.background_fit_mode = fit_mode or "fill"
+            self.gif_quality = (gif_quality or "optimized").lower()
         else:
             self.background_image = None
+            self.background_tint_color = None
+            self.background_tint_opacity = 0.0
+            self.background_fit_mode = "fill"
+            self.gif_quality = "optimized"
+        self.update()
+
+    def _update_animated_background(self, _frame):
+        quality_delay = {"optimized": 66, "smooth": 33, "full": 0}.get(self.gif_quality, 66)
+        if quality_delay:
+            now = QDateTime.currentMSecsSinceEpoch()
+            if now - self._background_last_frame_ms < quality_delay:
+                return
+            self._background_last_frame_ms = now
+        self._background_scaled_cache_key = None
         self.update()
 
     def paintEvent(self, event):
@@ -1551,14 +2278,26 @@ class GradientWidget(QWidget):
                 # Load and draw background image
                 try:
                     if os.path.isfile(self.background_image):
-                        pixmap = QPixmap(self.background_image)
+                        pixmap = self.background_movie.currentPixmap() if self.background_movie else self._background_static_pixmap
                         if not pixmap.isNull():
-                            scaled_pixmap = pixmap.scaled(
-                                self.size(),
-                                Qt.KeepAspectRatioByExpanding,
-                                Qt.SmoothTransformation
-                            )
-                            painter.drawPixmap(self.rect(), scaled_pixmap)
+                            fit_mode = (self.background_fit_mode or "fill").lower()
+                            if fit_mode == "stretch":
+                                painter.drawPixmap(self.rect(), pixmap)
+                            else:
+                                aspect_mode = Qt.KeepAspectRatio if fit_mode == "fit" else Qt.KeepAspectRatioByExpanding
+                                frame = self.background_movie.currentFrameNumber() if self.background_movie else -1
+                                cache_key = (frame, self.width(), self.height(), fit_mode, pixmap.cacheKey())
+                                if cache_key != self._background_scaled_cache_key or self._background_scaled_pixmap.isNull():
+                                    self._background_scaled_pixmap = pixmap.scaled(self.size(), aspect_mode, Qt.SmoothTransformation)
+                                    self._background_scaled_cache_key = cache_key
+                                scaled_pixmap = self._background_scaled_pixmap
+                                x = (self.width() - scaled_pixmap.width()) // 2
+                                y = (self.height() - scaled_pixmap.height()) // 2
+                                painter.drawPixmap(x, y, scaled_pixmap)
+                            if self.background_tint_color and self.background_tint_opacity > 0:
+                                tint = QColor(self.background_tint_color)
+                                tint.setAlphaF(min(1.0, max(0.0, self.background_tint_opacity)))
+                                painter.fillRect(self.rect(), tint)
                         else:
                             self.background_image = None
                     else:
@@ -1736,6 +2475,7 @@ class HexEditorQt(QMainWindow):
         self.cursor_nibble = 0
         self.selection_start = None
         self.selection_end = None
+        self._last_drag_selection_byte = None
         self.column_selection_mode = False  # Track if we're in column selection mode
         self.column_sel_start_row = None  # Starting row for column selection
         self.column_sel_start_col = None  # Starting column for column selection
@@ -1744,6 +2484,7 @@ class HexEditorQt(QMainWindow):
         self.clipboard = None
         self.clipboard_grid_rows = None  # Number of rows if clipboard data is from column selection
         self.clipboard_grid_cols = None  # Number of columns if clipboard data is from column selection
+        self.last_clicked_display = 'hex'  # Track which display was last clicked: 'hex' or 'ascii'
         self.endian_mode = 'little'
         self.integral_basis = 'dec'  # 'hex', 'dec', or 'oct'
         self.undo_stack = []
@@ -1766,18 +2507,22 @@ class HexEditorQt(QMainWindow):
         self.ignore_file_size_warnings = False  # Flag to suppress file size change warnings
         self.pattern_result_to_update = None  # Track pattern result for color box update
         self.hidden_delimiters = {}  # Dict of byte values to padding: {byte_value: padding}
+        self.action_script_manager = ActionScriptManager(self)
+        self.scripts_menu = None
+        self.control_shortcut_overrides = self.load_control_shortcuts()
+        self.control_actions = []
 
-        # Chunked rendering for large files
-        self.max_initial_rows = 200  # Only render 200 rows initially
+        # Buffered rendering for large files. This keeps a generous offscreen row
+        # window so most scrolling only moves the viewport instead of rebuilding text.
+        self.max_initial_rows = 320
+        self.render_recenter_margin = 80
         self.rendered_start_byte = 0  # Track what's currently rendered
         self.rendered_end_byte = 0
         self.current_top_row = 0  # Track the logical top row being viewed
-
-        # Scroll debounce timer to prevent lag during scrolling
-        self.scroll_timer = QTimer(self)
-        self.scroll_timer.setSingleShot(True)
-        self.scroll_timer.timeout.connect(self.on_scroll_stopped)
-        self.pending_scroll_position = None
+        self._ascii_chars = tuple(
+            chr(i) if (32 <= i <= 126) or (160 <= i <= 255) else '.'
+            for i in range(256)
+        )
 
         # Flag to prevent feedback loop during nav scrollbar dragging
         self.in_nav_scroll = False
@@ -1785,6 +2530,12 @@ class HexEditorQt(QMainWindow):
         # Signature pointer overlays
         self.signature_overlays = []  # List of QLabel widgets for signature value overlays
         self.screen_change_connected = False  # Track if we've connected the screen change signal
+        self._last_screen = None
+        self._pending_screen = None
+        self._applying_screen_change = False
+        self.screen_change_timer = QTimer(self)
+        self.screen_change_timer.setSingleShot(True)
+        self.screen_change_timer.timeout.connect(self.apply_pending_screen_change)
 
         # Extended ASCII display option (128-255)
         self.show_extended_ascii = True  # Always show extended ASCII (128-255)
@@ -1811,6 +2562,228 @@ class HexEditorQt(QMainWindow):
 
         self.setup_ui()
         self.apply_theme()
+        self.apply_system_titlebar_theme()
+
+    def load_control_shortcuts(self):
+        try:
+            if os.path.exists(CONTROL_SHORTCUTS_PATH):
+                with open(CONTROL_SHORTCUTS_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return {str(k): normalize_hotkey(v) for k, v in data.items()}
+        except Exception:
+            pass
+        return {}
+
+    def save_control_shortcuts(self):
+        try:
+            with open(CONTROL_SHORTCUTS_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.control_shortcut_overrides, f, indent=2)
+        except Exception as e:
+            QMessageBox.warning(self, "Controls", f"Failed to save controls: {e}")
+
+    def register_control_action(self, key, name, action, default_hotkey=""):
+        hotkey = self.control_shortcut_overrides.get(key, normalize_hotkey(default_hotkey))
+        action.setShortcut(hotkey)
+        self.control_actions.append({
+            "key": key,
+            "name": name,
+            "action": action,
+            "default": normalize_hotkey(default_hotkey),
+        })
+        return action
+
+    def find_hotkey_conflict(self, hotkey, ignore_script_name=None, ignore_control_key=None, ignore_script_index=None):
+        hotkey = normalize_hotkey(hotkey)
+        if not hotkey:
+            return ""
+        for entry in getattr(self, "control_actions", []):
+            if entry.get("key") == ignore_control_key:
+                continue
+            action_hotkey = normalize_hotkey(entry["action"].shortcut().toString(QKeySequence.NativeText))
+            if action_hotkey == hotkey:
+                return f"{entry['name']} ({hotkey})"
+        for index, script in enumerate(self.action_script_manager.scripts):
+            if ignore_script_index is not None and index == ignore_script_index:
+                continue
+            if ignore_script_index is None and ignore_script_name and script.get("name", "Unnamed Script") == ignore_script_name:
+                continue
+            if normalize_hotkey(script.get("hotkey", "")) == hotkey:
+                return f"Action Script: {script.get('name', 'Unnamed Script')} ({hotkey})"
+        return ""
+
+    def show_controls_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Controls")
+        dialog.resize(640, 430)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+        theme = get_theme_colors(self.current_theme)
+        surfaces = get_theme_surface_colors(theme)
+        surface_bg = surfaces["surface"]
+        control_bg = surfaces["control"]
+        control_fg = surfaces["control_text"]
+
+        table = QTableWidget()
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["Type", "Control", "Hotkey", "Default"])
+        table.horizontalHeader().setFixedHeight(22)
+        table.horizontalHeader().setStretchLastSection(False)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setAlternatingRowColors(False)
+        table.setFont(QFont("Arial", 8))
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setShowGrid(False)
+        table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {control_bg};
+                color: {control_fg};
+                gridline-color: {theme.get('border', '#555555')};
+                selection-background-color: {theme.get('selection_bg', theme.get('button_bg', '#990000'))};
+                selection-color: {theme.get('selection_fg', theme.get('foreground', '#ffffff'))};
+                alternate-background-color: {control_bg};
+                font-size: 8pt;
+            }}
+            QTableWidget::item {{
+                padding: 0px 3px;
+                min-height: 18px;
+            }}
+            QHeaderView::section {{
+                background-color: {surface_bg};
+                color: {theme.get('foreground', '#ffffff')};
+                border: 1px solid {theme.get('border', '#555555')};
+                padding: 2px 4px;
+                font-size: 8pt;
+            }}
+        """)
+        rows = []
+
+        def add_separator(label):
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setRowHeight(row, 20)
+            item = QTableWidgetItem(label)
+            item.setFlags(Qt.NoItemFlags)
+            table.setSpan(row, 0, 1, 4)
+            table.setItem(row, 0, item)
+            sep = QWidget()
+            sep.setStyleSheet(f"background-color: {control_bg};")
+            sep_layout = QHBoxLayout(sep)
+            sep_layout.setContentsMargins(4, 2, 4, 2)
+            sep_layout.setSpacing(6)
+            for before_text in (True, False):
+                line = QFrame()
+                line.setFrameShape(QFrame.HLine)
+                line.setFrameShadow(QFrame.Plain)
+                line.setStyleSheet(f"color: {theme.get('border', '#555555')}; background: transparent;")
+                sep_layout.addWidget(line, 1)
+                if before_text:
+                    label_widget = QLabel(label)
+                    label_widget.setAlignment(Qt.AlignCenter)
+                    label_widget.setFont(QFont("Arial", 8, QFont.Bold))
+                    label_widget.setStyleSheet(
+                        f"color: {theme.get('foreground', '#ffffff')}; background: transparent; padding: 0px 4px;"
+                    )
+                    sep_layout.addWidget(label_widget)
+            table.setCellWidget(row, 0, sep)
+
+        def add_row(row_type, name, hotkey, default_hotkey, payload):
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setRowHeight(row, 22)
+            table.setItem(row, 0, QTableWidgetItem(row_type))
+            table.setItem(row, 1, QTableWidgetItem(name))
+            edit = HotkeyCaptureEdit(hotkey)
+            edit.setMinimumWidth(130)
+            edit.setMaximumHeight(20)
+            table.setCellWidget(row, 2, edit)
+            table.setItem(row, 3, QTableWidgetItem(default_hotkey))
+            rows.append({"type": row_type, "name": name, "edit": edit, "default": default_hotkey, "payload": payload})
+
+        for entry in self.control_actions:
+            current = normalize_hotkey(entry["action"].shortcut().toString(QKeySequence.NativeText))
+            add_row("Built-in", entry["name"], current, entry["default"], ("control", entry))
+
+        if self.action_script_manager.scripts:
+            add_separator("Action Scripts")
+            for index, script in enumerate(self.action_script_manager.scripts):
+                add_row("Script", script.get("name", "Unnamed Script"), script.get("hotkey", ""), "", ("script", index))
+
+        layout.addWidget(table, 1)
+
+        tool_row = QHBoxLayout()
+        tool_row.setSpacing(4)
+        reset_btn = QPushButton("Reset Selected")
+        reset_all_btn = QPushButton("Reset All")
+        clear_btn = QPushButton("Clear Selected")
+        tool_row.addWidget(reset_btn)
+        tool_row.addWidget(reset_all_btn)
+        tool_row.addWidget(clear_btn)
+        tool_row.addStretch()
+        layout.addLayout(tool_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def selected_rows():
+            return sorted({index.row() for index in table.selectionModel().selectedRows()})
+
+        def reset_selected():
+            for row in selected_rows():
+                rows[row]["edit"].setText(rows[row]["default"])
+
+        def reset_all():
+            for row in rows:
+                row["edit"].setText(row["default"])
+
+        def clear_selected():
+            for row in selected_rows():
+                rows[row]["edit"].clear()
+
+        def save_controls():
+            seen = {}
+            for row in rows:
+                hotkey = normalize_hotkey(row["edit"].text())
+                if not hotkey:
+                    continue
+                if hotkey in seen:
+                    QMessageBox.warning(dialog, "Hotkey Conflict", f"{row['name']} conflicts with {seen[hotkey]} ({hotkey}).")
+                    row["edit"].clear()
+                    return
+                seen[hotkey] = row["name"]
+
+            self.control_shortcut_overrides = {}
+            for row in rows:
+                hotkey = normalize_hotkey(row["edit"].text())
+                payload_type, payload = row["payload"]
+                if payload_type == "control":
+                    entry = payload
+                    entry["action"].setShortcut(hotkey)
+                    if hotkey != entry["default"]:
+                        self.control_shortcut_overrides[entry["key"]] = hotkey
+                else:
+                    index = payload
+                    if 0 <= index < len(self.action_script_manager.scripts):
+                        self.action_script_manager.scripts[index]["hotkey"] = hotkey
+
+            self.save_control_shortcuts()
+            self.action_script_manager.save()
+            self.action_script_manager.install_shortcuts()
+            self.rebuild_scripts_menu()
+            dialog.accept()
+
+        reset_btn.clicked.connect(reset_selected)
+        reset_all_btn.clicked.connect(reset_all)
+        clear_btn.clicked.connect(clear_selected)
+        buttons.accepted.connect(save_controls)
+        buttons.rejected.connect(dialog.reject)
+        dialog.exec_()
 
     def is_high_res_screen(self):
         """Check if the current screen is 1440p or higher."""
@@ -1824,10 +2797,10 @@ class HexEditorQt(QMainWindow):
         print("Monitor Detection - No screen detected, defaulting to low-res")
         return False  # Default to low res if no screen detected
 
-    def get_hex_column_width(self):
+    def get_hex_column_width(self, screen=None):
         """Calculate appropriate hex column width based on screen resolution."""
         # ONLY use the screen that THIS window is currently on
-        screen = self.screen()
+        screen = screen or self.screen()
         if screen:
             screen_geometry = screen.availableGeometry()
             screen_height = screen_geometry.height()
@@ -1851,13 +2824,86 @@ class HexEditorQt(QMainWindow):
                 return width
         print("No screen detected, using default 615px width")
         return 615  # Default fallback
+    
+    def get_ascii_column_width(self, screen=None):
+        """Calculate appropriate ASCII column width based on screen resolution."""
+        screen = screen or self.screen()
+        if screen:
+            screen_geometry = screen.availableGeometry()
+            screen_height = screen_geometry.height()
+
+            # Scale ASCII column width proportionally with screen resolution
+            # 1080p = 160px, 1440p+ = 210px
+            if screen_height >= 1400:
+                print("Using 210px ASCII width for 1440p+")
+                return 210
+            elif screen_height <= 1100:
+                print("Using 160px ASCII width for 1080p")
+                return 160
+            else:
+                # Linear interpolation between 1100 and 1400
+                ratio = (screen_height - 1100) / (1400 - 1100)
+                width = int(160 + (50 * ratio))
+                print(f"Using {width}px ASCII width for intermediate resolution")
+                return width
+        print("No screen detected, using default 210px ASCII width")
+        return 210  # Default fallback
+
+    def get_inspector_width(self, screen=None):
+        """Calculate appropriate inspector panel width based on screen resolution."""
+        screen = screen or self.screen()
+        if screen:
+            screen_geometry = screen.availableGeometry()
+            screen_height = screen_geometry.height()
+
+            # Scale inspector width with screen resolution
+            # 1080p = 310px (smaller), 1440p+ = 390px (standard)
+            if screen_height >= 1400:
+                print("Using 390px inspector width for 1440p+")
+                return 390
+            elif screen_height <= 1100:
+                print("Using 310px inspector width for 1080p")
+                return 310
+            else:
+                # Linear interpolation between 1100 and 1400
+                ratio = (screen_height - 1100) / (1400 - 1100)
+                width = int(310 + (80 * ratio))
+                print(f"Using {width}px inspector width for intermediate resolution")
+                return width
+        print("No screen detected, using default 390px inspector width")
+        return 390  # Default fallback
 
     def on_screen_changed(self, screen):
         """Handle window moving to a different screen."""
+        self._pending_screen = screen or self.screen()
+        self.screen_change_timer.start(220)
+
+    def apply_pending_screen_change(self):
+        """Apply monitor-dependent sizing once the screen move has settled."""
+        if self._applying_screen_change:
+            return
+
+        screen = self._pending_screen or self.screen()
+        if screen is None:
+            return
+
+        self._applying_screen_change = True
+        try:
+            self.apply_screen_layout(screen)
+            self._pending_screen = None
+        finally:
+            self._applying_screen_change = False
+
+    def apply_screen_layout(self, screen):
+        """Recalculate monitor-dependent widths, overlays, and window size."""
         print(f"Screen changed to: {screen.name() if screen else 'None'}")
 
         # Recalculate hex column width for the new screen
-        new_width = self.get_hex_column_width()
+        new_width = self.get_hex_column_width(screen)
+        # Recalculate ASCII column width for the new screen
+        new_ascii_width = self.get_ascii_column_width(screen)
+        # Recalculate inspector width for the new screen
+        new_inspector_width = self.get_inspector_width(screen)
 
         # Calculate spacing multiplier based on screen resolution
         spacing_mult = 1.0
@@ -1876,7 +2922,6 @@ class HexEditorQt(QMainWindow):
             self.segment_overlay.set_char_width(char_width)
             self.segment_overlay.set_spacing_multiplier(spacing_mult)
             self.segment_overlay.update()
-            print(f"Updated segment_overlay: char_width={char_width}, spacing_mult={spacing_mult}")
 
         if hasattr(self, 'header_segment_overlay') and hasattr(self, 'hex_header'):
             header_font_metrics = QFontMetrics(self.hex_header.font())
@@ -1884,7 +2929,6 @@ class HexEditorQt(QMainWindow):
             self.header_segment_overlay.set_char_width(header_char_width)
             self.header_segment_overlay.set_spacing_multiplier(spacing_mult)
             self.header_segment_overlay.update()
-            print(f"Updated header_segment_overlay: char_width={header_char_width}, spacing_mult={spacing_mult}")
 
         # Update boundary overlay with current display parameters
         if hasattr(self, 'boundary_overlay') and hasattr(self, 'hex_display'):
@@ -1908,6 +2952,28 @@ class HexEditorQt(QMainWindow):
             self.hex_display.setMinimumWidth(self.hex_column_width)
             self.hex_display.setMaximumWidth(self.hex_column_width)
 
+        # Update ASCII column width if changed
+        if new_ascii_width != self.ascii_column_width:
+            self.ascii_column_width = new_ascii_width
+            print(f"Updating ASCII column width to: {new_ascii_width}px")
+
+            # Update the ASCII header and display widths
+            self.ascii_header.setMinimumWidth(self.ascii_column_width)
+            self.ascii_header.setMaximumWidth(self.ascii_column_width)
+            self.ascii_display.setMinimumWidth(self.ascii_column_width)
+            self.ascii_display.setMaximumWidth(self.ascii_column_width)
+
+        # Update inspector width if changed
+        if new_inspector_width != self.inspector_width:
+            self.inspector_width = new_inspector_width
+            print(f"Updating inspector width to: {new_inspector_width}px")
+
+            # Update the inspector widget width
+            if hasattr(self, 'inspector_widget'):
+                self.inspector_widget.setMinimumWidth(self.inspector_width)
+                # Reposition inspector overlay to account for new width
+                self.position_inspector_overlay()
+
             # Update overlay geometries
             if hasattr(self, 'segment_overlay'):
                 self.segment_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
@@ -1917,6 +2983,8 @@ class HexEditorQt(QMainWindow):
                 self.edit_box_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
             if hasattr(self, 'boundary_overlay'):
                 self.boundary_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
+            if hasattr(self, 'highlight_underline_overlay'):
+                self.highlight_underline_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
 
             # Update search results overlay if it exists
             if hasattr(self, 'results_overlay') and self.results_overlay is not None:
@@ -1927,20 +2995,12 @@ class HexEditorQt(QMainWindow):
                 overlay_width = self.hex_ascii_container.width() - x_start
                 self.results_overlay.setGeometry(x_start, y_position, overlay_width, overlay_height)
 
-        # Recalculate window width for the new screen
+        # Update window size for the new screen (handles both width and height)
         if screen and not self.isMaximized():
-            screen_geometry = screen.availableGeometry()
-            screen_height = screen_geometry.height()
+            self.update_window_size_for_screen(screen)
 
-            # Default is 1200, increase by 400 for 1440p+
-            new_window_width = 1200
-            if screen_height >= 1400:
-                new_window_width = 1600
-
-            # Only resize if width changed
-            if self.width() != new_window_width:
-                print(f"Updating window width to: {new_window_width}px")
-                self.resize(new_window_width, self.height())
+        if self.current_tab_index >= 0:
+            self.display_hex(preserve_scroll=True)
 
     def build_hex_header(self):
         """Build hex header string"""
@@ -1961,9 +3021,15 @@ class HexEditorQt(QMainWindow):
 
     def setup_ui(self):
         self.setWindowTitle("RxD Hex Editor")
+        if os.path.exists(APP_ICON_PATH):
+            self.setWindowIcon(QIcon(APP_ICON_PATH))
 
         # Calculate hex column width based on screen resolution
         self.hex_column_width = self.get_hex_column_width()
+        # Calculate ASCII column width based on screen resolution
+        self.ascii_column_width = self.get_ascii_column_width()
+        # Calculate inspector width based on screen resolution
+        self.inspector_width = self.get_inspector_width()
 
         # Set default size but allow resizing
         # Detect screen resolution and adjust width based on monitor
@@ -2017,6 +3083,24 @@ class HexEditorQt(QMainWindow):
         # Remove any spacing/margins from tab widget
         self.tab_widget.setContentsMargins(0, 0, 0, 0)
 
+        self.directory_bar = QWidget()
+        directory_layout = QHBoxLayout()
+        directory_layout.setContentsMargins(4, 2, 4, 2)
+        directory_layout.setSpacing(4)
+        self.directory_combo = QComboBox()
+        self.directory_combo.setObjectName("directory_combo")
+        self.directory_combo.setMinimumWidth(220)
+        self.directory_combo.setMaximumWidth(520)
+        self.directory_combo.setMaximumHeight(28)
+        self.directory_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.directory_combo.activated.connect(self.open_directory_combo_item)
+        directory_layout.addWidget(self.directory_combo)
+        directory_layout.addStretch()
+        self.directory_bar.setLayout(directory_layout)
+        self.directory_bar.hide()
+        self.apply_directory_bar_theme()
+        main_layout.addWidget(self.directory_bar, stretch=0)
+
         main_layout.addWidget(self.tab_widget, stretch=0)
 
         # Main content splitter
@@ -2047,8 +3131,8 @@ class HexEditorQt(QMainWindow):
         # Offset header (clickable to cycle modes)
         self.offset_header = QLabel("Offset (h)")
         self.offset_header.setFont(QFont("Courier", 9, QFont.Bold))
-        self.offset_header.setMinimumWidth(130)
-        self.offset_header.setMaximumWidth(130)
+        self.offset_header.setMinimumWidth(145)  # Match offset_display width
+        self.offset_header.setMaximumWidth(145)
         self.offset_header.setAlignment(Qt.AlignCenter)
         self.offset_header.setStyleSheet(f"border-right: 2px solid {grid_line_color}; border-bottom: 1px solid {grid_line_color}; cursor: pointer; padding: 4px 2px; margin: 0px;")
         self.offset_header.mousePressEvent = self.cycle_offset_mode
@@ -2095,10 +3179,10 @@ class HexEditorQt(QMainWindow):
         # ASCII header fixed next to hex
         self.ascii_header = QLabel("Decoded Text")
         self.ascii_header.setFont(QFont("Courier", 9))
-        self.ascii_header.setMinimumWidth(250)
-        self.ascii_header.setMaximumWidth(250)
+        self.ascii_header.setMinimumWidth(self.ascii_column_width)
+        self.ascii_header.setMaximumWidth(self.ascii_column_width)
         self.ascii_header.setAlignment(Qt.AlignLeft)
-        self.ascii_header.setStyleSheet(f"border-left: 2px solid {grid_line_color}; border-right: 1px solid {grid_line_color}; border-bottom: 1px solid {grid_line_color}; padding: 4px 0px 4px 4px; margin: 0px;")
+        self.ascii_header.setStyleSheet(f"border-left: 2px solid {grid_line_color}; border-right: 2px solid {grid_line_color}; border-bottom: 1px solid {grid_line_color}; padding: 4px 0px 4px 4px; margin: 0px;")
         self.ascii_header.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.ascii_header.setContentsMargins(2, 0, 2, 0)
         hex_ascii_header_combined_layout.addWidget(self.ascii_header)
@@ -2117,10 +3201,10 @@ class HexEditorQt(QMainWindow):
         hex_layout.setContentsMargins(0, 0, 0, 0)
         hex_layout.setSpacing(0)
 
-        # Offset column
+        # Offset column - increased width for better spacing on all resolutions
         self.offset_display = HexTextEdit()
         self.offset_display.editor = self  # Set reference to parent editor
-        self.offset_display.setFixedWidth(130)  # Match header width exactly
+        self.offset_display.setFixedWidth(145)  # Increased from 130 for better spacing
         self.offset_display.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.offset_display.setStyleSheet(f"border-right: 2px solid {grid_line_color}; padding: 2px;")
         self.offset_display.setAlignment(Qt.AlignCenter)
@@ -2142,7 +3226,6 @@ class HexEditorQt(QMainWindow):
         self.hex_display.setStyleSheet(f"border-right: 1px solid {grid_line_color}; padding: 2px 0px 2px 4px;")
         self.hex_display.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.hex_display.setTextInteractionFlags(Qt.NoTextInteraction)  # Disable native text selection
-        self.hex_display.verticalScrollBar().valueChanged.connect(self.on_scroll)
         hex_layout.addWidget(self.hex_display)
 
         # Create segment overlay for hex display
@@ -2180,27 +3263,34 @@ class HexEditorQt(QMainWindow):
         self.boundary_overlay.set_boundaries(self.boundary_enabled, self.boundary_start_col, self.boundary_end_col)
         self.boundary_overlay.show()
 
+        # Draw user highlight underlines separately so they can be thicker and lower than QTextEdit allows.
+        self.highlight_underline_overlay = HighlightUnderlineOverlay(self, self.hex_display)
+        self.highlight_underline_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
+        self.highlight_underline_overlay.show()
+
         # ASCII column - fixed next to hex
         self.ascii_display = HexTextEdit()
         self.ascii_display.editor = self  # Set reference to parent editor
         self.ascii_display.hovered.connect(self.on_ascii_hover)
-        self.ascii_display.setMinimumWidth(250)
-        self.ascii_display.setMaximumWidth(250)
+        self.ascii_display.setMinimumWidth(self.ascii_column_width)
+        self.ascii_display.setMaximumWidth(self.ascii_column_width)
         self.ascii_display.setLineWrapMode(QTextEdit.NoWrap)
         self.ascii_display.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.ascii_display.clicked.connect(self.on_ascii_click)
         self.ascii_display.setTextInteractionFlags(Qt.NoTextInteraction)  # Disable native text selection
         self.ascii_display.rightClicked.connect(self.on_ascii_right_click)
-        self.ascii_display.setStyleSheet(f"border-left: 2px solid {grid_line_color}; border-right: 1px solid {grid_line_color}; padding: 2px 4px;")
+        self.ascii_display.setStyleSheet(f"border-left: 2px solid {grid_line_color}; border-right: 2px solid {grid_line_color}; padding: 2px 4px;")
         self.ascii_display.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.ascii_display.setAlignment(Qt.AlignCenter)
         hex_layout.addWidget(self.ascii_display)
 
-        # Add spacer to push everything to the left (scrollbar will be positioned separately)
-        hex_layout.addStretch()
-
+        # No spacer - inspector should be right next to decoded text
         self.hex_ascii_container.setLayout(hex_layout)
         hex_main_layout.addWidget(self.hex_ascii_container)
+
+        self.pane_separator_overlay = PaneSeparatorOverlay(self, self.hex_ascii_container)
+        self.pane_separator_overlay.refresh()
+
         hex_widget.setLayout(hex_main_layout)
         # Allow hex widget to stretch with window
         content_splitter.addWidget(hex_widget)
@@ -2210,7 +3300,7 @@ class HexEditorQt(QMainWindow):
 
         # Right side: Tabbed panels with scrollbar (will be positioned as overlay)
         self.inspector_widget = QWidget()
-        self.inspector_width = 390  # Initial width for overlay
+        # inspector_width already calculated in setup_ui based on screen resolution
         self.inspector_widget.setMinimumWidth(self.inspector_width)
         self.inspector_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self.inspector_widget.setObjectName("inspector_widget")
@@ -2249,15 +3339,20 @@ class HexEditorQt(QMainWindow):
 
         # Create tab widget for different panels
         self.right_panel_tabs = QTabWidget()
+        self.right_panel_tabs.setObjectName("right_panel_tabs")
         self.right_panel_tabs.setTabPosition(QTabWidget.North)
         self.right_panel_tabs.setUsesScrollButtons(True)
+        self.right_panel_tabs.setElideMode(Qt.ElideNone)
+        self.right_panel_tabs.tabBar().setExpanding(False)
         # Set tab font size
         tab_font = QFont("Arial", 10)
         self.right_panel_tabs.setFont(tab_font)
         # Style scroll buttons to match theme
         self.update_tab_scroll_buttons_style()
         # Update arrow text when tabs change
-        self.right_panel_tabs.currentChanged.connect(lambda: self._update_arrow_button_text())
+        self.right_panel_tabs.currentChanged.connect(self.on_right_panel_tab_changed)
+        # Replace native tab scroller arrows with clean text buttons after Qt creates them.
+        QTimer.singleShot(100, self._setup_tab_scroll_buttons)
 
         # Data Inspector Tab (original inspector)
         data_inspector_widget = QWidget()
@@ -2269,12 +3364,7 @@ class HexEditorQt(QMainWindow):
         inspector_title_layout = QHBoxLayout()
         inspector_title_layout.setContentsMargins(10, 15, 10, 10)
 
-        inspector_title = QLabel("Data Inspector")
-        inspector_title.setFont(QFont("Arial", 9, QFont.Bold))
-        inspector_title.setAlignment(Qt.AlignCenter)
-        inspector_title_layout.addWidget(inspector_title)
-
-        # Navigation buttons
+        # Navigation buttons - far left (start/prev)
         first_btn = QPushButton("|◄")
         first_btn.setMinimumWidth(40)
         first_btn.setMaximumWidth(50)
@@ -2289,6 +3379,12 @@ class HexEditorQt(QMainWindow):
         prev_btn.clicked.connect(self.prev_byte)
         inspector_title_layout.addWidget(prev_btn)
 
+        inspector_title = QLabel("Data Inspector")
+        inspector_title.setFont(QFont("Arial", 9, QFont.Bold))
+        inspector_title.setAlignment(Qt.AlignCenter)
+        inspector_title_layout.addWidget(inspector_title, 1)
+
+        # Navigation buttons - far right (next/end)
         next_btn = QPushButton("►")
         next_btn.setMinimumWidth(40)
         next_btn.setMaximumWidth(50)
@@ -2327,17 +3423,16 @@ class HexEditorQt(QMainWindow):
         self.endian_btn.clicked.connect(self.toggle_endian)
         inspector_layout.addWidget(self.endian_btn)
 
-        # Number basis selection (for integrals)
-        basis_label = QLabel("Integral Display Basis:")
-        basis_label.setFont(QFont("Arial", 9, QFont.Bold))
-        basis_label.setMinimumHeight(20)
-        basis_label.setAlignment(Qt.AlignCenter)
-        inspector_layout.addWidget(basis_label)
-
+        # Number basis selection (for integrals) - title and buttons on same line
         basis_container = QWidget()
         basis_layout = QHBoxLayout()
         basis_layout.setContentsMargins(10, 5, 10, 5)
         basis_layout.setSpacing(15)
+
+        basis_label = QLabel("Integral Basis:")
+        basis_label.setFont(QFont("Arial", 9, QFont.Bold))
+        basis_label.setMinimumHeight(20)
+        basis_layout.addWidget(basis_label)
 
         self.hex_basis_check = QCheckBox("Hex")
         self.hex_basis_check.setMinimumHeight(30)
@@ -2366,11 +3461,11 @@ class HexEditorQt(QMainWindow):
         data_inspector_widget.setLayout(inspector_layout)
         self.right_panel_tabs.addTab(data_inspector_widget, "Inspector")
 
-        # Pattern Scan Tab
+        # Analyze Tab
         self.pattern_scan_widget = PatternScanWidget()
         self.pattern_scan_widget.parent_editor = self
         self.pattern_scan_widget.result_clicked.connect(self.on_pattern_result_clicked)
-        self.right_panel_tabs.addTab(self.pattern_scan_widget, "Pattern Scan")
+        self.right_panel_tabs.addTab(self.pattern_scan_widget, "Analyze")
 
         # Signature Tab
         self.signature_widget = SignatureWidget()
@@ -2388,6 +3483,7 @@ class HexEditorQt(QMainWindow):
         self.statistics_widget = StatisticsWidget()
         self.statistics_widget.parent_editor = self
         self.right_panel_tabs.addTab(self.statistics_widget, "Statistics")
+        self.update_right_panel_tab_nav_state()
 
         inspector_content_layout.addWidget(self.right_panel_tabs)
         inspector_content_widget.setLayout(inspector_content_layout)
@@ -2442,7 +3538,6 @@ class HexEditorQt(QMainWindow):
 
         # Connect navigation scrollbar to hex display scrollbar (bidirectional sync)
         self.hex_nav_scrollbar.valueChanged.connect(self.on_nav_scroll)
-        self.hex_display.verticalScrollBar().rangeChanged.connect(self.update_nav_scrollbar_range)
 
     def position_inspector_overlay(self):
         """Position the inspector widget and scrollbar as overlays on the right side."""
@@ -2527,21 +3622,43 @@ class HexEditorQt(QMainWindow):
         """End resizing the inspector widget."""
         self.resizing_inspector = False
 
-    def update_window_size_for_screen(self):
+    def update_window_size_for_screen(self, screen=None):
         """Update window size based on current screen resolution."""
-        # Use the screen that THIS window is currently on
-        screen = self.screen()
-        if screen:
-            screen_geometry = screen.availableGeometry()
-            screen_height = screen_geometry.height()
+        if self.isMaximized() or self.isFullScreen():
+            return
 
-            # Default is 1200, increase by 400 for 1440p+
-            optimal_width = 1200
-            if screen_height >= 1400:
-                optimal_width = 1600
+        screen = screen or self.screen()
+        if screen is None:
+            return
 
-            # Set initial width (height will be set by Qt defaults)
-            self.resize(optimal_width, 840)
+        screen_geometry = screen.availableGeometry()
+        screen_width = screen_geometry.width()
+        screen_height = screen_geometry.height()
+
+        # Calculate appropriate width and height based on screen resolution
+        if screen_height >= 1400:  # 1440p or higher
+            window_width = 1400
+            window_height = 900
+            print(f"Window Size: target 1400x900 for 1440p+ (screen height: {screen_height})")
+        elif screen_height <= 1100:  # 1080p or lower
+            window_width = 1080
+            window_height = 700
+            print(f"Window Size: target 1080x700 for 1080p (screen height: {screen_height})")
+        else:  # Between 1080p and 1440p
+            # Interpolate between the two sizes
+            ratio = (screen_height - 1100) / (1400 - 1100)
+            window_width = int(1080 + (1400 - 1080) * ratio)
+            window_height = int(700 + (900 - 700) * ratio)
+            print(f"Window Size: target {window_width}x{window_height} (interpolated, screen height: {screen_height})")
+
+        window_width = min(window_width, max(500, screen_width - 80))
+        window_height = min(window_height, max(200, screen_height - 80))
+
+        if abs(self.width() - window_width) < 24 and abs(self.height() - window_height) < 24:
+            return
+
+        print(f"Resizing window from {self.width()}x{self.height()} to {window_width}x{window_height}")
+        self.resize(window_width, window_height)
 
     def create_menus(self):
         menubar = self.menuBar()
@@ -2552,6 +3669,10 @@ class HexEditorQt(QMainWindow):
         open_action = QAction("Open", self)
         open_action.triggered.connect(self.open_file)
         file_menu.addAction(open_action)
+
+        open_directory_action = QAction("Open Directory", self)
+        open_directory_action.triggered.connect(self.open_directory)
+        file_menu.addAction(open_directory_action)
 
         file_menu.addSeparator()
 
@@ -2566,12 +3687,12 @@ class HexEditorQt(QMainWindow):
         file_menu.addSeparator()
 
         save_action = QAction("Save", self)
-        save_action.setShortcut("Ctrl+S")
+        self.register_control_action("file.save", "File: Save", save_action, "Ctrl+S")
         save_action.triggered.connect(self.save_file)
         file_menu.addAction(save_action)
 
         save_all_action = QAction("Save All", self)
-        save_all_action.setShortcut("Ctrl+Shift+S")
+        self.register_control_action("file.save_all", "File: Save All", save_all_action, "Ctrl+Shift+S")
         save_all_action.triggered.connect(self.save_all_files)
         file_menu.addAction(save_all_action)
 
@@ -2585,41 +3706,41 @@ class HexEditorQt(QMainWindow):
         edit_menu = menubar.addMenu("Edit")
 
         undo_action = QAction("Undo", self)
-        undo_action.setShortcut("Ctrl+Z")
+        self.register_control_action("edit.undo", "Edit: Undo", undo_action, "Ctrl+Z")
         undo_action.triggered.connect(self.undo)
         edit_menu.addAction(undo_action)
 
         redo_action = QAction("Redo", self)
-        redo_action.setShortcut("Ctrl+Y")
+        self.register_control_action("edit.redo", "Edit: Redo", redo_action, "Ctrl+Y")
         redo_action.triggered.connect(self.redo)
         edit_menu.addAction(redo_action)
 
         edit_menu.addSeparator()
 
         copy_action = QAction("Copy", self)
-        copy_action.setShortcut("Ctrl+C")
+        self.register_control_action("edit.copy", "Edit: Copy", copy_action, "Ctrl+C")
         copy_action.triggered.connect(self.copy)
         edit_menu.addAction(copy_action)
 
         cut_action = QAction("Cut", self)
-        cut_action.setShortcut("Ctrl+X")
+        self.register_control_action("edit.cut", "Edit: Cut", cut_action, "Ctrl+X")
         cut_action.triggered.connect(self.cut)
         edit_menu.addAction(cut_action)
 
         paste_write_action = QAction("Paste Write", self)
-        paste_write_action.setShortcut("Ctrl+B")
+        self.register_control_action("edit.paste_write", "Edit: Paste Write", paste_write_action, "Ctrl+B")
         paste_write_action.triggered.connect(self.paste_write)
         edit_menu.addAction(paste_write_action)
 
         paste_insert_action = QAction("Paste Insert", self)
-        paste_insert_action.setShortcut("Ctrl+V")
+        self.register_control_action("edit.paste_insert", "Edit: Paste Insert", paste_insert_action, "Ctrl+V")
         paste_insert_action.triggered.connect(self.paste_insert)
         edit_menu.addAction(paste_insert_action)
 
         edit_menu.addSeparator()
 
         fill_selection_action = QAction("Fill Selection", self)
-        fill_selection_action.setShortcut("Ctrl+L")
+        self.register_control_action("edit.fill_selection", "Edit: Fill Selection", fill_selection_action, "Ctrl+L")
         fill_selection_action.triggered.connect(self.show_fill_selection_dialog)
         edit_menu.addAction(fill_selection_action)
 
@@ -2627,17 +3748,17 @@ class HexEditorQt(QMainWindow):
         view_menu = menubar.addMenu("View")
 
         search_action = QAction("Search", self)
-        search_action.setShortcut("Ctrl+F")
+        self.register_control_action("view.search", "View: Search", search_action, "Ctrl+F")
         search_action.triggered.connect(self.show_search_window)
         view_menu.addAction(search_action)
 
         replace_action = QAction("Replace", self)
-        replace_action.setShortcut("Ctrl+R")
+        self.register_control_action("view.replace", "View: Replace", replace_action, "Ctrl+R")
         replace_action.triggered.connect(self.show_replace_window)
         view_menu.addAction(replace_action)
 
         goto_action = QAction("Go to...", self)
-        goto_action.setShortcut("Ctrl+G")
+        self.register_control_action("view.goto", "View: Go to", goto_action, "Ctrl+G")
         goto_action.triggered.connect(self.show_goto_window)
         view_menu.addAction(goto_action)
 
@@ -2652,15 +3773,30 @@ class HexEditorQt(QMainWindow):
         segments_action.triggered.connect(self.show_segments_config)
         view_menu.addAction(segments_action)
 
+        # Scripts menu
+        self.scripts_menu = menubar.addMenu("Scripts")
+        self.rebuild_scripts_menu()
+
         # Tools menu
         tools_menu = menubar.addMenu("Tools")
 
+        # Quick tools with hotkeys
         highlight_action = QAction("Highlight", self)
-        highlight_action.setShortcut("Ctrl+H")
+        self.register_control_action("tools.highlight", "Tools: Highlight", highlight_action, "Ctrl+H")
         highlight_action.triggered.connect(self.show_highlight_window)
         tools_menu.addAction(highlight_action)
 
+        padding_action = QAction("Padding...", self)
+        self.register_control_action("tools.padding", "Tools: Padding", padding_action, "Ctrl+P")
+        padding_action.triggered.connect(self.show_padding_tool)
+        tools_menu.addAction(padding_action)
+
         tools_menu.addSeparator()
+
+        # Analysis / workspace tools
+        compare_action = QAction("Compare Data", self)
+        compare_action.triggered.connect(self.show_compare_window)
+        tools_menu.addAction(compare_action)
 
         notes_action = QAction("Show Notes", self)
         notes_action.triggered.connect(self.toggle_notes)
@@ -2668,17 +3804,14 @@ class HexEditorQt(QMainWindow):
 
         tools_menu.addSeparator()
 
-        calc_action = QAction("Calculator", self)
-        calc_action.triggered.connect(self.show_calculator_window)
-        tools_menu.addAction(calc_action)
+        # Non-destructive file utilities
+        compress_action = QAction("Compress...", self)
+        compress_action.triggered.connect(self.show_compress_tool)
+        tools_menu.addAction(compress_action)
 
-        color_action = QAction("Color Picker", self)
-        color_action.triggered.connect(self.show_color_picker_window)
-        tools_menu.addAction(color_action)
-
-        compare_action = QAction("Compare Data", self)
-        compare_action.triggered.connect(self.show_compare_window)
-        tools_menu.addAction(compare_action)
+        decompress_action = QAction("Decompress...", self)
+        decompress_action.triggered.connect(self.show_decompress_tool)
+        tools_menu.addAction(decompress_action)
 
         # Options menu
         options_menu = menubar.addMenu("Options")
@@ -2692,6 +3825,12 @@ class HexEditorQt(QMainWindow):
         themes_action = QAction("Themes", self)
         themes_action.triggered.connect(self.show_theme_selector)
         options_menu.addAction(themes_action)
+
+        options_menu.addSeparator()
+
+        controls_action = QAction("Controls...", self)
+        controls_action.triggered.connect(self.show_controls_dialog)
+        options_menu.addAction(controls_action)
 
         options_menu.addSeparator()
 
@@ -2717,13 +3856,101 @@ class HexEditorQt(QMainWindow):
         about_action.triggered.connect(self.show_about_dialog)
         options_menu.addAction(about_action)
 
+        self.action_script_manager.install_shortcuts()
+
+    def rebuild_scripts_menu(self):
+        if not self.scripts_menu:
+            return
+        self.scripts_menu.clear()
+
+        open_action = QAction("Open", self)
+        open_action.triggered.connect(self.show_scripts_manager)
+        self.scripts_menu.addAction(open_action)
+
+        create_action = QAction("Create", self)
+        create_action.triggered.connect(self.create_action_script)
+        self.scripts_menu.addAction(create_action)
+
+        self.scripts_menu.addSeparator()
+
+        import_action = QAction("Import...", self)
+        import_action.triggered.connect(self.import_action_scripts)
+        self.scripts_menu.addAction(import_action)
+
+        export_action = QAction("Export...", self)
+        export_action.triggered.connect(self.export_action_scripts)
+        self.scripts_menu.addAction(export_action)
+
+        if self.action_script_manager.scripts:
+            self.scripts_menu.addSeparator()
+            for index, script in enumerate(self.action_script_manager.scripts):
+                name = script.get("name", "Unnamed Script")
+                hotkey = script.get("hotkey", "")
+                label = f"{name}\t{hotkey}" if hotkey else name
+                run_action = QAction(label, self)
+                run_action.triggered.connect(lambda checked=False, i=index: self.action_script_manager.run_script(i))
+                self.scripts_menu.addAction(run_action)
+
+    def show_scripts_manager(self):
+        dialog = ScriptManagerDialog(self.action_script_manager, self)
+        dialog.exec_()
+
+    def create_action_script(self):
+        dialog = ScriptEditorDialog(parent=self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.action_script_manager.scripts.append(dialog.get_script())
+            self.action_script_manager.save()
+            self.action_script_manager.install_shortcuts()
+            self.rebuild_scripts_menu()
+
+    def import_action_scripts(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Action Scripts", "", "JSON Files (*.json);;All Files (*)")
+        if not path:
+            return
+        try:
+            name = self.action_script_manager.import_from_file(path)
+            self.rebuild_scripts_menu()
+            QMessageBox.information(self, "Import Complete", f"Imported script '{name}'.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Import Failed", str(exc))
+
+    def export_action_scripts(self):
+        if not self.action_script_manager.scripts:
+            QMessageBox.information(self, "No Scripts", "There are no scripts to export.")
+            return
+        names = [script.get("name", "Unnamed Script") for script in self.action_script_manager.scripts]
+        selected, ok = QInputDialog.getItem(self, "Export Action Script", "Script:", names, 0, False)
+        if not ok or not selected:
+            return
+        index = names.index(selected)
+        path, _ = QFileDialog.getSaveFileName(self, "Export Action Script", safe_export_filename(selected), "JSON Files (*.json);;All Files (*)")
+        if not path:
+            return
+        try:
+            self.action_script_manager.export_to_file(path, index)
+            QMessageBox.information(self, "Export Complete", f"Exported script '{selected}'.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Export Failed", str(exc))
+
     def eventFilter(self, obj, event):
         if event.type() == QEvent.KeyPress:
             if obj == self.hex_display:
                 return self.on_hex_key_press(event)
             elif obj == self.ascii_display:
                 return self.on_ascii_key_press(event)
+        elif event.type() == QEvent.MouseButtonRelease and obj in (self.hex_display, self.ascii_display):
+            self._last_drag_selection_byte = None
+            self.clear_native_text_selections()
         return super().eventFilter(obj, event)
+
+    def clear_native_text_selections(self):
+        for widget in (getattr(self, 'hex_display', None), getattr(self, 'ascii_display', None)):
+            if not widget:
+                continue
+            cursor = widget.textCursor()
+            if cursor.hasSelection():
+                cursor.clearSelection()
+                widget.setTextCursor(cursor)
 
     def on_hex_key_press(self, event):
         if self.current_tab_index < 0:
@@ -2801,9 +4028,15 @@ class HexEditorQt(QMainWindow):
         else:
             new_value = (old_value & 0xF0) | nibble_value
 
-        current_file.file_data[self.cursor_position] = new_value
+        current_file.set_byte(self.cursor_position, new_value)
         current_file.modified = True
-        current_file.modified_bytes.add(self.cursor_position)
+        original_byte = current_file.get_original_byte(self.cursor_position)
+        if original_byte is not None and new_value != original_byte:
+            current_file.modified_bytes.add(self.cursor_position)
+        else:
+            current_file.modified_bytes.discard(self.cursor_position)
+            if hasattr(current_file, "edits"):
+                current_file.edits.pop(self.cursor_position, None)
         current_file.pattern_highlights_dirty = True  # Mark pattern highlights for reapplication
 
         # Move cursor
@@ -2825,9 +4058,16 @@ class HexEditorQt(QMainWindow):
 
         self.save_undo_state()
 
-        current_file.file_data[self.cursor_position] = ord(char)
+        new_value = ord(char)
+        current_file.set_byte(self.cursor_position, new_value)
         current_file.modified = True
-        current_file.modified_bytes.add(self.cursor_position)
+        original_byte = current_file.get_original_byte(self.cursor_position)
+        if original_byte is not None and new_value != original_byte:
+            current_file.modified_bytes.add(self.cursor_position)
+        else:
+            current_file.modified_bytes.discard(self.cursor_position)
+            if hasattr(current_file, "edits"):
+                current_file.edits.pop(self.cursor_position, None)
         current_file.pattern_highlights_dirty = True  # Mark pattern highlights for reapplication
 
         if self.cursor_position < len(current_file.file_data) - 1:
@@ -2842,43 +4082,544 @@ class HexEditorQt(QMainWindow):
             self, "Open File", "", "All Files (*)"
         )
         if file_path:
+            self.open_file_path(file_path)
+
+    def open_file_path(self, file_path):
+        if not file_path or not os.path.isfile(file_path):
+            return
+
+        progress_dialog = QProgressDialog("Loading file...", "Cancel", 0, 100, self)
+        progress_dialog.setWindowTitle("Opening File")
+        progress_dialog.setWindowModality(Qt.WindowModal)
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.setValue(0)
+
+        loader_thread = FileLoaderThread(file_path)
+        if not hasattr(self, '_file_loader_threads'):
+            self._file_loader_threads = []
+        self._file_loader_threads.append(loader_thread)
+
+        def cleanup_thread():
+            if hasattr(self, '_file_loader_threads') and loader_thread in self._file_loader_threads:
+                self._file_loader_threads.remove(loader_thread)
+            loader_thread.deleteLater()
+
+        def on_progress(value):
+            progress_dialog.setValue(value)
+
+        def on_finished(file_handle, file_data, use_mmap):
+            progress_dialog.close()
             try:
-                # Check file size first
-                file_size = os.path.getsize(file_path)
-                mmap_threshold = 10 * 1024 * 1024  # 10 MB - use mmap for files larger than this
-
-                use_mmap = file_size > mmap_threshold
-
                 if use_mmap:
-                    # Use memory-mapped file for large files
-                    file_handle = open(file_path, 'r+b' if os.access(file_path, os.W_OK) else 'rb')
                     file_tab = FileTab(file_path, file_handle=file_handle, use_mmap=True)
                 else:
-                    # Load small files entirely into memory
-                    with open(file_path, 'rb') as f:
-                        file_data = f.read()
                     file_tab = FileTab(file_path, file_data)
 
                 self.open_files.append(file_tab)
 
                 tab_name = os.path.basename(file_path)
                 tab_widget = QWidget()
+                new_index = len(self.open_files) - 1
+                self.tab_widget.blockSignals(True)
                 self.tab_widget.addTab(tab_widget, tab_name)
-                self.tab_widget.setCurrentIndex(len(self.open_files) - 1)
+                self.tab_widget.blockSignals(False)
 
-                # Reset rendered range for new file
                 self.rendered_start_byte = 0
                 self.rendered_end_byte = 0
+                self.tab_widget.setCurrentIndex(new_index)
 
-                # Note: Don't call set_file_data to avoid clearing data
-                # The on_tab_changed event will be triggered automatically
-                # when we set the current index above, which will handle
-                # setting up the widgets for this new empty file
-
-                self.display_hex()
+                if self.current_tab_index != new_index:
+                    self.on_tab_changed(new_index)
 
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to open file: {str(e)}")
+            finally:
+                cleanup_thread()
+
+        def on_error(error_msg):
+            progress_dialog.close()
+            cleanup_thread()
+            QMessageBox.critical(self, "Error", f"Failed to open file: {error_msg}")
+
+        def on_canceled():
+            loader_thread.terminate()
+            loader_thread.wait()
+            cleanup_thread()
+
+        loader_thread.progress.connect(on_progress)
+        loader_thread.finished.connect(on_finished)
+        loader_thread.error.connect(on_error)
+        progress_dialog.canceled.connect(on_canceled)
+
+        loader_thread.start()
+
+    def open_directory(self):
+        directory = QFileDialog.getExistingDirectory(self, "Open Directory", "")
+        if directory:
+            self.load_directory_listing(directory)
+
+    def apply_directory_bar_theme(self):
+        if not hasattr(self, 'directory_bar'):
+            return
+        theme = get_theme_colors(self.current_theme)
+        bg = theme.get('editor_bg', theme.get('background', '#000000'))
+        fg = theme.get('foreground', theme.get('editor_fg', '#ffffff'))
+        border = theme.get('border', theme.get('grid_line', '#555555'))
+        accent = theme.get('button_bg', theme.get('selection_bg', border))
+        popup_bg = theme.get('background', bg)
+        selection_fg = theme.get('selection_fg', fg)
+
+        palette = self.directory_combo.palette()
+        palette.setColor(QPalette.Base, QColor(bg))
+        palette.setColor(QPalette.Button, QColor(bg))
+        palette.setColor(QPalette.Text, QColor(fg))
+        palette.setColor(QPalette.ButtonText, QColor(fg))
+        palette.setColor(QPalette.WindowText, QColor(fg))
+        palette.setColor(QPalette.Highlight, QColor(accent))
+        palette.setColor(QPalette.HighlightedText, QColor(selection_fg))
+        self.directory_combo.setPalette(palette)
+
+        self.directory_bar.setStyleSheet(
+            f"QWidget {{ background-color: {bg}; border-bottom: 1px solid {border}; }}"
+            f"QComboBox#directory_combo {{ background-color: {bg}; color: {fg}; "
+            f"border: 1px solid {accent}; padding: 2px 24px 2px 8px; selection-background-color: {accent}; "
+            f"selection-color: {selection_fg}; }}"
+            f"QComboBox#directory_combo:hover {{ border-color: {fg}; }}"
+            f"QComboBox#directory_combo::drop-down {{ background-color: {bg}; border-left: 1px solid {accent}; width: 20px; }}"
+            f"QComboBox#directory_combo QAbstractItemView {{ background-color: {popup_bg}; color: {fg}; "
+            f"border: 1px solid {accent}; selection-background-color: {accent}; selection-color: {selection_fg}; }}"
+        )
+
+    def load_directory_listing(self, directory):
+        if not directory or not os.path.isdir(directory):
+            return
+        entries = []
+        try:
+            for name in sorted(os.listdir(directory), key=lambda value: value.lower()):
+                path = os.path.join(directory, name)
+                if os.path.isfile(path):
+                    entries.append((name, path))
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open directory: {str(e)}")
+            return
+
+        self.current_directory_path = directory
+        self.current_directory_files = entries
+        self.directory_combo.blockSignals(True)
+        self.directory_combo.clear()
+        self.directory_combo.addItem(f"[{os.path.basename(directory) or directory}]", "")
+        for name, path in entries:
+            self.directory_combo.addItem(f". {name}", path)
+        self.directory_combo.setCurrentIndex(0)
+        self.directory_combo.blockSignals(False)
+        self.resize_directory_combo_to_contents()
+        self.directory_bar.setVisible(True)
+        self.apply_directory_bar_theme()
+
+    def open_directory_combo_item(self, index):
+        if not hasattr(self, 'directory_combo') or index <= 0:
+            if hasattr(self, 'directory_combo'):
+                self.directory_combo.setCurrentIndex(0)
+            return
+        file_path = self.directory_combo.itemData(index)
+        self.directory_combo.setCurrentIndex(0)
+        if file_path:
+            self.open_file_path(file_path)
+
+    def resize_directory_combo_to_contents(self):
+        if not hasattr(self, 'directory_combo'):
+            return
+        metrics = QFontMetrics(self.directory_combo.font())
+        longest = 0
+        for index in range(self.directory_combo.count()):
+            longest = max(longest, metrics.horizontalAdvance(self.directory_combo.itemText(index)))
+        width = longest + 48
+        viewport_limit = max(220, int(self.width() * 0.45))
+        width = max(140, min(width, viewport_limit, 520))
+        self.directory_combo.setMinimumWidth(width)
+        self.directory_combo.setMaximumWidth(width)
+
+    def open_bytes_in_new_tab(self, data, tab_name, source_path=None):
+        """Open generated bytes in a new unsaved tab without touching the source file."""
+        file_path = source_path or tab_name
+        file_tab = FileTab(file_path, bytearray(data))
+        file_tab.modified = True
+        self.open_files.append(file_tab)
+
+        tab_widget = QWidget()
+        new_index = len(self.open_files) - 1
+        self.tab_widget.blockSignals(True)
+        self.tab_widget.addTab(tab_widget, tab_name)
+        self.tab_widget.blockSignals(False)
+
+        self.rendered_start_byte = 0
+        self.rendered_end_byte = 0
+        self.cursor_position = 0 if data else None
+        self.selection_start = None
+        self.selection_end = None
+        self.tab_widget.setCurrentIndex(new_index)
+        if self.current_tab_index != new_index:
+            self.on_tab_changed(new_index)
+        else:
+            self.display_hex()
+            self.data_inspector.update()
+
+    def current_scope_bytes(self):
+        if self.current_tab_index < 0:
+            raise ValueError("No file open")
+        current_file = self.open_files[self.current_tab_index]
+        data = current_file.file_data
+        if self.selection_start is not None and self.selection_end is not None:
+            start = min(self.selection_start, self.selection_end)
+            end = max(self.selection_start, self.selection_end) + 1
+            return bytes(data[start:end]), start, end, "selection"
+        return bytes(data), 0, len(data), "file"
+
+    def parse_padding_byte(self, text):
+        text = str(text).strip()
+        if not text:
+            raise ValueError("Padding byte is empty")
+        if text.lower().startswith("0x"):
+            text = text[2:]
+        text = "".join(text.split())
+        if len(text) > 2:
+            raise ValueError("Padding byte must be one hex byte")
+        value = int(text, 16)
+        if not 0 <= value <= 255:
+            raise ValueError("Padding byte out of range")
+        return value
+
+    def show_padding_tool(self):
+        if self.current_tab_index < 0:
+            QMessageBox.warning(self, "No File", "Please open a file first.")
+            return
+        if self.cursor_position is None:
+            QMessageBox.warning(self, "No Cursor", "Select the byte where padding should start.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Padding")
+        dialog.setMinimumWidth(320)
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+
+        byte_count_edit = QLineEdit("16")
+        byte_count_edit.setFont(QFont("Courier", 8))
+        form.addRow("Bytes:", byte_count_edit)
+
+        pad_byte_edit = QLineEdit("00")
+        pad_byte_edit.setFont(QFont("Courier", 8))
+        form.addRow("Pad byte:", pad_byte_edit)
+        layout.addLayout(form)
+
+        preview = QLabel()
+        preview.setFont(QFont("Courier", 8))
+        layout.addWidget(preview)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def compute():
+            text = byte_count_edit.text().strip()
+            add_count = int(text, 0)
+            if add_count <= 0:
+                raise ValueError("Bytes must be positive")
+            current_file = self.open_files[self.current_tab_index]
+            insert_at = self.cursor_position
+            if self.selection_start is not None and self.selection_end is not None:
+                insert_at = min(self.selection_start, self.selection_end)
+            if insert_at < 0 or insert_at > len(current_file.file_data):
+                raise ValueError("Selected byte is out of range")
+            return self.parse_padding_byte(pad_byte_edit.text()), insert_at, add_count
+
+        def update_preview():
+            try:
+                pad_value, insert_at, add_count = compute()
+                preview.setText(
+                    f"Insert at: 0x{insert_at:X}\n"
+                    f"Bytes to add: {add_count} (0x{add_count:X})\n"
+                    f"Pad: {pad_value:02X}\n"
+                    f"Original byte moves to: 0x{insert_at + add_count:X}"
+                )
+                buttons.button(QDialogButtonBox.Ok).setEnabled(add_count > 0)
+            except Exception as e:
+                preview.setText(f"Error: {e}")
+                buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+
+        def apply_padding():
+            try:
+                pad_value, insert_at, add_count = compute()
+                if add_count <= 0:
+                    return
+                reply = QMessageBox.question(
+                    dialog,
+                    "Confirm Padding",
+                    f"Add {add_count} byte(s) of 0x{pad_value:02X} at 0x{insert_at:X}?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                if reply != QMessageBox.Yes:
+                    return
+                current_file = self.open_files[self.current_tab_index]
+                if not isinstance(current_file.file_data, bytearray):
+                    current_file.file_data = bytearray(current_file.file_data)
+                    current_file.use_mmap = False
+                self.save_undo_state()
+                pad_bytes = bytes([pad_value]) * add_count
+                current_file.file_data[insert_at:insert_at] = pad_bytes
+                current_file.inserted_bytes.update(range(insert_at, insert_at + add_count))
+                current_file.modified = True
+                current_file.pattern_highlights_dirty = True
+                self.tab_widget.setTabText(self.current_tab_index, os.path.basename(current_file.file_path) + " *")
+                self.display_hex(preserve_scroll=True)
+                dialog.accept()
+            except Exception as e:
+                QMessageBox.warning(dialog, "Padding Error", str(e))
+
+        byte_count_edit.textChanged.connect(update_preview)
+        pad_byte_edit.textChanged.connect(update_preview)
+        buttons.accepted.connect(apply_padding)
+        buttons.rejected.connect(dialog.reject)
+        update_preview()
+        dialog.exec_()
+
+    def detect_compression_format(self, data):
+        detections = []
+        if data.startswith(b"\x1f\x8b"):
+            detections.append(("gzip", "GZip stream"))
+        if len(data) >= 2 and data[0] == 0x78:
+            try:
+                zlib.decompress(data)
+                detections.append(("zlib", "zlib stream"))
+            except Exception:
+                pass
+        try:
+            zlib.decompress(data, -15)
+            detections.append(("raw_deflate", "raw deflate stream"))
+        except Exception:
+            pass
+        if data.startswith(b"Yaz0"):
+            detections.append(("yaz0", "Nintendo Yaz0"))
+        if data.startswith(b"Yay0"):
+            detections.append(("yay0", "Nintendo Yay0"))
+        return detections
+
+    def yaz0_decompress(self, data):
+        if len(data) < 16 or not data.startswith(b"Yaz0"):
+            raise ValueError("Invalid Yaz0 header")
+        out_size = int.from_bytes(data[4:8], "big")
+        src = 16
+        out = bytearray()
+        valid_bits = 0
+        code = 0
+        while len(out) < out_size:
+            if valid_bits == 0:
+                if src >= len(data):
+                    raise ValueError("Unexpected end of Yaz0 stream")
+                code = data[src]
+                src += 1
+                valid_bits = 8
+            if code & 0x80:
+                if src >= len(data):
+                    raise ValueError("Unexpected end of Yaz0 literal")
+                out.append(data[src])
+                src += 1
+            else:
+                if src + 1 >= len(data):
+                    raise ValueError("Unexpected end of Yaz0 copy")
+                b1, b2 = data[src], data[src + 1]
+                src += 2
+                dist = ((b1 & 0x0F) << 8) | b2
+                count = b1 >> 4
+                if count == 0:
+                    if src >= len(data):
+                        raise ValueError("Unexpected end of Yaz0 count")
+                    count = data[src] + 0x12
+                    src += 1
+                else:
+                    count += 2
+                copy_src = len(out) - (dist + 1)
+                if copy_src < 0:
+                    raise ValueError("Invalid Yaz0 back-reference")
+                for _ in range(count):
+                    out.append(out[copy_src])
+                    copy_src += 1
+                    if len(out) >= out_size:
+                        break
+            code = (code << 1) & 0xFF
+            valid_bits -= 1
+        return bytes(out)
+
+    def yaz0_compress_literal(self, data):
+        out = bytearray(b"Yaz0")
+        out += len(data).to_bytes(4, "big")
+        out += b"\x00" * 8
+        for i in range(0, len(data), 8):
+            chunk = data[i:i + 8]
+            out.append((0xFF << (8 - len(chunk))) & 0xFF)
+            out.extend(chunk)
+        return bytes(out)
+
+    def yay0_decompress(self, data):
+        if len(data) < 16 or not data.startswith(b"Yay0"):
+            raise ValueError("Invalid Yay0 header")
+        out_size = int.from_bytes(data[4:8], "big")
+        link_offset = int.from_bytes(data[8:12], "big")
+        chunk_offset = int.from_bytes(data[12:16], "big")
+        mask_offset = 16
+        mask_bits = 0
+        mask = 0
+        link = link_offset
+        chunk = chunk_offset
+        out = bytearray()
+        while len(out) < out_size:
+            if mask_bits == 0:
+                if mask_offset + 4 > len(data):
+                    raise ValueError("Unexpected end of Yay0 masks")
+                mask = int.from_bytes(data[mask_offset:mask_offset + 4], "big")
+                mask_offset += 4
+                mask_bits = 32
+            if mask & 0x80000000:
+                if chunk >= len(data):
+                    raise ValueError("Unexpected end of Yay0 literal data")
+                out.append(data[chunk])
+                chunk += 1
+            else:
+                if link + 2 > len(data):
+                    raise ValueError("Unexpected end of Yay0 links")
+                pair = int.from_bytes(data[link:link + 2], "big")
+                link += 2
+                count = pair >> 12
+                dist = pair & 0x0FFF
+                if count == 0:
+                    if chunk >= len(data):
+                        raise ValueError("Unexpected end of Yay0 count")
+                    count = data[chunk] + 18
+                    chunk += 1
+                else:
+                    count += 2
+                copy_src = len(out) - (dist + 1)
+                if copy_src < 0:
+                    raise ValueError("Invalid Yay0 back-reference")
+                for _ in range(count):
+                    out.append(out[copy_src])
+                    copy_src += 1
+                    if len(out) >= out_size:
+                        break
+            mask = (mask << 1) & 0xFFFFFFFF
+            mask_bits -= 1
+        return bytes(out)
+
+    def yay0_compress_literal(self, data):
+        groups = (len(data) + 31) // 32
+        masks = b"\xFF\xFF\xFF\xFF" * groups
+        link_offset = 16 + len(masks)
+        chunk_offset = link_offset
+        return b"Yay0" + len(data).to_bytes(4, "big") + link_offset.to_bytes(4, "big") + chunk_offset.to_bytes(4, "big") + masks + bytes(data)
+
+    def compression_transform(self, data, fmt, mode):
+        if mode == "decompress":
+            if fmt == "zlib":
+                return zlib.decompress(data)
+            if fmt == "gzip":
+                return gzip.decompress(data)
+            if fmt == "raw_deflate":
+                return zlib.decompress(data, -15)
+            if fmt == "yaz0":
+                return self.yaz0_decompress(data)
+            if fmt == "yay0":
+                return self.yay0_decompress(data)
+        else:
+            if fmt == "zlib":
+                return zlib.compress(data)
+            if fmt == "gzip":
+                return gzip.compress(data)
+            if fmt == "raw_deflate":
+                compressor = zlib.compressobj(level=9, wbits=-15)
+                return compressor.compress(data) + compressor.flush()
+            if fmt == "yaz0":
+                return self.yaz0_compress_literal(data)
+            if fmt == "yay0":
+                return self.yay0_compress_literal(data)
+        raise ValueError("Unsupported compression format")
+
+    def show_compress_tool(self):
+        self.show_compression_tool("compress")
+
+    def show_decompress_tool(self):
+        self.show_compression_tool("decompress")
+
+    def show_compression_tool(self, mode):
+        if self.current_tab_index < 0:
+            QMessageBox.warning(self, "No File", "Please open a file first.")
+            return
+        try:
+            source, start, end, scope = self.current_scope_bytes()
+        except Exception as e:
+            QMessageBox.warning(self, "Compression Error", str(e))
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Compress" if mode == "compress" else "Decompress")
+        dialog.setMinimumWidth(380)
+        layout = QVBoxLayout(dialog)
+
+        fmt_combo = QComboBox()
+        formats = [("zlib", "zlib"), ("gzip", "gzip"), ("raw_deflate", "raw deflate"), ("yaz0", "Yaz0"), ("yay0", "Yay0")]
+        for key, label in formats:
+            fmt_combo.addItem(label, key)
+        layout.addWidget(QLabel(f"Source: {scope} 0x{start:X}-0x{end:X} ({len(source)} bytes)"))
+        layout.addWidget(fmt_combo)
+
+        info = QLabel()
+        info.setFont(QFont("Courier", 8))
+        layout.addWidget(info)
+
+        if mode == "decompress":
+            detections = self.detect_compression_format(source)
+            if detections:
+                fmt_combo.setCurrentIndex(fmt_combo.findData(detections[0][0]))
+                info.setText("Detected: " + ", ".join(desc for _, desc in detections))
+            else:
+                info.setText("Detected: unknown")
+        else:
+            info.setText("Compression opens a new tab and never overwrites the source.")
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def run():
+            fmt = fmt_combo.currentData()
+            try:
+                result = self.compression_transform(source, fmt, mode)
+                ratio = (len(result) / len(source) * 100.0) if source else 0
+                summary = (
+                    f"Original size: {len(source)} bytes\n"
+                    f"Result size: {len(result)} bytes\n"
+                    f"Ratio: {ratio:.2f}%"
+                )
+                if mode == "compress" and len(result) > len(source):
+                    reply = QMessageBox.warning(
+                        dialog,
+                        "Compressed Data Is Larger",
+                        summary + "\n\nCompressed data is larger than the source. Open it anyway?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No
+                    )
+                    if reply != QMessageBox.Yes:
+                        return
+                else:
+                    QMessageBox.information(dialog, "Compression Result", summary)
+                base = os.path.basename(self.open_files[self.current_tab_index].file_path)
+                suffix = "compressed" if mode == "compress" else "decompressed"
+                self.open_bytes_in_new_tab(result, f"{base}.{fmt}.{suffix}", f"{self.open_files[self.current_tab_index].file_path}.{fmt}.{suffix}")
+                dialog.accept()
+            except Exception as e:
+                QMessageBox.warning(dialog, "Compression Error", str(e))
+
+        buttons.accepted.connect(run)
+        buttons.rejected.connect(dialog.reject)
+        dialog.exec_()
 
     def close_tab(self, index):
         if 0 <= index < len(self.open_files):
@@ -2979,7 +4720,10 @@ class HexEditorQt(QMainWindow):
 
             # Set file data for widgets (this only updates the file_data reference)
             self.pattern_scan_widget.file_data = current_file.file_data
-            self.statistics_widget.set_file_data(current_file.file_data)
+            self.statistics_widget.set_file_data(
+                current_file.file_data,
+                defer_update=self.right_panel_tabs.currentWidget() != self.statistics_widget
+            )
 
             # Restore pattern scan results for this file
             self.pattern_scan_widget.tree.clear()
@@ -3000,6 +4744,30 @@ class HexEditorQt(QMainWindow):
             self.display_hex()
         else:
             self.clear_display()
+
+    def on_right_panel_tab_changed(self, index):
+        self._update_arrow_button_text()
+        self.update_right_panel_tab_nav_state()
+
+        if (hasattr(self, 'statistics_widget') and
+            self.right_panel_tabs.widget(index) == self.statistics_widget and
+            getattr(self.statistics_widget, '_stats_dirty', False)):
+            self.statistics_widget.update_statistics()
+
+        if (hasattr(self, 'fields_widget') and
+            self.right_panel_tabs.widget(index) == self.fields_widget):
+            self.fields_widget.rebuild_tree()
+
+    def update_right_panel_tab_nav_state(self):
+        """Enable or disable inspector tab nav buttons based on current tab."""
+        if not hasattr(self, 'right_panel_tabs'):
+            return
+        current_idx = self.right_panel_tabs.currentIndex()
+        tab_count = self.right_panel_tabs.count()
+        if hasattr(self, 'right_panel_tab_prev_btn'):
+            self.right_panel_tab_prev_btn.setEnabled(current_idx > 0)
+        if hasattr(self, 'right_panel_tab_next_btn'):
+            self.right_panel_tab_next_btn.setEnabled(current_idx < tab_count - 1)
 
     def shift_pattern_labels(self, current_file, start_pos, shift_amount):
         """Shift pattern labels after a position by shift_amount (positive for insert, negative for cut)"""
@@ -3142,7 +4910,7 @@ class HexEditorQt(QMainWindow):
         # Mark as clean after reapplying
         current_file.pattern_highlights_dirty = False
 
-    def display_hex(self, preserve_scroll=False):
+    def display_hex(self, preserve_scroll=False, update_side_panels=True, apply_formatting=True):
         if self.current_tab_index < 0 or not self.open_files:
             return
 
@@ -3157,10 +4925,6 @@ class HexEditorQt(QMainWindow):
         hex_scroll_pos = self.hex_display.verticalScrollBar().value() if preserve_scroll else 0
         offset_scroll_pos = self.offset_display.verticalScrollBar().value() if preserve_scroll else 0
         ascii_scroll_pos = self.ascii_display.verticalScrollBar().value() if preserve_scroll else 0
-
-        self.offset_display.clear()
-        self.hex_display.clear()
-        self.ascii_display.clear()
 
         offset_lines = []
         hex_lines = []
@@ -3183,10 +4947,6 @@ class HexEditorQt(QMainWindow):
             context_rows = self.max_initial_rows // 2
             start_row = max(0, cursor_row - context_rows)
             end_row = min(total_rows, start_row + self.max_initial_rows)
-            # Adjust start if we're near the end
-            if end_row == total_rows:
-                start_row = max(0, end_row - self.max_initial_rows)
-
             start_byte = start_row * self.bytes_per_row
             end_byte = min(len(file_data), end_row * self.bytes_per_row)
         else:
@@ -3225,9 +4985,9 @@ class HexEditorQt(QMainWindow):
             offset_lines.append(offset_line)
 
             # Hex - build plain text row with leading spaces for alignment
-            hex_row = "  "  # Add 2 leading spaces to align with header
-            for j, byte in enumerate(row_data):
-                hex_row += f"{byte:02X} "
+            hex_row = "  " + bytes(row_data).hex(" ").upper()
+            if hex_row != "  ":
+                hex_row += " "
 
             # Pad with spaces if row is incomplete
             if len(row_data) < self.bytes_per_row:
@@ -3236,17 +4996,7 @@ class HexEditorQt(QMainWindow):
             hex_lines.append(hex_row.rstrip())
 
             # ASCII - build plain text row
-            ascii_row = ""
-            for j, byte in enumerate(row_data):
-                # Show extended ASCII (160-255) always enabled
-                # Control characters (0x00-0x1F, 0x7F-0x9F) displayed as dots
-                if 32 <= byte <= 126:
-                    char = chr(byte)
-                elif 160 <= byte <= 255:
-                    char = chr(byte)
-                else:
-                    char = '.'
-                ascii_row += char
+            ascii_row = ''.join(self._ascii_chars[byte] for byte in row_data)
 
             # Pad with spaces if row is incomplete
             if len(row_data) < self.bytes_per_row:
@@ -3275,9 +5025,17 @@ class HexEditorQt(QMainWindow):
         hex_text = '\n'.join(hex_lines)
         ascii_text = '\n'.join(ascii_lines)
 
-        self.offset_display.setPlainText(offset_text_clean)
-        self.hex_display.setPlainText(hex_text)
-        self.ascii_display.setPlainText(ascii_text)
+        self.offset_display.setUpdatesEnabled(False)
+        self.hex_display.setUpdatesEnabled(False)
+        self.ascii_display.setUpdatesEnabled(False)
+        try:
+            self.offset_display.setPlainText(offset_text_clean)
+            self.hex_display.setPlainText(hex_text)
+            self.ascii_display.setPlainText(ascii_text)
+        finally:
+            self.offset_display.setUpdatesEnabled(True)
+            self.hex_display.setUpdatesEnabled(True)
+            self.ascii_display.setUpdatesEnabled(True)
 
         # Apply color formatting to marked lines without changing size
         highlight_format = QTextCharFormat()
@@ -3306,30 +5064,57 @@ class HexEditorQt(QMainWindow):
         fmt.setAlignment(Qt.AlignCenter)
         cursor.mergeBlockFormat(fmt)
 
-        # Apply formatting after setting plain text
-        self.apply_hex_formatting(current_file)
+        # Apply formatting only if there's something to format
+        # Skip expensive formatting on initial file load when nothing needs formatting
+        needs_formatting = self.needs_hex_formatting(current_file)
+
+        formatting_applied = False
+        if apply_formatting and needs_formatting and not preserve_scroll:
+            self.apply_hex_formatting(current_file)
+            formatting_applied = True
 
         # Restore scroll position if preserving
         if preserve_scroll:
             self.hex_display.verticalScrollBar().setValue(hex_scroll_pos)
             self.offset_display.verticalScrollBar().setValue(offset_scroll_pos)
             self.ascii_display.verticalScrollBar().setValue(ascii_scroll_pos)
+            if apply_formatting and needs_formatting:
+                self.apply_hex_formatting(current_file)
+                formatting_applied = True
 
-        self.update_cursor_highlight()
+        self.update_cursor_highlight(refresh_formatting=apply_formatting and not formatting_applied)
         self.update_edit_box_overlay()  # Update edit box if active
-        self.data_inspector.update()
+        if update_side_panels:
+            self.data_inspector.update()
         self.update_status()
-        self.update_tab_title()
+        if update_side_panels:
+            self.update_tab_title()
 
         # Update navigation scrollbar to represent full file
         self.update_nav_scrollbar_range(0, 0)
 
         # Update signature pointer overlays
-        self.update_signature_overlays()
+        if update_side_panels:
+            self.update_signature_overlays()
 
         # Update fields tree
-        if hasattr(self, 'fields_widget'):
+        if (update_side_panels and
+            hasattr(self, 'fields_widget') and
+            hasattr(self, 'right_panel_tabs') and
+            self.right_panel_tabs.currentWidget() == self.fields_widget and
+            any(field.tab_index == self.current_tab_index for field in self.fields_widget.fields)):
             self.fields_widget.rebuild_tree()
+
+    def needs_hex_formatting(self, current_file):
+        return bool(
+            self.hidden_delimiters or
+            current_file.byte_highlights or
+            current_file.modified_bytes or
+            current_file.inserted_bytes or
+            current_file.replaced_bytes or
+            current_file.search_results or
+            self.selection_start is not None
+        )
 
     def scroll_to_offset(self, offset, center=True):
         """Scroll the hex display to show the given offset, using proper QTextEdit scrolling"""
@@ -3399,25 +5184,41 @@ class HexEditorQt(QMainWindow):
         # Update navigation scrollbar to reflect new position
         self.update_nav_scrollbar_position()
 
-    def apply_hex_formatting(self, current_file):
+    def apply_hex_formatting(self, current_file, clear_existing=True):
         """Apply colors and cursor highlighting to the hex and ASCII displays - optimized"""
-        # Clear all existing formatting first
         hex_cursor = self.hex_display.textCursor()
-        hex_cursor.select(QTextCursor.Document)
-        hex_cursor.setCharFormat(QTextCharFormat())
-        hex_cursor.clearSelection()
-
         ascii_cursor = self.ascii_display.textCursor()
-        ascii_cursor.select(QTextCursor.Document)
-        ascii_cursor.setCharFormat(QTextCharFormat())
-        ascii_cursor.clearSelection()
+
+        if clear_existing:
+            # Full clears are expensive, so avoid them during plain viewport scrolling.
+            hex_cursor.select(QTextCursor.Document)
+            hex_cursor.setCharFormat(QTextCharFormat())
+            hex_cursor.clearSelection()
+
+            ascii_cursor.select(QTextCursor.Document)
+            ascii_cursor.setCharFormat(QTextCharFormat())
+            ascii_cursor.clearSelection()
+
+        # Limit formatting to the viewport plus a small row buffer. Formatting the
+        # entire rendered window is expensive when delimiter/highlight density is high.
+        rendered_start = self.rendered_start_byte
+        rendered_end = min(self.rendered_end_byte, len(current_file.file_data))
+        line_height = max(1, self.hex_display.fontMetrics().height())
+        scroll_row = self.hex_display.verticalScrollBar().value() // line_height
+        viewport_rows = max(1, self.hex_display.viewport().height() // line_height)
+        buffer_rows = 24
+        visible_row_start = max(0, scroll_row - buffer_rows)
+        visible_row_end = scroll_row + viewport_rows + buffer_rows + 1
+        visible_start = max(rendered_start, rendered_start + visible_row_start * self.bytes_per_row)
+        visible_end = min(rendered_end, rendered_start + visible_row_end * self.bytes_per_row)
 
         # Apply delimiter grey-out first (if any delimiters are configured)
         if self.hidden_delimiters:
             # Get theme foreground color and make it paler
             theme_colors = get_theme_colors(self.current_theme)
+            surfaces = get_theme_surface_colors(theme_colors)
             foreground_color = QColor(theme_colors['editor_fg'])
-            background_color = QColor(theme_colors['editor_bg'])
+            background_color = QColor(surfaces.get("control", theme_colors.get('background', '#000000')))
 
             # Blend foreground with background to create a paler color (30% foreground, 70% background)
             pale_color = QColor(
@@ -3429,79 +5230,82 @@ class HexEditorQt(QMainWindow):
             delimiter_format = QTextCharFormat()
             delimiter_format.setForeground(pale_color)
 
-            # Track byte ranges to hide: list of (start_idx, end_idx)
             ranges_to_hide = []
+            file_len = len(current_file.file_data)
+            byte_index = visible_start
 
-            # Find delimiter patterns for each delimiter type
-            for delimiter_value, padding in self.hidden_delimiters.items():
-                byte_index = self.rendered_start_byte
+            while byte_index < visible_end:
+                byte_value = current_file.file_data[byte_index]
+                padding = self.hidden_delimiters.get(byte_value)
+                if not padding:
+                    byte_index += 1
+                    continue
 
-                while byte_index < min(self.rendered_end_byte, len(current_file.file_data)):
-                    byte_value = current_file.file_data[byte_index]
+                padding = max(1, int(padding))
+                if padding == 1:
+                    ranges_to_hide.append((byte_index, byte_index + 1))
+                    byte_index += 1
+                    continue
 
-                    if byte_value == delimiter_value:
-                        # Check if we have 'padding' consecutive delimiter bytes
-                        seq_start = byte_index
-                        seq_count = 0
+                pos_in_row = byte_index % self.bytes_per_row
+                if pos_in_row % padding != 0 or (byte_index + padding - 1) % self.bytes_per_row < pos_in_row:
+                    byte_index += 1
+                    continue
 
-                        # Count consecutive delimiter bytes
-                        while (seq_start + seq_count < len(current_file.file_data) and
-                               current_file.file_data[seq_start + seq_count] == delimiter_value and
-                               seq_count < padding):
-                            seq_count += 1
-
-                        # Check if we have exactly 'padding' consecutive bytes
-                        if seq_count == padding:
-                            # For padding > 1, check alignment within row
-                            if padding > 1:
-                                pos_in_row = byte_index % self.bytes_per_row
-
-                                # Check if aligned to segment boundary
-                                if pos_in_row % padding == 0:
-                                    # Check that sequence doesn't span row boundary
-                                    end_pos_in_row = (byte_index + padding - 1) % self.bytes_per_row
-                                    if end_pos_in_row >= pos_in_row:  # Same row
-                                        ranges_to_hide.append((byte_index, byte_index + padding))
-                                        byte_index += padding
-                                        continue
-                            else:
-                                # Padding 1: hide any single delimiter
-                                ranges_to_hide.append((byte_index, byte_index + 1))
-
+                end = byte_index + padding
+                if end <= file_len and all(current_file.file_data[pos] == byte_value for pos in range(byte_index, end)):
+                    ranges_to_hide.append((byte_index, end))
+                    byte_index = end
+                else:
                     byte_index += 1
 
-            # Apply grey-out to all bytes in marked ranges
-            for start_idx, end_idx in ranges_to_hide:
-                for idx in range(start_idx, end_idx):
-                    # Skip if outside rendered range
-                    if idx < self.rendered_start_byte or idx >= min(self.rendered_end_byte, len(current_file.file_data)):
-                        continue
+            if ranges_to_hide:
+                ranges_to_hide.sort()
+                merged_ranges = []
+                for start_idx, end_idx in ranges_to_hide:
+                    if merged_ranges and start_idx <= merged_ranges[-1][1]:
+                        merged_ranges[-1] = (merged_ranges[-1][0], max(merged_ranges[-1][1], end_idx))
+                    else:
+                        merged_ranges.append((start_idx, end_idx))
 
-                    # Calculate display positions
-                    row_num = (idx - self.rendered_start_byte) // self.bytes_per_row
-                    j = idx % self.bytes_per_row
-                    hex_chars_per_row = self.bytes_per_row * 3 + 2
-                    hex_pos = row_num * hex_chars_per_row + 2 + (j * 3)
-                    ascii_chars_per_row = self.bytes_per_row + 1
-                    ascii_pos = row_num * ascii_chars_per_row + j
+                hex_chars_per_row = self.bytes_per_row * 3 + 2
+                ascii_chars_per_row = self.bytes_per_row + 1
 
-                    # Apply grey color to hex display
-                    hex_cursor.setPosition(hex_pos)
-                    hex_cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 2)
-                    hex_cursor.mergeCharFormat(delimiter_format)
+                for start_idx, end_idx in merged_ranges:
+                    segment_start = max(start_idx, visible_start)
+                    segment_end = min(end_idx, visible_end)
+                    while segment_start < segment_end:
+                        row_start = (segment_start // self.bytes_per_row) * self.bytes_per_row
+                        row_end = min(row_start + self.bytes_per_row, segment_end)
+                        row_num = (segment_start - self.rendered_start_byte) // self.bytes_per_row
+                        col = segment_start % self.bytes_per_row
+                        count = row_end - segment_start
 
-                    # Apply grey color to ASCII display
-                    ascii_cursor.setPosition(ascii_pos)
-                    ascii_cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 1)
-                    ascii_cursor.mergeCharFormat(delimiter_format)
+                        hex_pos = row_num * hex_chars_per_row + 2 + (col * 3)
+                        hex_len = (count - 1) * 3 + 2
+                        ascii_pos = row_num * ascii_chars_per_row + col
 
-        # Format for cursor
+                        hex_cursor.setPosition(hex_pos)
+                        hex_cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, hex_len)
+                        hex_cursor.mergeCharFormat(delimiter_format)
+
+                        ascii_cursor.setPosition(ascii_pos)
+                        ascii_cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, count)
+                        ascii_cursor.mergeCharFormat(delimiter_format)
+
+                        segment_start = row_end
+
+        theme_colors = get_theme_colors(self.current_theme)
+
+        # Format for cursor/byte hover
         cursor_format = QTextCharFormat()
-        if self.is_dark_theme():
-            cursor_format.setBackground(QColor(64, 64, 64))
-        else:
-            cursor_format.setBackground(QColor(200, 220, 255))
-        cursor_format.setProperty(QTextFormat.OutlinePen, QPen(QColor(0, 255, 0), 2))
+        hover_color = QColor(theme_colors.get('byte_hover', theme_colors.get('selection_bg', '#404040')))
+        if not hover_color.isValid():
+            hover_color = QColor(64, 64, 64) if self.is_dark_theme() else QColor(200, 220, 255)
+        if hover_color.alpha() == 255:
+            hover_color.setAlpha(150)
+        cursor_format.setBackground(hover_color)
+        cursor_format.setProperty(QTextFormat.OutlinePen, QPen(QColor(theme_colors.get('grid_line', '#00ff00')), 2))
 
         # Format for modified bytes (red)
         modified_format = QTextCharFormat()
@@ -3515,6 +5319,13 @@ class HexEditorQt(QMainWindow):
         replaced_format = QTextCharFormat()
         replaced_format.setForeground(QColor(33, 150, 243))
 
+        # Format for search results (orange/yellow background with opacity)
+        search_result_format = QTextCharFormat()
+        if self.is_dark_theme():
+            search_result_format.setBackground(QColor(180, 120, 0, 100))  # Dark orange with opacity
+        else:
+            search_result_format.setBackground(QColor(255, 200, 0, 100))  # Bright yellow/orange with opacity
+
         # Format for selection
         selection_format = QTextCharFormat()
         if self.is_dark_theme():
@@ -3522,10 +5333,9 @@ class HexEditorQt(QMainWindow):
         else:
             selection_format.setBackground(QColor(173, 216, 230))
 
-        # Helper function to calculate positions (relative to rendered window)
         def get_positions(byte_index):
             # Calculate row relative to the rendered window, not absolute file position
-            if byte_index < self.rendered_start_byte or byte_index >= self.rendered_end_byte:
+            if byte_index < visible_start or byte_index >= visible_end:
                 return None, None  # Byte is outside rendered range
             row_num = (byte_index - self.rendered_start_byte) // self.bytes_per_row
             j = byte_index % self.bytes_per_row
@@ -3538,21 +5348,34 @@ class HexEditorQt(QMainWindow):
         # Collect all bytes that need formatting
         bytes_to_format = set()
 
-        # Add highlighted bytes
-        bytes_to_format.update(current_file.byte_highlights.keys())
+        # Add visible highlighted bytes only
+        if current_file.byte_highlights:
+            for byte_index in range(visible_start, visible_end):
+                if byte_index in current_file.byte_highlights:
+                    bytes_to_format.add(byte_index)
 
         # Don't add signature pointer bytes to formatting (overlays handle display)
         # for pointer in self.signature_widget.pointers:
         #     bytes_to_format.update(range(pointer.offset, pointer.offset + pointer.length))
 
         # Add modified bytes
-        bytes_to_format.update(current_file.modified_bytes)
-        bytes_to_format.update(current_file.inserted_bytes)
-        bytes_to_format.update(current_file.replaced_bytes)
+        bytes_to_format.update(i for i in current_file.modified_bytes if visible_start <= i < visible_end)
+        bytes_to_format.update(i for i in current_file.inserted_bytes if visible_start <= i < visible_end)
+        bytes_to_format.update(i for i in current_file.replaced_bytes if visible_start <= i < visible_end)
+
+        # Add search result bytes
+        visible_search_bytes = set()
+        for offset, length in current_file.search_results:
+            start = max(offset, visible_start)
+            end = min(offset + length, visible_end)
+            if start < end:
+                visible_search_bytes.update(range(start, end))
+        bytes_to_format.update(visible_search_bytes)
 
         # Add cursor position
         if self.cursor_position is not None:
-            bytes_to_format.add(self.cursor_position)
+            if visible_start <= self.cursor_position < visible_end:
+                bytes_to_format.add(self.cursor_position)
 
         # Add selection range
         if self.selection_start is not None and self.selection_end is not None:
@@ -3561,24 +5384,27 @@ class HexEditorQt(QMainWindow):
 
             # Handle column selection mode differently
             if self.column_selection_mode and self.column_sel_start_row is not None:
-                # Only highlight bytes in the column range
+                # Only queue visible bytes inside the column-selection rectangle.
                 min_row = min(self.column_sel_start_row, self.column_sel_end_row)
                 max_row = max(self.column_sel_start_row, self.column_sel_end_row)
                 min_col = min(self.column_sel_start_col, self.column_sel_end_col)
                 max_col = max(self.column_sel_start_col, self.column_sel_end_col)
 
-                for row in range(min_row, max_row + 1):
+                visible_start_row = visible_start // self.bytes_per_row
+                visible_end_row = (visible_end + self.bytes_per_row - 1) // self.bytes_per_row
+                for row in range(max(min_row, visible_start_row), min(max_row, visible_end_row - 1) + 1):
                     for col in range(min_col, max_col + 1):
                         byte_index = row * self.bytes_per_row + col
                         if byte_index < len(current_file.file_data):
-                            bytes_to_format.add(byte_index)
+                            if visible_start <= byte_index < visible_end:
+                                bytes_to_format.add(byte_index)
             else:
                 # Normal linear selection
-                bytes_to_format.update(range(sel_start, sel_end + 1))
+                bytes_to_format.update(range(max(sel_start, visible_start), min(sel_end + 1, visible_end)))
 
         # Only format bytes that need it
         for byte_index in bytes_to_format:
-            if byte_index >= len(current_file.file_data):
+            if byte_index < visible_start or byte_index >= visible_end:
                 continue
 
             hex_pos, ascii_pos = get_positions(byte_index)
@@ -3596,9 +5422,7 @@ class HexEditorQt(QMainWindow):
 
                 user_highlight_format = QTextCharFormat()
                 if highlight_info.get("underline", False):
-                    user_highlight_format.setUnderlineStyle(QTextCharFormat.WaveUnderline)
-                    user_highlight_format.setUnderlineColor(highlight_color)
-                    user_highlight_format.setFontUnderline(True)
+                    pass
                 else:
                     user_highlight_format.setBackground(highlight_color)
 
@@ -3612,7 +5436,20 @@ class HexEditorQt(QMainWindow):
 
             # Signature pointer formatting removed - overlays handle display
 
-            # Apply color for modified bytes
+            # Check if byte is part of a search result
+            is_search_result = byte_index in visible_search_bytes
+
+            # Apply search result highlighting (lower priority than modifications)
+            if is_search_result:
+                hex_cursor.setPosition(hex_pos)
+                hex_cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 2)
+                hex_cursor.mergeCharFormat(search_result_format)
+
+                ascii_cursor.setPosition(ascii_pos)
+                ascii_cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 1)
+                ascii_cursor.mergeCharFormat(search_result_format)
+
+            # Apply color for modified bytes (higher priority, overrides search results)
             if byte_index in current_file.modified_bytes:
                 hex_cursor.setPosition(hex_pos)
                 hex_cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 2)
@@ -3648,7 +5485,7 @@ class HexEditorQt(QMainWindow):
                 should_highlight = False
 
                 if self.column_selection_mode and self.column_sel_start_row is not None:
-                    # Column selection - check if byte is in the selected column range
+                    # Column selection - check the actual rectangular bounds.
                     min_row = min(self.column_sel_start_row, self.column_sel_end_row)
                     max_row = max(self.column_sel_start_row, self.column_sel_end_row)
                     min_col = min(self.column_sel_start_col, self.column_sel_end_col)
@@ -3696,6 +5533,9 @@ class HexEditorQt(QMainWindow):
                 ascii_cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 1)
                 ascii_cursor.mergeCharFormat(cursor_format)
 
+        if hasattr(self, 'highlight_underline_overlay'):
+            self.highlight_underline_overlay.update()
+
     def clear_display(self):
         self.offset_display.clear()
         self.hex_display.clear()
@@ -3719,40 +5559,36 @@ class HexEditorQt(QMainWindow):
         total_rows = (len(file_data) + self.bytes_per_row - 1) // self.bytes_per_row
 
         # Update the logical top row
-        self.current_top_row = max(0, min(total_rows - 1, self.current_top_row + num_rows))
+        max_top_row = max(0, total_rows - 1)
+        self.current_top_row = max(0, min(max_top_row, self.current_top_row + num_rows))
 
-        # Check if we need to re-render (if we're outside the current window)
         rendered_start_row = self.rendered_start_byte // self.bytes_per_row
         rendered_end_row = self.rendered_end_byte // self.bytes_per_row
 
-        # If scrolling outside the rendered window, trigger re-render
-        if (self.current_top_row < rendered_start_row or
-            self.current_top_row >= rendered_end_row or
-            total_rows <= self.max_initial_rows):
+        line_height = self.hex_display.fontMetrics().height()
+        scrollbar = self.hex_display.verticalScrollBar()
 
-            # For small files, just scroll the viewport
-            if total_rows <= self.max_initial_rows:
-                line_height = self.hex_display.fontMetrics().height()
-                scrollbar = self.hex_display.verticalScrollBar()
-                new_value = self.current_top_row * line_height
-                scrollbar.setValue(new_value)
-            else:
-                # For large files, re-render around the new position
-                self.render_at_row(self.current_top_row)
+        if total_rows <= self.max_initial_rows:
+            scrollbar.setValue(self.current_top_row * line_height)
         else:
-            # Just scroll within the current window
-            line_height = self.hex_display.fontMetrics().height()
-            scrollbar = self.hex_display.verticalScrollBar()
+            visible_rows = max(20, self.hex_display.viewport().height() // max(1, line_height))
+            margin = max(visible_rows * 2, self.render_recenter_margin)
+            near_top = self.current_top_row - rendered_start_row < margin
+            near_bottom = rendered_end_row - self.current_top_row < margin
 
-            # Calculate the scrollbar value for the desired row within the rendered window
-            row_in_window = self.current_top_row - rendered_start_row
-            new_value = row_in_window * line_height
-            scrollbar.setValue(new_value)
+            if (self.current_top_row < rendered_start_row or
+                self.current_top_row >= rendered_end_row or
+                near_top or near_bottom):
+                self.render_at_row(self.current_top_row, update_side_panels=False)
+            else:
+                row_in_window = self.current_top_row - rendered_start_row
+                scrollbar.setValue(row_in_window * line_height)
+                self.update_visible_overlays(scrollbar.value())
 
         # Update navigation scrollbar to reflect new position
         self.update_nav_scrollbar_position()
 
-    def render_at_row(self, target_row, center=False):
+    def render_at_row(self, target_row, center=False, update_side_panels=True):
         """Re-render the display with target row visible"""
         if self.current_tab_index < 0:
             return
@@ -3761,16 +5597,17 @@ class HexEditorQt(QMainWindow):
         file_data = current_file.file_data
         total_rows = (len(file_data) + self.bytes_per_row - 1) // self.bytes_per_row
 
-        # Calculate new render window centered on target row
+        # Calculate new render window. At EOF, anchor the target row at the top
+        # and rely on display padding for the HxD-style empty space below.
         window_size = self.max_initial_rows
         half_window = window_size // 2
 
-        new_start_row = max(0, target_row - half_window)
+        visible_rows = max(1, self.hex_display.viewport().height() // max(1, self.hex_display.fontMetrics().height()))
+        if target_row >= max(0, total_rows - visible_rows):
+            new_start_row = target_row
+        else:
+            new_start_row = max(0, target_row - half_window)
         new_end_row = min(total_rows, new_start_row + window_size)
-
-        # Adjust if we're near the end
-        if new_end_row == total_rows:
-            new_start_row = max(0, new_end_row - window_size)
 
         new_start_byte = new_start_row * self.bytes_per_row
         new_end_byte = min(len(file_data), new_end_row * self.bytes_per_row)
@@ -3780,7 +5617,7 @@ class HexEditorQt(QMainWindow):
         self.rendered_end_byte = new_end_byte
 
         # Re-render
-        self.display_hex(preserve_scroll=False)
+        self.display_hex(preserve_scroll=False, update_side_panels=update_side_panels, apply_formatting=False)
 
         # Set scrollbar position
         line_height = self.hex_display.fontMetrics().height()
@@ -3805,112 +5642,39 @@ class HexEditorQt(QMainWindow):
 
         # Update navigation scrollbar to reflect new position
         self.update_nav_scrollbar_position()
+        self.update_visible_overlays(scrollbar.value())
+        if self.needs_hex_formatting(current_file):
+            self.apply_hex_formatting(current_file, clear_existing=False)
 
-    def on_scroll(self, value):
-        """Handle scroll events with minimal debouncing for responsiveness"""
-        # Store the scroll position and restart the timer
-        self.pending_scroll_position = value
-        self.scroll_timer.start(50)  # Wait 50ms after scroll stops for immediate response
-
-        # Update overlay positions immediately during scroll for smooth tracking
-        if hasattr(self, 'signature_overlays'):
-            scroll_value = value
-            font_metrics = self.hex_display.fontMetrics()
-            line_height = font_metrics.height()
-
-            for overlay in self.signature_overlays:
-                try:
-                    # Get the pointer associated with this overlay
-                    pointer = overlay.pointer
-                    row_in_rendered = (pointer.offset - self.rendered_start_byte) // self.bytes_per_row
-
-                    # Update Y position based on scroll
-                    y_pos = 2 + row_in_rendered * line_height - scroll_value
-
-                    # Move the overlay to new position
-                    overlay.move(overlay.x(), int(y_pos))
-                except:
-                    pass
-
-    def on_scroll_stopped(self):
-        """Called when scrolling has stopped - update the display window"""
-        if self.current_tab_index < 0 or self.pending_scroll_position is None:
+    def update_visible_overlays(self, scroll_value=None):
+        """Move active overlays with the viewport without rebuilding them."""
+        if not hasattr(self, 'signature_overlays'):
             return
 
-        current_file = self.open_files[self.current_tab_index]
-        file_data = current_file.file_data
-        total_rows = (len(file_data) + self.bytes_per_row - 1) // self.bytes_per_row
+        if scroll_value is None:
+            scroll_value = self.hex_display.verticalScrollBar().value()
 
-        # Only do dynamic loading for large files
-        if total_rows <= self.max_initial_rows:
-            # Update current_top_row for small files
-            line_height = self.hex_display.fontMetrics().height()
-            if line_height > 0:
-                self.current_top_row = self.pending_scroll_position // line_height
-            self.pending_scroll_position = None
-            # Update overlays after scrolling stops
-            self.update_signature_overlays()
-            return
+        if hasattr(self, 'highlight_underline_overlay'):
+            self.highlight_underline_overlay.update()
 
-        scrollbar = self.hex_display.verticalScrollBar()
-
-        # Calculate which row is currently at the top of the viewport
         line_height = self.hex_display.fontMetrics().height()
-        rendered_start_row = self.rendered_start_byte // self.bytes_per_row
-
-        if line_height > 0:
-            row_in_window = self.pending_scroll_position // line_height
-            self.current_top_row = rendered_start_row + row_in_window
-
-        max_scroll = scrollbar.maximum()
-        if max_scroll == 0:
-            self.pending_scroll_position = None
-            return
-
-        # Define sliding window: keep max_initial_rows around current position
-        window_size = self.max_initial_rows
-        half_window = window_size // 2
-
-        # Calculate new render window
-        new_start_row = max(0, self.current_top_row - half_window)
-        new_end_row = min(total_rows, new_start_row + window_size)
-
-        # Adjust if we're near the end
-        if new_end_row == total_rows:
-            new_start_row = max(0, new_end_row - window_size)
-
-        new_start_byte = new_start_row * self.bytes_per_row
-        new_end_byte = min(len(file_data), new_end_row * self.bytes_per_row)
-
-        # Only re-render if window changed significantly (more than 20% of window)
-        threshold_rows = window_size // 5
-        current_start_row = self.rendered_start_byte // self.bytes_per_row
-        current_end_row = self.rendered_end_byte // self.bytes_per_row
-
-        if (abs(new_start_row - current_start_row) > threshold_rows or
-            abs(new_end_row - current_end_row) > threshold_rows):
-
-            self.rendered_start_byte = new_start_byte
-            self.rendered_end_byte = new_end_byte
-
-            # Re-render with new window
-            self.display_hex(preserve_scroll=False)
-
-            # Restore position to show current_top_row at the top
-            row_in_window = self.current_top_row - new_start_row
-            scrollbar.setValue(row_in_window * line_height)
-
-        self.pending_scroll_position = None
-
-        # Update overlays after scrolling stops
-        self.update_signature_overlays()
-
-        # Update navigation scrollbar to reflect current position
-        self.update_nav_scrollbar_position()
+        for overlay in self.signature_overlays:
+            try:
+                pointer = overlay.pointer
+                row_in_rendered = (pointer.offset - self.rendered_start_byte) // self.bytes_per_row
+                y_pos = 2 + row_in_rendered * line_height - scroll_value
+                overlay.move(overlay.x(), int(y_pos))
+            except RuntimeError:
+                pass
+            except Exception:
+                pass
 
     def on_hex_click(self, event):
         if self.current_tab_index < 0:
             return
+
+        # Track that hex display was clicked
+        self.last_clicked_display = 'hex'
 
         current_file = self.open_files[self.current_tab_index]
 
@@ -3969,6 +5733,7 @@ class HexEditorQt(QMainWindow):
             if event.modifiers() & Qt.ControlModifier:
                 # Start column selection mode
                 self.column_selection_mode = True
+                self.clear_native_text_selections()
                 self.column_sel_start_row = absolute_row
                 self.column_sel_start_col = byte_in_row
                 self.column_sel_end_row = absolute_row
@@ -3985,6 +5750,7 @@ class HexEditorQt(QMainWindow):
             # Start selection on click
             self.selection_start = byte_index
             self.selection_end = byte_index
+            self._last_drag_selection_byte = byte_index
 
             print(f"Hex click: line={line}, col={col}, byte_in_row={byte_in_row}, byte_index={byte_index}")
             # Just update cursor/selection highlighting, don't redraw everything
@@ -3996,6 +5762,9 @@ class HexEditorQt(QMainWindow):
     def on_ascii_click(self, event):
         if self.current_tab_index < 0:
             return
+
+        # Track that ASCII display was clicked
+        self.last_clicked_display = 'ascii'
 
         current_file = self.open_files[self.current_tab_index]
 
@@ -4038,6 +5807,7 @@ class HexEditorQt(QMainWindow):
             if event.modifiers() & Qt.ControlModifier:
                 # Start column selection mode
                 self.column_selection_mode = True
+                self.clear_native_text_selections()
                 self.column_sel_start_row = absolute_row
                 self.column_sel_start_col = col
                 self.column_sel_end_row = absolute_row
@@ -4054,6 +5824,7 @@ class HexEditorQt(QMainWindow):
             # Start selection on click
             self.selection_start = byte_index
             self.selection_end = byte_index
+            self._last_drag_selection_byte = byte_index
 
             print(f"ASCII click: line={line}, col={col}, byte_index={byte_index}, cursor_pos={self.cursor_position}")
             # Just update cursor/selection highlighting, don't redraw everything
@@ -4086,7 +5857,11 @@ class HexEditorQt(QMainWindow):
             # Handle drag selection - check if left mouse button is pressed
             if event.buttons() & Qt.LeftButton:
                 if self.selection_start is not None and byte_index < len(current_file.file_data):
+                    if byte_index == self._last_drag_selection_byte:
+                        return
+                    self._last_drag_selection_byte = byte_index
                     if self.column_selection_mode:
+                        self.clear_native_text_selections()
                         # Update column selection end position
                         self.column_sel_end_row = absolute_row
                         self.column_sel_end_col = byte_col
@@ -4100,20 +5875,20 @@ class HexEditorQt(QMainWindow):
                         # Set selection bounds to encompass the column range
                         self.selection_start = min_row * self.bytes_per_row + min_col
                         self.selection_end = max_row * self.bytes_per_row + max_col
-                        print(f"Column drag: rows {min_row}-{max_row}, cols {min_col}-{max_col}")
                     else:
                         # Normal linear selection
                         self.selection_end = byte_index
 
                     self.cursor_position = byte_index
-                    self.display_hex(preserve_scroll=True)
+                    self.update_cursor_highlight()
                     self.update_status()
 
             # Show tooltip for highlighted bytes
             if byte_index in current_file.byte_highlights and byte_index < len(current_file.file_data):
-                message = current_file.byte_highlights[byte_index].get("message", "")
+                highlight_info = current_file.byte_highlights[byte_index]
+                message = highlight_info.get("message", "")
                 if message:
-                    QToolTip.showText(event.globalPos(), message, self.hex_display)
+                    self.show_highlight_tooltip(event.globalPos(), message, highlight_info, self.hex_display)
                 else:
                     QToolTip.hideText()
             else:
@@ -4141,7 +5916,11 @@ class HexEditorQt(QMainWindow):
             # Handle drag selection - check if left mouse button is pressed
             if event.buttons() & Qt.LeftButton:
                 if self.selection_start is not None and byte_index < len(current_file.file_data):
+                    if byte_index == self._last_drag_selection_byte:
+                        return
+                    self._last_drag_selection_byte = byte_index
                     if self.column_selection_mode:
+                        self.clear_native_text_selections()
                         # Update column selection end position
                         self.column_sel_end_row = absolute_row
                         self.column_sel_end_col = col
@@ -4155,24 +5934,40 @@ class HexEditorQt(QMainWindow):
                         # Set selection bounds to encompass the column range
                         self.selection_start = min_row * self.bytes_per_row + min_col
                         self.selection_end = max_row * self.bytes_per_row + max_col
-                        print(f"Column drag: rows {min_row}-{max_row}, cols {min_col}-{max_col}")
                     else:
                         # Normal linear selection
                         self.selection_end = byte_index
 
                     self.cursor_position = byte_index
-                    self.display_hex(preserve_scroll=True)
+                    self.update_cursor_highlight()
                     self.update_status()
 
             # Show tooltip for highlighted bytes
             if byte_index in current_file.byte_highlights and byte_index < len(current_file.file_data):
-                message = current_file.byte_highlights[byte_index].get("message", "")
+                highlight_info = current_file.byte_highlights[byte_index]
+                message = highlight_info.get("message", "")
                 if message:
-                    QToolTip.showText(event.globalPos(), message, self.ascii_display)
+                    self.show_highlight_tooltip(event.globalPos(), message, highlight_info, self.ascii_display)
                 else:
                     QToolTip.hideText()
             else:
                 QToolTip.hideText()
+
+    def show_highlight_tooltip(self, global_pos, message, highlight_info, widget):
+        """Show highlight tooltips using the same color as the highlighted bytes."""
+        theme_colors = get_theme_colors(self.current_theme)
+        bg_color = QColor(get_theme_surface_colors(theme_colors).get("control", theme_colors.get('background', '#000000')))
+        fg_color = QColor(highlight_info.get("color", theme_colors.get('editor_fg', '#ffffff')))
+        border_color = QColor(fg_color)
+        border_color.setAlpha(180)
+
+        palette = QPalette()
+        palette.setColor(QPalette.ToolTipBase, bg_color)
+        palette.setColor(QPalette.ToolTipText, fg_color)
+        QToolTip.setPalette(palette)
+        escaped_message = html.escape(message).replace("\n", "<br>")
+        colored_message = f'<span style="color: {fg_color.name()};">{escaped_message}</span>'
+        QToolTip.showText(global_pos, colored_message, widget)
 
     def on_hex_right_click(self, event):
         menu = QMenu(self)
@@ -4239,7 +6034,7 @@ class HexEditorQt(QMainWindow):
             self.display_hex(preserve_scroll=True)
             self.scroll_to_offset(byte_offset, center=True)
 
-    def update_cursor_highlight(self):
+    def update_cursor_highlight(self, refresh_formatting=True):
         """Update only the cursor and selection highlighting without redrawing text"""
         if self.current_tab_index < 0:
             return
@@ -4254,18 +6049,25 @@ class HexEditorQt(QMainWindow):
                 print(f"Edit box deactivated - cursor moved to {self.cursor_position} outside range [{self.edit_box_start}, {self.edit_box_end}]")
 
         current_file = self.open_files[self.current_tab_index]
-        self.apply_hex_formatting(current_file)
+        if refresh_formatting:
+            self.apply_hex_formatting(current_file)
 
     def on_hex_scroll(self, value):
         self.offset_display.verticalScrollBar().setValue(value)
         self.ascii_display.verticalScrollBar().setValue(value)
+        self.update_visible_overlays(value)
         # Don't sync nav scrollbar if we're in the middle of handling a nav scroll event
         # (prevents feedback loop that causes scrollbar to jump)
         if not self.in_nav_scroll:
-            # Sync navigation scrollbar (block signals to prevent loop)
-            self.hex_nav_scrollbar.blockSignals(True)
-            self.hex_nav_scrollbar.setValue(value)
-            self.hex_nav_scrollbar.blockSignals(False)
+            line_height = max(1, self.hex_display.fontMetrics().height())
+            rendered_start_row = self.rendered_start_byte // self.bytes_per_row
+            if self.current_tab_index >= 0 and self.open_files:
+                current_file = self.open_files[self.current_tab_index]
+                total_rows = (len(current_file.file_data) + self.bytes_per_row - 1) // self.bytes_per_row
+                self.current_top_row = max(0, min(max(0, total_rows - 1), rendered_start_row + (value // line_height)))
+            else:
+                self.current_top_row = max(0, rendered_start_row + (value // line_height))
+            self.update_nav_scrollbar_position()
 
     def on_nav_scroll(self, value):
         """Handle navigation scrollbar changes - represents full file, not just rendered portion"""
@@ -4285,7 +6087,7 @@ class HexEditorQt(QMainWindow):
             # Calculate which row should be at top based on scrollbar position
             max_scroll = self.hex_nav_scrollbar.maximum()
             if max_scroll > 0:
-                target_row = int((value / max_scroll) * total_rows)
+                target_row = int(round((value / max_scroll) * max(0, total_rows - 1)))
                 target_row = max(0, min(total_rows - 1, target_row))
 
                 # Use the row-based scrolling system
@@ -4298,13 +6100,14 @@ class HexEditorQt(QMainWindow):
                         rendered_end_row = self.rendered_end_byte // self.bytes_per_row
 
                         if target_row < rendered_start_row or target_row >= rendered_end_row:
-                            self.render_at_row(target_row, center=False)
+                            self.render_at_row(target_row, center=False, update_side_panels=False)
                         else:
                             # Scroll within current window
                             line_height = self.hex_display.fontMetrics().height()
                             scrollbar = self.hex_display.verticalScrollBar()
                             row_in_window = target_row - rendered_start_row
                             scrollbar.setValue(row_in_window * line_height)
+                            self.update_visible_overlays(scrollbar.value())
                     else:
                         # Small file, just scroll the viewport
                         line_height = self.hex_display.fontMetrics().height()
@@ -4319,21 +6122,28 @@ class HexEditorQt(QMainWindow):
         if self.current_tab_index < 0:
             return
 
+        # While the user is dragging the overlay scrollbar, do not rebuild its
+        # range/page/value from render callbacks. Doing so makes the thumb fight
+        # the drag gesture and can snap back toward the top.
+        if getattr(self.hex_nav_scrollbar, 'dragging', False):
+            return
+
         current_file = self.open_files[self.current_tab_index]
         file_data = current_file.file_data
         total_rows = (len(file_data) + self.bytes_per_row - 1) // self.bytes_per_row
 
         self.hex_nav_scrollbar.blockSignals(True)
-        # Set range to represent full file (0 to total_rows in pixel units)
+        # Set range to represent full file top rows. The last row is allowed to
+        # sit near the top so the viewport can show empty space below it.
         # Use a large range for smooth scrolling
-        total_pixels = total_rows * 100  # Arbitrary multiplier for smooth scrolling
+        total_pixels = max(0, total_rows - 1) * 100  # Arbitrary multiplier for smooth scrolling
         self.hex_nav_scrollbar.setRange(0, total_pixels)
 
         # Set page step based on visible rows
         viewport_height = self.hex_display.viewport().height()
         line_height = self.hex_display.fontMetrics().height()
         visible_rows = viewport_height // line_height if line_height > 0 else 20
-        page_step = (visible_rows / total_rows * total_pixels) if total_rows > 0 else 100
+        page_step = (visible_rows / max(1, total_rows) * max(1, total_pixels)) if total_rows > 0 else 100
         self.hex_nav_scrollbar.setPageStep(int(page_step))
         self.hex_nav_scrollbar.blockSignals(False)
 
@@ -4343,6 +6153,11 @@ class HexEditorQt(QMainWindow):
     def update_nav_scrollbar_position(self):
         """Update the navigation scrollbar position to reflect current_top_row"""
         if self.current_tab_index < 0:
+            return
+
+        # The scrollbar already owns its visual value while being dragged.
+        # Syncing it here during render/scroll callbacks causes visible jumps.
+        if getattr(self.hex_nav_scrollbar, 'dragging', False):
             return
 
         current_file = self.open_files[self.current_tab_index]
@@ -4355,7 +6170,7 @@ class HexEditorQt(QMainWindow):
         # Calculate scrollbar position based on current_top_row
         max_scroll = self.hex_nav_scrollbar.maximum()
         if max_scroll > 0 and total_rows > 0:
-            ratio = self.current_top_row / total_rows
+            ratio = self.current_top_row / max(1, total_rows - 1)
             new_value = int(ratio * max_scroll)
 
             self.hex_nav_scrollbar.blockSignals(True)
@@ -4494,8 +6309,12 @@ class HexEditorQt(QMainWindow):
         # Calculate scroll offset
         scroll_value = self.hex_display.verticalScrollBar().value()
 
-        # Iterate through all signature pointers
-        for pointer in self.signature_widget.pointers:
+        # Iterate through all signature pointers plus field-driven overlays.
+        overlay_pointers = list(self.signature_widget.pointers)
+        if hasattr(self, 'fields_widget'):
+            overlay_pointers.extend(self.fields_widget.get_overlay_pointers(self.current_tab_index))
+
+        for pointer in overlay_pointers:
             # Check if pointer is in rendered range
             if pointer.offset < self.rendered_start_byte or pointer.offset >= self.rendered_end_byte:
                 continue
@@ -4542,11 +6361,15 @@ class HexEditorQt(QMainWindow):
             else:
                 value_str = str(pointer.value)
 
+            dtype_lower = pointer.data_type.lower()
+            is_color_pointer = dtype_lower in ("rgb24", "rgba32", "bgr24", "bgra32", "argb32", "abgr32", "hsv")
             overlay.setText(value_str)
             overlay.setFont(QFont("Courier", 10))
 
             # Make N/A values read-only
-            if str(pointer.value) == "N/A":
+            if is_color_pointer:
+                overlay.setReadOnly(True)
+            elif str(pointer.value) == "N/A":
                 overlay.setReadOnly(True)
             else:
                 overlay.setReadOnly(False)
@@ -4557,20 +6380,41 @@ class HexEditorQt(QMainWindow):
             button_color = theme_colors.get('button_bg', '#3e3e42')
             fg_color = theme_colors.get('foreground', '#d4d4d4')
 
-            overlay.setStyleSheet(f"""
-                QLineEdit {{
-                    background-color: {bg_color};
-                    border: 2px solid {button_color};
-                    padding: 0px;
-                    margin: 0px;
-                    color: {fg_color};
-                }}
-            """)
+            color_components = None
+            if is_color_pointer:
+                hex_bytes_for_color = current_file.file_data[pointer.offset:pointer.offset + pointer.length]
+                color_components = self.signature_widget.color_components_from_bytes(bytes(hex_bytes_for_color), dtype_lower)
+
+            if color_components:
+                r, g, b, a = color_components
+                overlay.setStyleSheet(f"""
+                    QLineEdit {{
+                        background-color: rgb({r}, {g}, {b});
+                        border: 2px solid {button_color};
+                        padding: 0px;
+                        margin: 0px;
+                        color: {fg_color};
+                    }}
+                """)
+                overlay.setText(pointer.data_type.split()[0].upper())
+            else:
+                overlay.setStyleSheet(f"""
+                    QLineEdit {{
+                        background-color: {bg_color};
+                        border: 2px solid {button_color};
+                        padding: 0px;
+                        margin: 0px;
+                        color: {fg_color};
+                    }}
+                """)
 
             # Calculate width based on hex bytes coverage
             # Boxes should NOT grow larger than the number of bytes they represent
             hex_coverage_width = (pointer.length * 3 - 1) * char_width
             overlay_width = hex_coverage_width
+            if is_color_pointer:
+                label_width = overlay.fontMetrics().horizontalAdvance(pointer.data_type.split()[0].upper()) + 10
+                overlay_width = max(hex_coverage_width, line_height, label_width)
 
             overlay.setGeometry(int(x_pos), int(y_pos), int(overlay_width), line_height)
 
@@ -4583,7 +6427,9 @@ class HexEditorQt(QMainWindow):
             # Add full value to tooltip if it's long
             if len(value_str) > 10:
                 tooltip_text += f"\nValue: {value_str}"
-            overlay.setToolTip(tooltip_text)
+            if is_color_pointer:
+                tooltip_text += f"\nColor: {value_str}\nClick to edit"
+            overlay.set_custom_tooltip(tooltip_text, bg_color, fg_color)
 
             # Check if overlays should be hidden
             if self.signature_widget.hide_overlay_values:
@@ -4645,6 +6491,8 @@ class HexEditorQt(QMainWindow):
                         pass
 
         # Find the pointer in the tree and select it
+        if getattr(pointer, "category", None) == "Fields":
+            return
         self.signature_widget.locate_pointer_in_tree(pointer)
 
     def on_overlay_value_changed(self, pointer, new_value):
@@ -4654,6 +6502,7 @@ class HexEditorQt(QMainWindow):
 
         current_file = self.open_files[self.current_tab_index]
         file_data = current_file.file_data
+        is_field_overlay = getattr(pointer, "category", None) == "Fields"
 
         if new_value:
             try:
@@ -4668,7 +6517,10 @@ class HexEditorQt(QMainWindow):
                     pointer.custom_value = new_value
 
                     # Update tree display
-                    self.signature_widget.rebuild_tree()
+                    if is_field_overlay and hasattr(self, 'fields_widget'):
+                        self.fields_widget.rebuild_tree(preserve_expansion=True)
+                    else:
+                        self.signature_widget.rebuild_tree()
 
                     # Refresh display to update the overlay
                     self.display_hex(preserve_scroll=True)
@@ -4686,7 +6538,10 @@ class HexEditorQt(QMainWindow):
                     pointer.label = new_value
 
                     # Update tree display
-                    self.signature_widget.rebuild_tree()
+                    if is_field_overlay and hasattr(self, 'fields_widget'):
+                        self.fields_widget.rebuild_tree(preserve_expansion=True)
+                    else:
+                        self.signature_widget.rebuild_tree()
 
                     # Refresh display to update the overlay
                     self.display_hex(preserve_scroll=True)
@@ -4714,7 +6569,10 @@ class HexEditorQt(QMainWindow):
                         # Mark as modified and update UI
                         current_file.modified = True
                         self.update_tab_title()
-                        self.signature_widget.rebuild_tree()
+                        if is_field_overlay and hasattr(self, 'fields_widget'):
+                            self.fields_widget.rebuild_tree(preserve_expansion=True)
+                        else:
+                            self.signature_widget.rebuild_tree()
                         self.display_hex(preserve_scroll=True)
                     return
 
@@ -4746,7 +6604,10 @@ class HexEditorQt(QMainWindow):
                     )
 
                     # Update tree display
-                    self.signature_widget.rebuild_tree()
+                    if is_field_overlay and hasattr(self, 'fields_widget'):
+                        self.fields_widget.rebuild_tree(preserve_expansion=True)
+                    else:
+                        self.signature_widget.rebuild_tree()
 
                     # Update tab title
                     tab_text = os.path.basename(current_file.file_path) + " *"
@@ -5160,12 +7021,20 @@ class HexEditorQt(QMainWindow):
             self.clipboard_grid_rows = None
             self.clipboard_grid_cols = None
 
-        # Also copy to system clipboard as both hex string and raw bytes
+        # Also copy to system clipboard
         if self.clipboard:
             system_clipboard = QApplication.clipboard()
-            # Copy as hex string for easy viewing/pasting
-            hex_string = ' '.join(f'{b:02X}' for b in self.clipboard)
-            system_clipboard.setText(hex_string)
+
+            # Check if ASCII display was last clicked - if so, copy as ASCII text
+            # Otherwise copy as hex string
+            if self.last_clicked_display == 'ascii':
+                # Copy as ASCII text
+                ascii_text = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in self.clipboard)
+                system_clipboard.setText(ascii_text)
+            else:
+                # Copy as hex string for easy viewing/pasting
+                hex_string = ' '.join(f'{b:02X}' for b in self.clipboard)
+                system_clipboard.setText(hex_string)
 
     def cut(self):
         if self.current_tab_index < 0:
@@ -6101,7 +7970,7 @@ class HexEditorQt(QMainWindow):
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Fill Selection")
-        dialog.setMinimumSize(450, 300)
+        dialog.setMinimumSize(400, 250)
 
         layout = QVBoxLayout()
 
@@ -6308,7 +8177,7 @@ class HexEditorQt(QMainWindow):
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Highlight Bytes")
-        dialog.setMinimumSize(400, 400)
+        dialog.setMinimumSize(360, 320)
 
         layout = QVBoxLayout()
 
@@ -6345,20 +8214,21 @@ class HexEditorQt(QMainWindow):
 
         # Get theme colors for styling
         theme_colors = get_theme_colors(self.current_theme)
+        inactive_button_bg = get_theme_surface_colors(theme_colors).get("control", theme_colors.get('menubar_bg', '#1f1f1f'))
         # For Matrix theme, use dark text on bright buttons for better readability
         button_text_color = "#000000" if self.current_theme == "Matrix" else theme_colors['foreground']
 
         def set_search_mode():
             current_mode[0] = "search"
             search_mode_btn.setStyleSheet(f"background-color: {theme_colors['button_bg']}; color: {button_text_color}; font-weight: bold;")
-            selection_mode_btn.setStyleSheet(f"background-color: {theme_colors['editor_bg']}; color: {theme_colors['foreground']};")
+            selection_mode_btn.setStyleSheet(f"background-color: {inactive_button_bg}; color: {theme_colors['foreground']};")
             bytes_input_frame.setVisible(True)
             selection_info_frame.setVisible(False)
 
         def set_selection_mode():
             current_mode[0] = "selection"
             selection_mode_btn.setStyleSheet(f"background-color: {theme_colors['button_bg']}; color: {button_text_color}; font-weight: bold;")
-            search_mode_btn.setStyleSheet(f"background-color: {theme_colors['editor_bg']}; color: {theme_colors['foreground']};")
+            search_mode_btn.setStyleSheet(f"background-color: {inactive_button_bg}; color: {theme_colors['foreground']};")
             bytes_input_frame.setVisible(False)
             selection_info_frame.setVisible(True)
 
@@ -6415,8 +8285,9 @@ class HexEditorQt(QMainWindow):
         color_preview.setMinimumWidth(30)
 
         def choose_color():
-            color = QColorDialog.getColor()
-            if color.isValid():
+            picker = self.get_theme_color_dialog(parent=dialog)
+            if picker.exec_() == QDialog.Accepted:
+                color = picker.selectedColor()
                 selected_color[0] = color.name()
                 color_btn.setStyleSheet(f"background-color: {selected_color[0]}; color: black;")
                 color_preview.setStyleSheet(f"background-color: {selected_color[0]}; border: 1px solid black;")
@@ -6584,64 +8455,461 @@ class HexEditorQt(QMainWindow):
 
     def show_search_window(self):
         dialog = QDialog(self)
-        dialog.setWindowTitle("Search")
-        dialog.setMinimumSize(400, 180)
+        dialog.setWindowTitle("Find")
+        dialog.setMinimumSize(460, 300)
+        dialog.resize(500, 320)
 
-        layout = QVBoxLayout()
+        main_layout = QVBoxLayout()
+        main_layout.setSpacing(8)
 
-        # Search pattern
-        pattern_layout = QHBoxLayout()
-        pattern_layout.addWidget(QLabel("Search for:"))
-        self.search_pattern_edit = QLineEdit()
-        pattern_layout.addWidget(self.search_pattern_edit)
-        layout.addLayout(pattern_layout)
+        # Tab widget for search types
+        tab_widget = QTabWidget()
+        tab_widget.setMinimumHeight(145)
+        tab_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        tab_widget.setStyleSheet("""
+            QTabBar::tab {
+                font-size: 8pt;
+                padding: 3px 10px;
+                min-width: 52px;
+            }
+        """)
 
-        # Search type button (Hex/Text toggle)
+        # --- Text-string Tab ---
+        text_tab = QWidget()
+        text_layout = QVBoxLayout()
+        text_layout.setContentsMargins(10, 10, 10, 10)
+
+        text_input_layout = QHBoxLayout()
+        text_input_layout.addWidget(QLabel("Search for:"))
+        self.search_text_edit = QLineEdit()
+        selected_text = self.selected_text_for_dialog()
+        if selected_text:
+            self.search_text_edit.setText(selected_text)
+        text_input_layout.addWidget(self.search_text_edit)
+        text_layout.addLayout(text_input_layout)
+
+        text_options = QHBoxLayout()
+        self.text_case_sensitive = QCheckBox("Case-Sensitive")
+        self.text_case_sensitive.setStyleSheet(f"""
+            QCheckBox {{
+                color: {get_theme_colors(self.current_theme).get('foreground', '#ffffff')};
+                spacing: 5px;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+                border: 2px solid #666;
+                border-radius: 3px;
+                background: #333;
+            }}
+            QCheckBox::indicator:checked {{
+                background: #2196F3;
+                border-color: #2196F3;
+            }}
+            QCheckBox::indicator:hover {{
+                border-color: #888;
+            }}
+        """)
+        text_options.addWidget(self.text_case_sensitive)
+        text_options.addStretch()
+        text_layout.addLayout(text_options)
+
+        # Encoding selection
+        encoding_layout = QHBoxLayout()
+        encoding_layout.addWidget(QLabel("Encoding:"))
+        self.search_text_encoding_combo = QComboBox()
+        self.search_text_encoding_combo.addItems([
+            "UTF-8",
+            "UTF-16 LE",
+            "UTF-16 BE",
+            "UTF-32 LE",
+            "UTF-32 BE",
+            "ASCII",
+            "Latin-1 (ISO-8859-1)",
+            "Windows-1252"
+        ])
+        self.search_text_encoding_combo.setMaximumWidth(180)
+        encoding_layout.addWidget(self.search_text_encoding_combo)
+        encoding_layout.addStretch()
+        text_layout.addLayout(encoding_layout)
+
+        text_layout.addStretch()
+
+        text_tab.setLayout(text_layout)
+        tab_widget.addTab(text_tab, "Text")
+
+        # --- Hex-values Tab ---
+        hex_tab = QWidget()
+        hex_layout = QVBoxLayout()
+        hex_layout.setContentsMargins(10, 10, 10, 10)
+
+        hex_input_layout = QHBoxLayout()
+        hex_input_layout.addWidget(QLabel("Search for:"))
+        self.search_hex_edit = QLineEdit()
+        self.search_hex_edit.setPlaceholderText("e.g., FF 00 A1 B2")
+        selected_bytes = self.selected_bytes_for_dialog()
+        if selected_bytes:
+            self.search_hex_edit.setText(" ".join(f"{b:02X}" for b in selected_bytes))
+        hex_input_layout.addWidget(self.search_hex_edit)
+        hex_layout.addLayout(hex_input_layout)
+        hex_layout.addStretch()
+
+        hex_tab.setLayout(hex_layout)
+        tab_widget.addTab(hex_tab, "Hex")
+
+        # --- Data type Tab ---
+        datatype_tab = QWidget()
+        datatype_layout = QVBoxLayout()
+        datatype_layout.setContentsMargins(10, 10, 10, 10)
+
+        # Value/Range toggle button
+        self.datatype_mode_btn = QPushButton("Value")
+        self.datatype_mode_btn.setCheckable(True)
+        self.datatype_mode_btn.setChecked(False)
+        self.datatype_mode_btn.setMaximumWidth(80)
+
+        def toggle_datatype_mode():
+            if self.datatype_mode_btn.isChecked():
+                self.datatype_mode_btn.setText("Range")
+                self.datatype_range_widget.setVisible(True)
+                self.datatype_value_widget.setVisible(False)
+            else:
+                self.datatype_mode_btn.setText("Value")
+                self.datatype_range_widget.setVisible(False)
+                self.datatype_value_widget.setVisible(True)
+
+        self.datatype_mode_btn.clicked.connect(toggle_datatype_mode)
+
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Mode:"))
+        mode_layout.addWidget(self.datatype_mode_btn)
+        mode_layout.addStretch()
+        datatype_layout.addLayout(mode_layout)
+
+        # Endianness and Data type selection
         type_layout = QHBoxLayout()
-        type_layout.addWidget(QLabel("Search type:"))
-        self.search_type_btn = QPushButton("Hex")
-        self.search_type_btn.setFont(QFont("Arial", 9, QFont.Bold))
-        self.search_type_btn.setCheckable(True)
-        self.search_type_btn.setChecked(True)
-        self.search_type_btn.setMaximumWidth(100)
-        self.search_type_btn.clicked.connect(self.toggle_search_type)
-        type_layout.addWidget(self.search_type_btn)
-        type_layout.addStretch()
-        layout.addLayout(type_layout)
 
-        # Search direction options
-        options_group = QGroupBox("Search Direction")
-        options_layout = QHBoxLayout()
+        # Endianness toggle button
+        self.search_endian_btn = QPushButton("LE")
+        self.search_endian_btn.setCheckable(True)
+        self.search_endian_btn.setChecked(False)
+        self.search_endian_btn.setMaximumWidth(50)
+        self.search_endian_btn.setToolTip("Toggle between Little Endian (LE) and Big Endian (BE)")
+
+        def toggle_endianness():
+            if self.search_endian_btn.isChecked():
+                self.search_endian_btn.setText("BE")
+            else:
+                self.search_endian_btn.setText("LE")
+            update_datatype_list()
+
+        def update_datatype_list():
+            current_text = self.datatype_combo.currentText()
+            current_base = current_text.replace(" LE", "").replace(" BE", "")
+            endian = "BE" if self.search_endian_btn.isChecked() else "LE"
+
+            simple_types = ["Int8", "UInt8"]
+            sized_types = ["Int16", "UInt16", "Int32", "UInt32", "Int64", "UInt64", "Float32", "Float64"]
+
+            items = simple_types + [f"{t} {endian}" for t in sized_types]
+
+            self.datatype_combo.clear()
+            self.datatype_combo.addItems(items)
+
+            for i in range(self.datatype_combo.count()):
+                if current_base in self.datatype_combo.itemText(i):
+                    self.datatype_combo.setCurrentIndex(i)
+                    break
+
+        self.search_endian_btn.clicked.connect(toggle_endianness)
+
+        type_layout.addWidget(QLabel("Data type:"))
+        type_layout.addWidget(self.search_endian_btn)
+        self.datatype_combo = QComboBox()
+        self.datatype_combo.addItems([
+            "Int8", "UInt8", "Int16 LE", "UInt16 LE",
+            "Int32 LE", "UInt32 LE", "Int64 LE", "UInt64 LE",
+            "Float32 LE", "Float64 LE"
+        ])
+        type_layout.addWidget(self.datatype_combo)
+        datatype_layout.addLayout(type_layout)
+
+        # Value input (single value) - wrapped in a widget
+        self.datatype_value_widget = QWidget()
+        self.datatype_value_layout = QHBoxLayout()
+        self.datatype_value_layout.setContentsMargins(0, 0, 0, 0)
+        self.datatype_value_layout.addWidget(QLabel("Value:"))
+        self.datatype_value_edit = QLineEdit()
+        self.datatype_value_edit.setPlaceholderText("e.g., 42 or 3.14")
+        self.datatype_value_layout.addWidget(self.datatype_value_edit)
+        self.datatype_value_widget.setLayout(self.datatype_value_layout)
+        datatype_layout.addWidget(self.datatype_value_widget)
+
+        # Range input (min-max) - wrapped in a widget
+        self.datatype_range_widget = QWidget()
+        self.datatype_range_layout = QHBoxLayout()
+        self.datatype_range_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.datatype_range_layout.addWidget(QLabel("Min:"))
+        self.datatype_min_edit = QLineEdit()
+        self.datatype_min_edit.setPlaceholderText("e.g., 0.0")
+        self.datatype_range_layout.addWidget(self.datatype_min_edit)
+
+        self.datatype_range_layout.addWidget(QLabel("Max:"))
+        self.datatype_max_edit = QLineEdit()
+        self.datatype_max_edit.setPlaceholderText("e.g., 1.0")
+        self.datatype_range_layout.addWidget(self.datatype_max_edit)
+
+        self.datatype_range_widget.setLayout(self.datatype_range_layout)
+        self.datatype_range_widget.setVisible(False)
+        datatype_layout.addWidget(self.datatype_range_widget)
+
+        datatype_tab.setLayout(datatype_layout)
+        tab_widget.addTab(datatype_tab, "Data")
+
+        # --- Color Tab ---
+        color_tab = QWidget()
+        color_layout = QVBoxLayout()
+        color_layout.setContentsMargins(10, 10, 10, 10)
+        color_top = QHBoxLayout()
+        self.search_color_mode_btn = QPushButton("Value")
+        self.search_color_mode_btn.setCheckable(True)
+        self.search_color_mode_btn.setMaximumWidth(80)
+        self.search_color_format_combo = QComboBox()
+        self.search_color_format_combo.addItems(list(self.color_formats().keys()))
+        color_top.addWidget(QLabel("Mode:"))
+        color_top.addWidget(self.search_color_mode_btn)
+        color_top.addWidget(QLabel("Format:"))
+        color_top.addWidget(self.search_color_format_combo)
+        search_color_pick_btn = QPushButton("Pick...")
+        search_color_pick_btn.setMaximumWidth(70)
+        color_top.addWidget(search_color_pick_btn)
+        color_layout.addLayout(color_top)
+        self.search_color_grid = QGridLayout()
+        color_layout.addLayout(self.search_color_grid)
+        self.search_color_edits = {}
+
+        def rebuild_search_color_fields():
+            while self.search_color_grid.count():
+                item = self.search_color_grid.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            self.search_color_edits = {}
+            labels = self.color_formats()[self.search_color_format_combo.currentText()]
+            range_mode = self.search_color_mode_btn.isChecked()
+            self.add_component_set_to_grid(self.search_color_grid, labels, range_mode, "any", self.search_color_edits, columns=2, width=62)
+            self.fill_color_component_edits(self.search_color_format_combo.currentText(), self.search_color_edits, selected_bytes)
+
+        def toggle_search_color_mode():
+            self.search_color_mode_btn.setText("Range" if self.search_color_mode_btn.isChecked() else "Value")
+            rebuild_search_color_fields()
+
+        self.search_color_mode_btn.clicked.connect(toggle_search_color_mode)
+        self.search_color_format_combo.currentIndexChanged.connect(rebuild_search_color_fields)
+        rebuild_search_color_fields()
+        self.fill_color_component_edits(self.search_color_format_combo.currentText(), self.search_color_edits, selected_bytes)
+
+        def pick_search_color():
+            picker = self.get_theme_color_dialog(parent=dialog)
+            if picker.exec_() == QDialog.Accepted:
+                color = picker.selectedColor()
+                values = {"R": color.red(), "G": color.green(), "B": color.blue(), "A": color.alpha()}
+                for label in self.color_formats()[self.search_color_format_combo.currentText()]:
+                    if label in values:
+                        self.set_component_edit_value(self.search_color_edits[label], values[label])
+
+        search_color_pick_btn.clicked.connect(pick_search_color)
+        color_layout.addStretch()
+        color_tab.setLayout(color_layout)
+        tab_widget.addTab(color_tab, "Color")
+
+        # --- Vector Tab ---
+        vector_tab = QWidget()
+        vector_layout = QVBoxLayout()
+        vector_layout.setContentsMargins(10, 10, 10, 10)
+        vector_top = QHBoxLayout()
+        self.search_vector_mode_btn = QPushButton("Value")
+        self.search_vector_mode_btn.setCheckable(True)
+        self.search_vector_mode_btn.setMaximumWidth(80)
+        self.search_vector_endian_btn = QPushButton("LE")
+        self.search_vector_endian_btn.setCheckable(True)
+        self.search_vector_endian_btn.setMaximumWidth(50)
+        self.search_vector_shape_combo = QComboBox()
+        self.search_vector_shape_combo.addItems(list(self.vector_shapes().keys()))
+        self.search_vector_type_combo = QComboBox()
+        self.search_vector_type_combo.addItems(list(self.vector_component_types("LE").keys()))
+        vector_top.addWidget(QLabel("Mode:"))
+        vector_top.addWidget(self.search_vector_mode_btn)
+        vector_top.addWidget(self.search_vector_endian_btn)
+        vector_top.addWidget(QLabel("Shape:"))
+        vector_top.addWidget(self.search_vector_shape_combo)
+        vector_top.addWidget(QLabel("Type:"))
+        vector_top.addWidget(self.search_vector_type_combo)
+        vector_layout.addLayout(vector_top)
+        self.search_vector_grid = QGridLayout()
+        vector_layout.addLayout(self.search_vector_grid)
+        self.search_vector_edits = {}
+
+        def rebuild_search_vector_fields():
+            while self.search_vector_grid.count():
+                item = self.search_vector_grid.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            self.search_vector_edits = {}
+            labels = self.vector_shapes()[self.search_vector_shape_combo.currentText()]
+            range_mode = self.search_vector_mode_btn.isChecked()
+            self.add_component_set_to_grid(self.search_vector_grid, labels, range_mode, "any", self.search_vector_edits, columns=2, width=72)
+            self.fill_vector_component_edits(
+                self.search_vector_shape_combo.currentText(),
+                self.search_vector_type_combo.currentText(),
+                "BE" if self.search_vector_endian_btn.isChecked() else "LE",
+                self.search_vector_edits,
+                selected_bytes
+            )
+
+        def toggle_search_vector_mode():
+            self.search_vector_mode_btn.setText("Range" if self.search_vector_mode_btn.isChecked() else "Value")
+            rebuild_search_vector_fields()
+
+        def toggle_search_vector_endian():
+            self.search_vector_endian_btn.setText("BE" if self.search_vector_endian_btn.isChecked() else "LE")
+            rebuild_search_vector_fields()
+
+        self.search_vector_mode_btn.clicked.connect(toggle_search_vector_mode)
+        self.search_vector_endian_btn.clicked.connect(toggle_search_vector_endian)
+        self.search_vector_shape_combo.currentIndexChanged.connect(rebuild_search_vector_fields)
+        self.search_vector_type_combo.currentIndexChanged.connect(rebuild_search_vector_fields)
+        rebuild_search_vector_fields()
+        self.fill_vector_component_edits(
+            self.search_vector_shape_combo.currentText(),
+            self.search_vector_type_combo.currentText(),
+            "BE" if self.search_vector_endian_btn.isChecked() else "LE",
+            self.search_vector_edits,
+            selected_bytes
+        )
+        vector_layout.addStretch()
+        vector_tab.setLayout(vector_layout)
+        tab_widget.addTab(vector_tab, "Vector")
+
+        main_layout.addWidget(tab_widget)
+
+        # Store current tab widget reference
+        self.search_tab_widget = tab_widget
+
+        # Search direction and range options
+        direction_range_layout = QHBoxLayout()
+
+        # Direction group box (left side)
+        direction_group = QGroupBox("Search direction")
+        direction_group.setMaximumHeight(66)
+        direction_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        direction_group_layout = QHBoxLayout()
+        direction_group_layout.setContentsMargins(8, 8, 8, 3)
+        direction_group_layout.setAlignment(Qt.AlignVCenter)
+
+        radio_style = """
+            QRadioButton {
+                color: white;
+                spacing: 5px;
+            }
+            QRadioButton::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 8px;
+                border: 2px solid #666;
+                background: #333;
+            }
+            QRadioButton::indicator:checked {
+                background: #2196F3;
+                border-color: #2196F3;
+            }
+            QRadioButton::indicator:hover {
+                border-color: #888;
+            }
+        """
+
+        self.search_all_radio = QRadioButton("All")
+        self.search_all_radio.setStyleSheet(radio_style)
+        direction_group_layout.addWidget(self.search_all_radio)
 
         self.search_forward_radio = QRadioButton("Forward")
         self.search_forward_radio.setChecked(True)
-        options_layout.addWidget(self.search_forward_radio)
+        self.search_forward_radio.setStyleSheet(radio_style)
+        direction_group_layout.addWidget(self.search_forward_radio)
 
         self.search_backward_radio = QRadioButton("Backward")
-        options_layout.addWidget(self.search_backward_radio)
+        self.search_backward_radio.setStyleSheet(radio_style)
+        direction_group_layout.addWidget(self.search_backward_radio)
 
-        self.search_findall_radio = QRadioButton("Find All")
-        options_layout.addWidget(self.search_findall_radio)
+        self.search_range_radio = QRadioButton("Range")
+        self.search_range_radio.setStyleSheet(radio_style)
+        direction_group_layout.addWidget(self.search_range_radio)
 
-        options_group.setLayout(options_layout)
-        layout.addWidget(options_group)
+        direction_group.setLayout(direction_group_layout)
+        direction_range_layout.addWidget(direction_group)
+
+        # Offset Range group box (right side)
+        range_group = QGroupBox("Offset Range")
+        range_group.setMaximumHeight(66)
+        range_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        range_group_layout = QHBoxLayout()
+        range_group_layout.setContentsMargins(8, 8, 8, 3)
+        range_group_layout.setAlignment(Qt.AlignVCenter)
+
+        self.search_range_min_edit = QLineEdit()
+        self.search_range_min_edit.setPlaceholderText("Min (hex)")
+        self.search_range_min_edit.setMaximumWidth(100)
+        self.search_range_min_edit.setEnabled(False)
+        range_group_layout.addWidget(self.search_range_min_edit)
+
+        self.search_range_max_edit = QLineEdit()
+        self.search_range_max_edit.setPlaceholderText("Max (hex)")
+        self.search_range_max_edit.setMaximumWidth(100)
+        self.search_range_max_edit.setEnabled(False)
+        range_group_layout.addWidget(self.search_range_max_edit)
+
+        range_group.setLayout(range_group_layout)
+        direction_range_layout.addWidget(range_group)
+
+        # Connect range radio to enable/disable range inputs
+        def toggle_search_range_inputs():
+            enabled = self.search_range_radio.isChecked()
+            self.search_range_min_edit.setEnabled(enabled)
+            self.search_range_max_edit.setEnabled(enabled)
+
+        self.search_range_radio.toggled.connect(toggle_search_range_inputs)
+
+        main_layout.addLayout(direction_range_layout)
 
         # Buttons
         button_layout = QHBoxLayout()
         button_layout.addStretch()
 
-        search_btn = QPushButton("Search")
+        search_btn = QPushButton("OK")
+        search_btn.setDefault(True)
         search_btn.clicked.connect(lambda: self.perform_search(dialog))
         button_layout.addWidget(search_btn)
 
-        close_btn = QPushButton("Close")
+        search_all_btn = QPushButton("Search all")
+        search_all_btn.clicked.connect(lambda: self.perform_search_all(dialog))
+        button_layout.addWidget(search_all_btn)
+
+        close_btn = QPushButton("Cancel")
         close_btn.clicked.connect(dialog.close)
         button_layout.addWidget(close_btn)
 
-        layout.addLayout(button_layout)
+        main_layout.addLayout(button_layout)
 
-        dialog.setLayout(layout)
+        dialog.setLayout(main_layout)
         dialog.show()
+
+    def close_search_results(self):
+        """Close search results overlay and clear highlights"""
+        if self.current_tab_index >= 0 and self.current_tab_index < len(self.open_files):
+            self.open_files[self.current_tab_index].search_results = []
+            self.display_hex(preserve_scroll=True)
+        if hasattr(self, 'results_overlay') and self.results_overlay:
+            self.results_overlay.hide()
 
     def create_results_overlay(self):
         # Create results overlay widget at bottom between hex and ASCII displays
@@ -6651,7 +8919,7 @@ class HexEditorQt(QMainWindow):
             self.results_overlay.setObjectName("results_overlay")
 
             # Position at bottom, starting after offset column
-            overlay_height = 200
+            overlay_height = getattr(self, 'search_results_overlay_height', 200)
             x_start = 130  # After offset column
             y_position = self.hex_ascii_container.height() - overlay_height
 
@@ -6661,23 +8929,51 @@ class HexEditorQt(QMainWindow):
             self.results_overlay.setGeometry(x_start, y_position, overlay_width, overlay_height)
 
             overlay_layout = QVBoxLayout()
-            overlay_layout.setContentsMargins(10, 8, 10, 5)
-            overlay_layout.setSpacing(4)
+            overlay_layout.setContentsMargins(10, 2, 10, 5)
+            overlay_layout.setSpacing(2)
+
+            self.search_results_resize_handle = SearchResultsResizeHandle(self, self.results_overlay)
+            overlay_layout.addWidget(self.search_results_resize_handle)
 
             # Title row with close button
             title_row = QHBoxLayout()
-            title_label = QLabel("Search Results")
-            title_label.setFont(QFont("Arial", 10, QFont.Bold))
-            title_row.addWidget(title_label)
+            self.search_results_title_label = QLabel("Search Results")
+            self.search_results_title_label.setFont(QFont("Arial", 10, QFont.Bold))
+            title_row.addWidget(self.search_results_title_label)
             title_row.addStretch()
 
             close_btn = QPushButton("✕")
             close_btn.setMaximumWidth(25)
             close_btn.setMaximumHeight(25)
-            close_btn.clicked.connect(lambda: self.results_overlay.hide())
+            close_btn.clicked.connect(self.close_search_results)
             title_row.addWidget(close_btn)
 
             overlay_layout.addLayout(title_row)
+
+            self.search_results_tab_bar = QTabBar()
+            self.search_results_tab_bar.setExpanding(False)
+            self.search_results_tab_bar.setUsesScrollButtons(True)
+            self.search_results_tab_bar.setFont(QFont("Arial", 8))
+            self.search_results_tab_bar.setStyleSheet("""
+                QTabBar::tab {
+                    font-size: 8pt;
+                    min-height: 16px;
+                    padding: 2px 8px;
+                    margin: 0px;
+                }
+                QTabBar::tab:selected {
+                    font-weight: bold;
+                }
+                QTabBar QToolButton {
+                    min-width: 16px;
+                    min-height: 16px;
+                    padding: 0px;
+                    margin: 0px;
+                }
+            """)
+            self.search_results_tab_bar.currentChanged.connect(self.activate_search_result_tab)
+            overlay_layout.addWidget(self.search_results_tab_bar)
+            self.search_results_tab_bar.hide()
 
             # Results display area (scrollable)
             self.search_results_scroll = QScrollArea()
@@ -6718,16 +9014,10 @@ class HexEditorQt(QMainWindow):
 
             # Helper function to update overlay position
             def update_overlay_position():
+                if hasattr(self, 'pane_separator_overlay'):
+                    self.pane_separator_overlay.refresh()
                 if hasattr(self, 'results_overlay') and self.results_overlay is not None:
-                    overlay_height = 200
-                    x_start = 130  # After offset column
-                    y_position = self.hex_ascii_container.height() - overlay_height
-
-                    # Calculate width within hex_ascii_container
-                    overlay_width = self.hex_ascii_container.width() - x_start
-
-                    self.results_overlay.setGeometry(x_start, y_position, overlay_width, overlay_height)
-                    self.results_overlay.raise_()
+                    self.position_search_results_overlay()
 
             # Connect resize event to reposition overlay (Y position only, width doesn't change on resize)
             original_resize = self.hex_ascii_container.resizeEvent
@@ -6736,6 +9026,127 @@ class HexEditorQt(QMainWindow):
                 if original_resize:
                     original_resize(event)
             self.hex_ascii_container.resizeEvent = new_resize
+
+    def set_search_results_overlay_height(self, height):
+        max_height = max(120, self.hex_ascii_container.height() - 40)
+        self.search_results_overlay_height = max(120, min(max_height, int(height)))
+        self.position_search_results_overlay()
+
+    def position_search_results_overlay(self):
+        if not hasattr(self, 'results_overlay') or self.results_overlay is None:
+            return
+        overlay_height = getattr(self, 'search_results_overlay_height', 200)
+        overlay_height = max(120, min(max(120, self.hex_ascii_container.height() - 40), overlay_height))
+        self.search_results_overlay_height = overlay_height
+        x_start = 130
+        y_position = max(0, self.hex_ascii_container.height() - overlay_height)
+        overlay_width = max(160, self.hex_ascii_container.width() - x_start)
+        self.results_overlay.setGeometry(x_start, y_position, overlay_width, overlay_height)
+        self.results_overlay.raise_()
+
+    def set_search_results_title(self, suffix=None):
+        self.create_results_overlay()
+        title = "Search Results"
+        if suffix:
+            title += f" - {suffix}"
+        self.search_results_title_label.setText(title)
+
+    def clear_search_results_layout(self):
+        self.create_results_overlay()
+        while self.search_results_layout.count():
+            item = self.search_results_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def store_search_result_set(self, title, results, pattern=None, dtype=None, render=False):
+        if self.current_tab_index < 0:
+            return
+        current_file = self.open_files[self.current_tab_index]
+        if not hasattr(current_file, "search_result_sets"):
+            current_file.search_result_sets = []
+            current_file.active_search_result_set = -1
+
+        clean_title = title or "Search"
+        result_set = {
+            "title": clean_title,
+            "results": list(results or []),
+            "pattern": bytes(pattern) if pattern else None,
+            "dtype": dtype,
+        }
+        current_file.search_result_sets.append(result_set)
+        current_file.active_search_result_set = len(current_file.search_result_sets) - 1
+        self.rebuild_search_result_tabs()
+        if render:
+            self.render_search_result_set(current_file.active_search_result_set)
+
+    def rebuild_search_result_tabs(self):
+        self.create_results_overlay()
+        if self.current_tab_index < 0:
+            return
+        current_file = self.open_files[self.current_tab_index]
+        sets = getattr(current_file, "search_result_sets", [])
+        self.search_results_tab_bar.blockSignals(True)
+        while self.search_results_tab_bar.count():
+            self.search_results_tab_bar.removeTab(self.search_results_tab_bar.count() - 1)
+        for index, result_set in enumerate(sets):
+            title = result_set.get("title") or f"Search {index + 1}"
+            if len(title) > 24:
+                title = title[:21] + "..."
+            self.search_results_tab_bar.addTab(title)
+        active = getattr(current_file, "active_search_result_set", -1)
+        if 0 <= active < self.search_results_tab_bar.count():
+            self.search_results_tab_bar.setCurrentIndex(active)
+        self.search_results_tab_bar.setVisible(self.search_results_tab_bar.count() > 1)
+        self.search_results_tab_bar.blockSignals(False)
+
+    def activate_search_result_tab(self, index):
+        if index >= 0:
+            self.render_search_result_set(index)
+
+    def render_search_result_set(self, index):
+        if self.current_tab_index < 0:
+            return
+        current_file = self.open_files[self.current_tab_index]
+        sets = getattr(current_file, "search_result_sets", [])
+        if index < 0 or index >= len(sets):
+            return
+
+        result_set = sets[index]
+        current_file.active_search_result_set = index
+        current_file.search_results = list(result_set.get("results", []))
+        self.set_search_results_title(result_set.get("title"))
+        self.clear_search_results_layout()
+
+        data = bytes(current_file.file_data)
+        pattern = result_set.get("pattern")
+        dtype = result_set.get("dtype")
+        results = current_file.search_results
+
+        if results:
+            for pos, size in results[:100]:
+                if dtype:
+                    self.show_datatype_search_result(pos, dtype, data, clickable=True)
+                else:
+                    result_pattern = pattern or data[pos:pos + size]
+                    self.show_search_result(pos, result_pattern, data, clickable=True)
+            if len(results) > 100:
+                self.add_search_result_label(f"Showing first 100 of {len(results)} results")
+            first_pos = results[0][0]
+            self.cursor_position = first_pos
+            self.cursor_nibble = 0
+        else:
+            self.add_search_result_label("No matches found")
+
+        self.display_hex(preserve_scroll=True)
+        if results:
+            self.scroll_to_offset(results[0][0], center=True)
+        self.results_overlay.show()
+        self.results_overlay.raise_()
+
+    def publish_search_results(self, title, results, pattern=None, dtype=None):
+        self.create_results_overlay()
+        self.store_search_result_set(title, results, pattern=pattern, dtype=dtype, render=True)
 
     def toggle_search_type(self):
         if self.search_type_btn.isChecked():
@@ -6747,83 +9158,593 @@ class HexEditorQt(QMainWindow):
         if self.current_tab_index < 0:
             return
 
-        pattern_text = self.search_pattern_edit.text()
-        if not pattern_text:
-            return
-
         current_file = self.open_files[self.current_tab_index]
-        is_hex = self.search_type_btn.isChecked()
+        current_tab = self.search_tab_widget.currentIndex()
 
-        # Convert pattern to bytes
-        if is_hex:
+        # Get pattern based on current tab
+        pattern = None
+        matches_list = []
+
+        if current_tab == 0:  # Text-string
+            text = self.search_text_edit.text()
+            if not text:
+                return
+
+            encoding = self.search_text_encoding_combo.currentText()
+            codec = self.get_text_encoding(encoding)
+
             try:
-                pattern = bytes.fromhex(pattern_text.replace(" ", ""))
+                if self.text_case_sensitive.isChecked():
+                    pattern = text.encode(codec)
+                else:
+                    # For case-insensitive search, we'll handle it differently
+                    text_lower = text.lower()
+                    data_lower = bytes(current_file.file_data).lower()
+                    pattern = text_lower.encode(codec)
+                    # Use lowercase data for searching
+                    data = data_lower
+                    original_data = bytes(current_file.file_data)
+                if not self.text_case_sensitive.isChecked():
+                    pass  # Already set above
+                else:
+                    data = bytes(current_file.file_data)
+                    original_data = data
+            except (UnicodeEncodeError, LookupError) as e:
+                QMessageBox.critical(self, "Error", f"Cannot encode text with {encoding}: {str(e)}")
+                return
+
+        elif current_tab == 1:  # Hex-values
+            hex_text = self.search_hex_edit.text()
+            if not hex_text:
+                return
+            try:
+                pattern = bytes.fromhex(hex_text.replace(" ", ""))
             except ValueError:
                 QMessageBox.critical(self, "Error", "Invalid hex pattern")
                 return
-        else:
-            pattern = pattern_text.encode()
+            data = bytes(current_file.file_data)
+            original_data = data
+
+        elif current_tab == 2:  # Data type
+            import struct
+            data = bytes(current_file.file_data)
+            original_data = data
+
+            dtype = self.datatype_combo.currentText()
+            is_range_mode = self.datatype_mode_btn.isChecked()
+
+            # Parse data type
+            dt_info = self.parse_datatype(dtype)
+            if not dt_info:
+                QMessageBox.critical(self, "Error", "Invalid data type")
+                return
+
+            fmt, size, is_float = dt_info
+
+            if is_range_mode:
+                # Range search
+                try:
+                    if is_float:
+                        min_val = float(self.datatype_min_edit.text())
+                        max_val = float(self.datatype_max_edit.text())
+                    else:
+                        min_val = int(self.datatype_min_edit.text())
+                        max_val = int(self.datatype_max_edit.text())
+                except ValueError:
+                    QMessageBox.critical(self, "Error", "Invalid range values")
+                    return
+
+                # Search for values in range
+                for i in range(0, len(data) - size + 1):
+                    try:
+                        value = struct.unpack(fmt, data[i:i+size])[0]
+                        if min_val <= value <= max_val:
+                            matches_list.append(i)
+                    except struct.error:
+                        continue
+
+            else:
+                # Value search
+                try:
+                    if is_float:
+                        search_val = float(self.datatype_value_edit.text())
+                    else:
+                        search_val = int(self.datatype_value_edit.text())
+                except ValueError:
+                    QMessageBox.critical(self, "Error", "Invalid value")
+                    return
+
+                # Convert value to bytes
+                pattern = struct.pack(fmt, search_val)
+
+        elif current_tab == 3:  # Color
+            data = bytes(current_file.file_data)
+            original_data = data
+            color_format = self.search_color_format_combo.currentText()
+            is_range_mode = self.search_color_mode_btn.isChecked()
+            try:
+                criteria = self.parse_component_criteria(
+                    self.color_formats()[color_format],
+                    self.search_color_edits,
+                    is_range_mode,
+                    is_float=False
+                )
+            except ValueError:
+                QMessageBox.critical(self, "Error", "Invalid color value/range")
+                return
+            matches_list, color_size = self.find_color_matches(data, color_format, criteria, is_range_mode)
+
+        elif current_tab == 4:  # Vector
+            data = bytes(current_file.file_data)
+            original_data = data
+            vector_shape = self.search_vector_shape_combo.currentText()
+            vector_type = self.search_vector_type_combo.currentText()
+            vector_endian = "BE" if self.search_vector_endian_btn.isChecked() else "LE"
+            is_range_mode = self.search_vector_mode_btn.isChecked()
+            is_float = self.vector_component_types(vector_endian)[vector_type][2]
+            try:
+                criteria = self.parse_component_criteria(
+                    self.vector_shapes()[vector_shape],
+                    self.search_vector_edits,
+                    is_range_mode,
+                    is_float=is_float
+                )
+            except ValueError:
+                QMessageBox.critical(self, "Error", "Invalid vector value/range")
+                return
+            matches_list, vector_size = self.find_vector_matches(data, vector_shape, vector_type, vector_endian, criteria, is_range_mode)
 
         # Create results overlay if it doesn't exist
         self.create_results_overlay()
+        search_title = None
+        if current_tab == 0:
+            search_title = self.search_text_edit.text()
+        elif current_tab == 1 and pattern:
+            search_title = " ".join(f"{b:02X}" for b in pattern)
+        elif current_tab == 2:
+            if self.datatype_mode_btn.isChecked():
+                search_title = f"{dtype} {self.datatype_min_edit.text()}-{self.datatype_max_edit.text()}"
+            else:
+                search_title = f"{dtype} {self.datatype_value_edit.text()}"
+        elif current_tab == 3:
+            search_title = f"{color_format} {'range' if is_range_mode else 'value'}"
+        elif current_tab == 4:
+            search_title = f"{vector_shape} {vector_type} {'range' if is_range_mode else 'value'}"
+        self.set_search_results_title(search_title)
 
-        # Clear previous results
+        # Clear previous results and search highlights
         for i in reversed(range(self.search_results_layout.count())):
             self.search_results_layout.itemAt(i).widget().setParent(None)
 
-        data = bytes(current_file.file_data)
+        current_file.search_results = []
 
-        if self.search_forward_radio.isChecked():
-            # Search forward from current position
-            start_pos = self.cursor_position + 1 if self.cursor_position is not None else 0
-            pos = data.find(pattern, start_pos)
-            if pos != -1:
-                self.show_search_result(pos, pattern, data)
-                self.cursor_position = pos
-                self.cursor_nibble = 0
-                self.display_hex()
-                # Scroll to result
-                row = pos // self.bytes_per_row
-                self.hex_display.verticalScrollBar().setValue(row)
+        # For component/range searches, we already have matches_list
+        if ((current_tab == 2 and self.datatype_mode_btn.isChecked()) or current_tab in (3, 4)):
+            if current_tab == 2:
+                dt_info = self.parse_datatype(dtype)
+                size = dt_info[1] if dt_info else 1
+            elif current_tab == 3:
+                size = color_size
             else:
-                self.add_search_result_label("No match found")
+                size = vector_size
 
-        elif self.search_backward_radio.isChecked():
-            # Search backward from current position
-            end_pos = self.cursor_position if self.cursor_position is not None else len(data)
-            pos = data.rfind(pattern, 0, end_pos)
-            if pos != -1:
-                self.show_search_result(pos, pattern, data)
-                self.cursor_position = pos
-                self.cursor_nibble = 0
-                self.display_hex()
-                # Scroll to result
-                row = pos // self.bytes_per_row
-                self.hex_display.verticalScrollBar().setValue(row)
+            if self.search_forward_radio.isChecked():
+                # Find next match after cursor
+                start_pos = self.cursor_position + 1 if self.cursor_position is not None else 0
+                found = False
+                for pos in matches_list:
+                    if pos >= start_pos:
+                        if current_tab == 2:
+                            self.show_datatype_search_result(pos, dtype, original_data)
+                        else:
+                            self.show_search_result(pos, original_data[pos:pos + size], original_data)
+                        current_file.search_results = [(pos, size)]
+                        self.cursor_position = pos
+                        self.cursor_nibble = 0
+                        self.display_hex()
+                        self.scroll_to_offset(pos, center=True)
+                        found = True
+                        break
+                if not found:
+                    self.add_search_result_label("No match found")
+
+            elif self.search_backward_radio.isChecked():
+                # Find previous match before cursor
+                end_pos = self.cursor_position if self.cursor_position is not None else len(data)
+                found = False
+                for pos in reversed(matches_list):
+                    if pos < end_pos:
+                        if current_tab == 2:
+                            self.show_datatype_search_result(pos, dtype, original_data)
+                        else:
+                            self.show_search_result(pos, original_data[pos:pos + size], original_data)
+                        current_file.search_results = [(pos, size)]
+                        self.cursor_position = pos
+                        self.cursor_nibble = 0
+                        self.display_hex()
+                        self.scroll_to_offset(pos, center=True)
+                        found = True
+                        break
+                if not found:
+                    self.add_search_result_label("No match found")
+
+            else:  # Find All
+                if matches_list:
+                    # Add all matches to search_results for highlighting
+                    current_file.search_results = [(pos, size) for pos in matches_list]
+                    for pos in matches_list[:100]:  # Limit to first 100 results in display
+                        if current_tab == 2:
+                            self.show_datatype_search_result(pos, dtype, original_data, clickable=True)
+                        else:
+                            self.show_search_result(pos, original_data[pos:pos + size], original_data, clickable=True)
+                    if len(matches_list) > 100:
+                        self.add_search_result_label(f"Showing first 100 of {len(matches_list)} results")
+                    self.display_hex(preserve_scroll=True)
+                else:
+                    self.add_search_result_label("No matches found")
+
+        else:
+            # Regular pattern search
+            # Determine search range
+            if self.search_range_radio.isChecked():
+                # Use custom range
+                try:
+                    min_text = self.search_range_min_edit.text().strip()
+                    max_text = self.search_range_max_edit.text().strip()
+
+                    if not min_text or not max_text:
+                        self.add_search_result_label("Error: Please enter both min and max offset values")
+                        return
+
+                    search_start = int(min_text, 16)
+                    search_end = int(max_text, 16)
+
+                    if search_start < 0 or search_end > len(data) or search_start >= search_end:
+                        self.add_search_result_label("Error: Invalid offset range")
+                        return
+                except ValueError:
+                    self.add_search_result_label("Error: Invalid hex values for offset range")
+                    return
             else:
-                self.add_search_result_label("No match found")
+                search_start = 0
+                search_end = len(data)
 
-        else:  # Find All
-            # Find all occurrences
-            matches = []
-            offset = 0
-            while True:
-                pos = data.find(pattern, offset)
-                if pos == -1:
-                    break
-                matches.append(pos)
-                # Skip past the entire pattern to avoid overlapping matches
-                offset = pos + len(pattern)
+            if self.search_forward_radio.isChecked():
+                start_pos = self.cursor_position + 1 if self.cursor_position is not None else search_start
+                start_pos = max(start_pos, search_start)
+                pos = data.find(pattern, start_pos, search_end)
+                if pos != -1:
+                    self.show_search_result(pos, pattern, original_data)
+                    current_file.search_results = [(pos, len(pattern))]
+                    self.cursor_position = pos
+                    self.cursor_nibble = 0
+                    self.display_hex()
+                    self.scroll_to_offset(pos, center=True)
+                else:
+                    self.add_search_result_label("No match found")
 
-            if matches:
-                for pos in matches:
-                    self.show_search_result(pos, pattern, data, clickable=True)
-            else:
-                self.add_search_result_label("No matches found")
+            elif self.search_backward_radio.isChecked():
+                end_pos = self.cursor_position if self.cursor_position is not None else search_end
+                end_pos = min(end_pos, search_end)
+                pos = data.rfind(pattern, search_start, end_pos)
+                if pos != -1:
+                    self.show_search_result(pos, pattern, original_data)
+                    current_file.search_results = [(pos, len(pattern))]
+                    self.cursor_position = pos
+                    self.cursor_nibble = 0
+                    self.display_hex()
+                    self.scroll_to_offset(pos, center=True)
+                else:
+                    self.add_search_result_label("No match found")
+
+            else:  # Find All - handled by Search all button
+                matches = []
+                offset = search_start
+                while offset < search_end:
+                    pos = data.find(pattern, offset, search_end)
+                    if pos == -1:
+                        break
+                    matches.append(pos)
+                    offset = pos + len(pattern)
+
+                if matches:
+                    # Add all matches to search_results for highlighting
+                    current_file.search_results = [(pos, len(pattern)) for pos in matches]
+                    for pos in matches[:100]:  # Limit to first 100
+                        self.show_search_result(pos, pattern, original_data, clickable=True)
+                    if len(matches) > 100:
+                        self.add_search_result_label(f"Showing first 100 of {len(matches)} results")
+                    self.display_hex(preserve_scroll=True)
+                else:
+                    self.add_search_result_label("No matches found")
+
+        if current_file.search_results:
+            tab_dtype = dtype if current_tab == 2 else None
+            tab_pattern = pattern if current_tab not in (2, 3, 4) else None
+            self.store_search_result_set(search_title, current_file.search_results, pattern=tab_pattern, dtype=tab_dtype, render=False)
 
         # Show results overlay
         self.results_overlay.show()
         self.results_overlay.raise_()
+
+    def perform_search_all(self, dialog=None):
+        # Temporarily set to "All" mode and perform search
+        original_state = self.search_all_radio.isChecked()
+        self.search_all_radio.setChecked(True)
+        self.perform_search(dialog)
+        if not original_state:
+            self.search_forward_radio.setChecked(True)
+
+    def get_text_encoding(self, encoding_name):
+        """Map encoding display name to Python codec name"""
+        encoding_map = {
+            "UTF-8": "utf-8",
+            "UTF-16 LE": "utf-16-le",
+            "UTF-16 BE": "utf-16-be",
+            "UTF-32 LE": "utf-32-le",
+            "UTF-32 BE": "utf-32-be",
+            "ASCII": "ascii",
+            "Latin-1 (ISO-8859-1)": "latin-1",
+            "Windows-1252": "cp1252"
+        }
+        return encoding_map.get(encoding_name, "utf-8")
+
+    def parse_datatype(self, dtype):
+        """Parse data type string and return (struct_format, size, is_float)"""
+        import struct
+        dtype_map = {
+            "Int8": ("b", 1, False),
+            "UInt8": ("B", 1, False),
+            "Int16 LE": ("<h", 2, False),
+            "Int16 BE": (">h", 2, False),
+            "UInt16 LE": ("<H", 2, False),
+            "UInt16 BE": (">H", 2, False),
+            "Int32 LE": ("<i", 4, False),
+            "Int32 BE": (">i", 4, False),
+            "UInt32 LE": ("<I", 4, False),
+            "UInt32 BE": (">I", 4, False),
+            "Int64 LE": ("<q", 8, False),
+            "Int64 BE": (">q", 8, False),
+            "UInt64 LE": ("<Q", 8, False),
+            "UInt64 BE": (">Q", 8, False),
+            "Float32 LE": ("<f", 4, True),
+            "Float32 BE": (">f", 4, True),
+            "Float64 LE": ("<d", 8, True),
+            "Float64 BE": (">d", 8, True),
+        }
+        return dtype_map.get(dtype)
+
+    def color_formats(self):
+        return {
+            "RGB24": ("R", "G", "B"),
+            "RGBA32": ("R", "G", "B", "A"),
+            "BGR24": ("B", "G", "R"),
+            "BGRA32": ("B", "G", "R", "A"),
+            "ARGB32": ("A", "R", "G", "B"),
+            "ABGR32": ("A", "B", "G", "R"),
+            "HSV": ("H", "S", "V"),
+        }
+
+    def vector_component_types(self, endian="LE"):
+        prefix = "<" if endian == "LE" else ">"
+        return {
+            "Int8": ("b", 1, False),
+            "UInt8": ("B", 1, False),
+            "Int16": (prefix + "h", 2, False),
+            "UInt16": (prefix + "H", 2, False),
+            "Int32": (prefix + "i", 4, False),
+            "UInt32": (prefix + "I", 4, False),
+            "Float16": (prefix + "e", 2, True),
+            "Float32": (prefix + "f", 4, True),
+            "Float64": (prefix + "d", 8, True),
+        }
+
+    def vector_shapes(self):
+        return {
+            "Vector2": ("X", "Y"),
+            "Vector3": ("X", "Y", "Z"),
+            "Vector4": ("X", "Y", "Z", "W"),
+            "Quaternion": ("X", "Y", "Z", "W"),
+            "Bounding Box": ("Min X", "Min Y", "Min Z", "Max X", "Max Y", "Max Z"),
+        }
+
+    def parse_component_criteria(self, labels, edits, range_mode, is_float=False):
+        criteria = []
+        for label in labels:
+            if range_mode:
+                min_text, max_text = edits[label]
+                min_text = min_text.text().strip()
+                max_text = max_text.text().strip()
+                if min_text == "" and max_text == "":
+                    criteria.append(None)
+                    continue
+                min_val = float(min_text) if is_float else int(min_text, 0)
+                max_val = float(max_text) if is_float else int(max_text, 0)
+                criteria.append((min(min_val, max_val), max(min_val, max_val)))
+            else:
+                text = edits[label].text().strip()
+                if text == "":
+                    criteria.append(None)
+                    continue
+                criteria.append(float(text) if is_float else int(text, 0))
+        return criteria
+
+    def component_values_match(self, values, criteria, range_mode):
+        for value, criterion in zip(values, criteria):
+            if criterion is None:
+                continue
+            if range_mode:
+                if not (criterion[0] <= value <= criterion[1]):
+                    return False
+            elif value != criterion:
+                return False
+        return True
+
+    def find_color_matches(self, data, fmt_name, criteria, range_mode):
+        labels = self.color_formats()[fmt_name]
+        size = len(labels)
+        matches = []
+        for pos in range(0, len(data) - size + 1):
+            values = list(data[pos:pos + size])
+            if self.component_values_match(values, criteria, range_mode):
+                matches.append(pos)
+        return matches, size
+
+    def find_vector_matches(self, data, shape, component_type, endian, criteria, range_mode):
+        labels = self.vector_shapes()[shape]
+        fmt, component_size, is_float = self.vector_component_types(endian)[component_type]
+        size = component_size * len(labels)
+        matches = []
+        for pos in range(0, len(data) - size + 1):
+            try:
+                values = [
+                    struct.unpack(fmt, data[pos + i * component_size:pos + (i + 1) * component_size])[0]
+                    for i in range(len(labels))
+                ]
+            except Exception:
+                continue
+            if self.component_values_match(values, criteria, range_mode):
+                matches.append(pos)
+        return matches, size
+
+    def pack_vector_component(self, value, component_type, endian):
+        fmt, _size, is_float = self.vector_component_types(endian)[component_type]
+        if is_float:
+            return struct.pack(fmt, float(value))
+        return struct.pack(fmt, int(round(float(value))))
+
+    def selected_bytes_for_dialog(self):
+        if self.current_tab_index < 0:
+            return b""
+        current_file = self.open_files[self.current_tab_index]
+        if self.selection_start is not None and self.selection_end is not None:
+            start = min(self.selection_start, self.selection_end)
+            end = max(self.selection_start, self.selection_end) + 1
+            return bytes(current_file.file_data[start:end])
+        if self.cursor_position is not None and self.cursor_position < len(current_file.file_data):
+            return bytes(current_file.file_data[self.cursor_position:self.cursor_position + self.bytes_per_row])
+        return b""
+
+    def selected_text_for_dialog(self):
+        selected = self.selected_bytes_for_dialog()
+        if not selected:
+            return ""
+        text = ''.join(self._ascii_chars[byte] for byte in selected)
+        return text.strip()
+
+    def set_component_edit_value(self, edit_or_pair, value):
+        if isinstance(edit_or_pair, tuple):
+            edit_or_pair[0].setText(str(value))
+            edit_or_pair[1].setText(str(value))
+        else:
+            edit_or_pair.setText(str(value))
+
+    def fill_color_component_edits(self, fmt_name, edits, selected_bytes):
+        labels = self.color_formats()[fmt_name]
+        if len(selected_bytes) < len(labels):
+            return False
+        for label, value in zip(labels, selected_bytes[:len(labels)]):
+            self.set_component_edit_value(edits[label], value)
+        return True
+
+    def fill_vector_component_edits(self, shape, component_type, endian, edits, selected_bytes):
+        labels = self.vector_shapes()[shape]
+        fmt, component_size, is_float = self.vector_component_types(endian)[component_type]
+        total = component_size * len(labels)
+        if len(selected_bytes) < total:
+            return False
+        for i, label in enumerate(labels):
+            value = struct.unpack(fmt, selected_bytes[i * component_size:(i + 1) * component_size])[0]
+            shown = f"{value:.6g}" if is_float else value
+            self.set_component_edit_value(edits[label], shown)
+        return True
+
+    def add_component_editor_to_grid(self, grid, row, col, label, range_mode, placeholder, width=76):
+        label_widget = QLabel(f"{label}:")
+        label_widget.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        grid.addWidget(label_widget, row, col * 3)
+        if range_mode:
+            min_edit = QLineEdit()
+            max_edit = QLineEdit()
+            min_edit.setPlaceholderText("min")
+            max_edit.setPlaceholderText("max")
+            min_edit.setMaximumWidth(width)
+            max_edit.setMaximumWidth(width)
+            grid.addWidget(min_edit, row, col * 3 + 1)
+            grid.addWidget(max_edit, row, col * 3 + 2)
+            return (min_edit, max_edit)
+        edit = QLineEdit()
+        edit.setPlaceholderText(placeholder)
+        edit.setMaximumWidth(width * 2)
+        grid.addWidget(edit, row, col * 3 + 1, 1, 2)
+        return edit
+
+    def add_component_set_to_grid(self, grid, labels, range_mode, placeholder, edits, columns=2, width=76):
+        labels = list(labels)
+        if set(labels) == {"Min X", "Min Y", "Min Z", "Max X", "Max Y", "Max Z"}:
+            labels = ["Min X", "Max X", "Min Y", "Max Y", "Min Z", "Max Z"]
+            columns = 2
+        for index, label in enumerate(labels):
+            row = index // columns
+            col = index % columns
+            edits[label] = self.add_component_editor_to_grid(grid, row, col, label, range_mode, placeholder, width)
+
+    def get_theme_color_dialog(self, initial=QColor(), parent=None):
+        dialog = QColorDialog(initial if isinstance(initial, QColor) else QColor(initial), parent or self)
+        dialog.setOption(QColorDialog.DontUseNativeDialog, False)
+        QTimer.singleShot(0, lambda: apply_native_titlebar_theme(dialog, self.system_uses_dark_titlebar()))
+        return dialog
+
+    def show_datatype_search_result(self, pos, dtype, data, clickable=False):
+        """Show data type search result with decoded value"""
+        import struct
+        dt_info = self.parse_datatype(dtype)
+        if not dt_info:
+            return
+
+        fmt, size, is_float = dt_info
+
+        # Extract and decode value
+        try:
+            value = struct.unpack(fmt, data[pos:pos+size])[0]
+            if is_float:
+                value_str = f"{value:.6f}"
+            else:
+                value_str = str(value)
+        except:
+            value_str = "error"
+
+        # Show context
+        context_before = 4
+        context_after = 4
+        start = max(0, pos - context_before)
+        end = min(len(data), pos + size + context_after)
+
+        result_widget = QWidget()
+        result_layout = QHBoxLayout()
+        result_layout.setContentsMargins(5, 2, 5, 2)
+
+        hex_parts = []
+        for i in range(start, end):
+            if i >= pos and i < pos + size:
+                hex_parts.append(f"<span style='color: #2196F3; font-weight: bold;'>{data[i]:02X}</span>")
+            else:
+                hex_parts.append(f"{data[i]:02X}")
+
+        hex_str = " ".join(hex_parts)
+
+        result_label = QLabel(f"{dtype}: {value_str} | Hex: {hex_str} | Offset: 0x{pos:X}")
+        result_label.setFont(QFont("Courier", 8))
+        result_label.setTextFormat(Qt.RichText)
+
+        if clickable:
+            result_label.mousePressEvent = lambda event, p=pos: self.goto_search_result(p)
+            result_label.setCursor(Qt.PointingHandCursor)
+            result_label.setStyleSheet("text-decoration: underline;")
+
+        result_layout.addWidget(result_label)
+        result_widget.setLayout(result_layout)
+        self.search_results_layout.addWidget(result_widget)
 
     def show_search_result(self, pos, pattern, data, clickable=False):
         # Show context: 4 bytes before and after
@@ -6878,104 +9799,890 @@ class HexEditorQt(QMainWindow):
     def show_replace_window(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Replace")
-        dialog.setMinimumSize(400, 220)
+        dialog.setMinimumSize(540, 390)
+        dialog.resize(560, 410)
 
-        layout = QVBoxLayout()
+        main_layout = QVBoxLayout()
 
-        # Search pattern
-        search_layout = QHBoxLayout()
-        search_layout.addWidget(QLabel("Find:"))
-        self.replace_find_edit = QLineEdit()
-        search_layout.addWidget(self.replace_find_edit)
-        layout.addLayout(search_layout)
+        # Tab widget for different search types
+        tab_widget = QTabWidget()
+        tab_widget.setMinimumHeight(220)
+        tab_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        tab_widget.setStyleSheet("""
+            QTabBar::tab {
+                font-size: 8pt;
+                padding: 3px 10px;
+                min-width: 52px;
+            }
+        """)
 
-        # Replace pattern
-        replace_layout = QHBoxLayout()
-        replace_layout.addWidget(QLabel("Replace:"))
-        self.replace_with_edit = QLineEdit()
-        replace_layout.addWidget(self.replace_with_edit)
-        layout.addLayout(replace_layout)
+        # --- Text-string Tab ---
+        text_tab = QWidget()
+        text_layout = QVBoxLayout()
+        text_layout.setContentsMargins(10, 10, 10, 10)
 
-        # Search type button (Hex/Text toggle)
-        type_layout = QHBoxLayout()
-        type_layout.addWidget(QLabel("Search type:"))
-        self.replace_type_btn = QPushButton("Hex")
-        self.replace_type_btn.setFont(QFont("Arial", 9, QFont.Bold))
-        self.replace_type_btn.setCheckable(True)
-        self.replace_type_btn.setChecked(True)
-        self.replace_type_btn.setMaximumWidth(100)
+        find_text_layout = QHBoxLayout()
+        find_text_layout.addWidget(QLabel("Find:"))
+        self.replace_text_find_edit = QLineEdit()
+        selected_text = self.selected_text_for_dialog()
+        if selected_text:
+            self.replace_text_find_edit.setText(selected_text)
+        find_text_layout.addWidget(self.replace_text_find_edit)
+        text_layout.addLayout(find_text_layout)
 
-        def toggle_replace_type():
-            if self.replace_type_btn.isChecked():
-                self.replace_type_btn.setText("Hex")
+        replace_text_layout = QHBoxLayout()
+        replace_text_layout.addWidget(QLabel("Replace:"))
+        self.replace_text_with_edit = QLineEdit()
+        replace_text_layout.addWidget(self.replace_text_with_edit)
+        text_layout.addLayout(replace_text_layout)
+
+        text_options = QHBoxLayout()
+        self.replace_text_case_sensitive = QCheckBox("Case-Sensitive")
+        # Improve checkbox visibility on dark backgrounds
+        self.replace_text_case_sensitive.setStyleSheet(f"""
+            QCheckBox {{
+                color: {get_theme_colors(self.current_theme).get('foreground', '#ffffff')};
+                spacing: 5px;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+                border: 2px solid #666;
+                border-radius: 3px;
+                background: #333;
+            }}
+            QCheckBox::indicator:checked {{
+                background: #2196F3;
+                border-color: #2196F3;
+            }}
+            QCheckBox::indicator:hover {{
+                border-color: #888;
+            }}
+        """)
+        text_options.addWidget(self.replace_text_case_sensitive)
+        text_options.addStretch()
+        text_layout.addLayout(text_options)
+
+        # Encoding selection
+        encoding_layout = QHBoxLayout()
+        encoding_layout.addWidget(QLabel("Encoding:"))
+        self.replace_text_encoding_combo = QComboBox()
+        self.replace_text_encoding_combo.addItems([
+            "UTF-8",
+            "UTF-16 LE",
+            "UTF-16 BE",
+            "UTF-32 LE",
+            "UTF-32 BE",
+            "ASCII",
+            "Latin-1 (ISO-8859-1)",
+            "Windows-1252"
+        ])
+        self.replace_text_encoding_combo.setMaximumWidth(180)
+        encoding_layout.addWidget(self.replace_text_encoding_combo)
+        encoding_layout.addStretch()
+        text_layout.addLayout(encoding_layout)
+
+        text_layout.addStretch()
+
+        text_tab.setLayout(text_layout)
+        tab_widget.addTab(text_tab, "Text")
+
+        # --- Hex-values Tab ---
+        hex_tab = QWidget()
+        hex_layout = QVBoxLayout()
+        hex_layout.setContentsMargins(10, 10, 10, 10)
+
+        find_hex_layout = QHBoxLayout()
+        find_hex_layout.addWidget(QLabel("Find:"))
+        self.replace_hex_find_edit = QLineEdit()
+        self.replace_hex_find_edit.setPlaceholderText("e.g., FF 00 A1 B2")
+        selected_bytes = self.selected_bytes_for_dialog()
+        if selected_bytes:
+            self.replace_hex_find_edit.setText(" ".join(f"{b:02X}" for b in selected_bytes))
+        find_hex_layout.addWidget(self.replace_hex_find_edit)
+        hex_layout.addLayout(find_hex_layout)
+
+        replace_hex_layout = QHBoxLayout()
+        replace_hex_layout.addWidget(QLabel("Replace:"))
+        self.replace_hex_with_edit = QLineEdit()
+        self.replace_hex_with_edit.setPlaceholderText("e.g., FF 00 A1 B2")
+        replace_hex_layout.addWidget(self.replace_hex_with_edit)
+        hex_layout.addLayout(replace_hex_layout)
+        hex_layout.addStretch()
+
+        hex_tab.setLayout(hex_layout)
+        tab_widget.addTab(hex_tab, "Hex")
+
+        # --- Data type Tab ---
+        datatype_tab = QWidget()
+        datatype_layout = QVBoxLayout()
+        datatype_layout.setContentsMargins(10, 10, 10, 10)
+
+        # Value/Range toggle button
+        self.replace_datatype_mode_btn = QPushButton("Value")
+        self.replace_datatype_mode_btn.setCheckable(True)
+        self.replace_datatype_mode_btn.setChecked(False)
+        self.replace_datatype_mode_btn.setMaximumWidth(80)
+
+        def toggle_replace_datatype_mode():
+            if self.replace_datatype_mode_btn.isChecked():
+                self.replace_datatype_mode_btn.setText("Range")
+                self.replace_datatype_range_widget.setVisible(True)
+                self.replace_datatype_value_widget.setVisible(False)
             else:
-                self.replace_type_btn.setText("Text")
+                self.replace_datatype_mode_btn.setText("Value")
+                self.replace_datatype_range_widget.setVisible(False)
+                self.replace_datatype_value_widget.setVisible(True)
 
-        self.replace_type_btn.clicked.connect(toggle_replace_type)
-        type_layout.addWidget(self.replace_type_btn)
-        type_layout.addStretch()
-        layout.addLayout(type_layout)
+        self.replace_datatype_mode_btn.clicked.connect(toggle_replace_datatype_mode)
 
-        # Search direction options
-        options_group = QGroupBox("Replace")
-        options_layout = QHBoxLayout()
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Mode:"))
+        mode_layout.addWidget(self.replace_datatype_mode_btn)
+        mode_layout.addStretch()
+        datatype_layout.addLayout(mode_layout)
 
-        self.replace_forward_radio = QRadioButton("All Forward")
-        self.replace_forward_radio.setChecked(True)
-        options_layout.addWidget(self.replace_forward_radio)
+        # Endianness and Data type selection
+        type_layout = QHBoxLayout()
 
-        self.replace_backward_radio = QRadioButton("All Backward")
-        options_layout.addWidget(self.replace_backward_radio)
+        # Endianness toggle button
+        self.replace_endian_btn = QPushButton("LE")
+        self.replace_endian_btn.setCheckable(True)
+        self.replace_endian_btn.setChecked(False)
+        self.replace_endian_btn.setMaximumWidth(50)
+        self.replace_endian_btn.setToolTip("Toggle between Little Endian (LE) and Big Endian (BE)")
+
+        def toggle_replace_endianness():
+            if self.replace_endian_btn.isChecked():
+                self.replace_endian_btn.setText("BE")
+            else:
+                self.replace_endian_btn.setText("LE")
+            update_replace_datatype_list()
+
+        def update_replace_datatype_list():
+            current_text = self.replace_datatype_combo.currentText()
+            current_base = current_text.replace(" LE", "").replace(" BE", "")
+            endian = "BE" if self.replace_endian_btn.isChecked() else "LE"
+
+            simple_types = ["Int8", "UInt8"]
+            sized_types = ["Int16", "UInt16", "Int32", "UInt32", "Int64", "UInt64", "Float32", "Float64"]
+
+            items = simple_types + [f"{t} {endian}" for t in sized_types]
+
+            self.replace_datatype_combo.clear()
+            self.replace_datatype_combo.addItems(items)
+
+            for i in range(self.replace_datatype_combo.count()):
+                if current_base in self.replace_datatype_combo.itemText(i):
+                    self.replace_datatype_combo.setCurrentIndex(i)
+                    break
+
+        self.replace_endian_btn.clicked.connect(toggle_replace_endianness)
+
+        type_layout.addWidget(QLabel("Data type:"))
+        type_layout.addWidget(self.replace_endian_btn)
+        self.replace_datatype_combo = QComboBox()
+        self.replace_datatype_combo.addItems([
+            "Int8", "UInt8", "Int16 LE", "UInt16 LE",
+            "Int32 LE", "UInt32 LE", "Int64 LE", "UInt64 LE",
+            "Float32 LE", "Float64 LE"
+        ])
+        type_layout.addWidget(self.replace_datatype_combo)
+        datatype_layout.addLayout(type_layout)
+
+        # Find Value input (single value) - wrapped in a widget
+        find_label = QLabel("Find:")
+        find_label.setStyleSheet("font-weight: bold;")
+        datatype_layout.addWidget(find_label)
+
+        self.replace_datatype_value_widget = QWidget()
+        self.replace_datatype_value_layout = QHBoxLayout()
+        self.replace_datatype_value_layout.setContentsMargins(0, 0, 0, 0)
+        self.replace_datatype_value_layout.addWidget(QLabel("Value:"))
+        self.replace_datatype_value_edit = QLineEdit()
+        self.replace_datatype_value_edit.setPlaceholderText("e.g., 42 or 3.14")
+        self.replace_datatype_value_layout.addWidget(self.replace_datatype_value_edit)
+        self.replace_datatype_value_widget.setLayout(self.replace_datatype_value_layout)
+        datatype_layout.addWidget(self.replace_datatype_value_widget)
+
+        # Find Range input (min-max) - wrapped in a widget
+        self.replace_datatype_range_widget = QWidget()
+        self.replace_datatype_range_layout = QHBoxLayout()
+        self.replace_datatype_range_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.replace_datatype_range_layout.addWidget(QLabel("Min:"))
+        self.replace_datatype_min_edit = QLineEdit()
+        self.replace_datatype_min_edit.setPlaceholderText("e.g., 0.0")
+        self.replace_datatype_range_layout.addWidget(self.replace_datatype_min_edit)
+
+        self.replace_datatype_range_layout.addWidget(QLabel("Max:"))
+        self.replace_datatype_max_edit = QLineEdit()
+        self.replace_datatype_max_edit.setPlaceholderText("e.g., 1.0")
+        self.replace_datatype_range_layout.addWidget(self.replace_datatype_max_edit)
+
+        self.replace_datatype_range_widget.setLayout(self.replace_datatype_range_layout)
+        self.replace_datatype_range_widget.setVisible(False)
+        datatype_layout.addWidget(self.replace_datatype_range_widget)
+
+        # Replace With section
+        replace_with_label = QLabel("Replace with:")
+        replace_with_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        datatype_layout.addWidget(replace_with_label)
+
+        # Fixed value / Random value toggle
+        self.replace_datatype_with_mode_btn = QPushButton("Fixed")
+        self.replace_datatype_with_mode_btn.setCheckable(True)
+        self.replace_datatype_with_mode_btn.setChecked(False)
+        self.replace_datatype_with_mode_btn.setMaximumWidth(80)
+
+        def toggle_replace_with_mode():
+            if self.replace_datatype_with_mode_btn.isChecked():
+                self.replace_datatype_with_mode_btn.setText("Rand.")
+                self.replace_datatype_with_fixed_widget.setVisible(False)
+                self.replace_datatype_with_random_widget.setVisible(True)
+            else:
+                self.replace_datatype_with_mode_btn.setText("Fixed")
+                self.replace_datatype_with_fixed_widget.setVisible(True)
+                self.replace_datatype_with_random_widget.setVisible(False)
+
+        self.replace_datatype_with_mode_btn.clicked.connect(toggle_replace_with_mode)
+
+        with_mode_layout = QHBoxLayout()
+        with_mode_layout.addWidget(QLabel("Mode:"))
+        with_mode_layout.addWidget(self.replace_datatype_with_mode_btn)
+        with_mode_layout.addStretch()
+        datatype_layout.addLayout(with_mode_layout)
+
+        # Fixed value widget
+        self.replace_datatype_with_fixed_widget = QWidget()
+        with_fixed_layout = QHBoxLayout()
+        with_fixed_layout.setContentsMargins(0, 0, 0, 0)
+        with_fixed_layout.addWidget(QLabel("Value:"))
+        self.replace_datatype_with_edit = QLineEdit()
+        self.replace_datatype_with_edit.setPlaceholderText("e.g., 100 or 2.5")
+        with_fixed_layout.addWidget(self.replace_datatype_with_edit)
+        self.replace_datatype_with_fixed_widget.setLayout(with_fixed_layout)
+        datatype_layout.addWidget(self.replace_datatype_with_fixed_widget)
+
+        # Random value widget
+        self.replace_datatype_with_random_widget = QWidget()
+        with_random_layout = QHBoxLayout()
+        with_random_layout.setContentsMargins(0, 0, 0, 0)
+        with_random_layout.addWidget(QLabel("Min:"))
+        self.replace_datatype_with_min_edit = QLineEdit()
+        self.replace_datatype_with_min_edit.setPlaceholderText("e.g., 0.0")
+        with_random_layout.addWidget(self.replace_datatype_with_min_edit)
+        with_random_layout.addWidget(QLabel("Max:"))
+        self.replace_datatype_with_max_edit = QLineEdit()
+        self.replace_datatype_with_max_edit.setPlaceholderText("e.g., 1.0")
+        with_random_layout.addWidget(self.replace_datatype_with_max_edit)
+        self.replace_datatype_with_random_widget.setLayout(with_random_layout)
+        self.replace_datatype_with_random_widget.setVisible(False)
+        datatype_layout.addWidget(self.replace_datatype_with_random_widget)
+
+        datatype_tab.setLayout(datatype_layout)
+        tab_widget.addTab(datatype_tab, "Data")
+
+        # --- Color Tab ---
+        color_tab = QWidget()
+        color_layout = QVBoxLayout()
+        color_layout.setContentsMargins(10, 10, 10, 10)
+        color_top = QHBoxLayout()
+        self.replace_color_mode_btn = QPushButton("Value")
+        self.replace_color_mode_btn.setCheckable(True)
+        self.replace_color_mode_btn.setMaximumWidth(80)
+        self.replace_color_format_combo = QComboBox()
+        self.replace_color_format_combo.addItems(list(self.color_formats().keys()))
+        color_top.addWidget(QLabel("Find:"))
+        color_top.addWidget(self.replace_color_mode_btn)
+        color_top.addWidget(QLabel("Format:"))
+        color_top.addWidget(self.replace_color_format_combo)
+        replace_color_pick_find_btn = QPushButton("Pick")
+        replace_color_pick_find_btn.setMaximumWidth(90)
+        color_top.addWidget(replace_color_pick_find_btn)
+        color_layout.addLayout(color_top)
+        self.replace_color_find_grid = QGridLayout()
+        color_layout.addLayout(self.replace_color_find_grid)
+        self.replace_color_find_edits = {}
+        replace_color_label = QLabel("Replace with:")
+        replace_color_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        color_layout.addWidget(replace_color_label)
+        color_replace_mode = QHBoxLayout()
+        self.replace_color_with_mode_btn = QPushButton("Fixed")
+        self.replace_color_with_mode_btn.setCheckable(True)
+        self.replace_color_with_mode_btn.setMaximumWidth(80)
+        color_replace_mode.addWidget(QLabel("Mode:"))
+        color_replace_mode.addWidget(self.replace_color_with_mode_btn)
+        replace_color_pick_with_btn = QPushButton("Pick")
+        replace_color_pick_with_btn.setMaximumWidth(110)
+        color_replace_mode.addWidget(replace_color_pick_with_btn)
+        color_replace_mode.addStretch()
+        color_layout.addLayout(color_replace_mode)
+        self.replace_color_with_grid = QGridLayout()
+        color_layout.addLayout(self.replace_color_with_grid)
+        self.replace_color_with_edits = {}
+
+        def rebuild_replace_color_fields():
+            for grid in (self.replace_color_find_grid, self.replace_color_with_grid):
+                while grid.count():
+                    item = grid.takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
+            self.replace_color_find_edits = {}
+            self.replace_color_with_edits = {}
+            labels = self.color_formats()[self.replace_color_format_combo.currentText()]
+            find_range = self.replace_color_mode_btn.isChecked()
+            replace_random = self.replace_color_with_mode_btn.isChecked()
+            self.add_component_set_to_grid(self.replace_color_find_grid, labels, find_range, "any", self.replace_color_find_edits, columns=2, width=62)
+            self.add_component_set_to_grid(self.replace_color_with_grid, labels, replace_random, "keep", self.replace_color_with_edits, columns=2, width=62)
+            self.fill_color_component_edits(self.replace_color_format_combo.currentText(), self.replace_color_find_edits, selected_bytes)
+
+        def toggle_replace_color_mode():
+            self.replace_color_mode_btn.setText("Range" if self.replace_color_mode_btn.isChecked() else "Value")
+            rebuild_replace_color_fields()
+
+        def toggle_replace_color_with_mode():
+            self.replace_color_with_mode_btn.setText("Rand." if self.replace_color_with_mode_btn.isChecked() else "Fixed")
+            rebuild_replace_color_fields()
+
+        self.replace_color_mode_btn.clicked.connect(toggle_replace_color_mode)
+        self.replace_color_with_mode_btn.clicked.connect(toggle_replace_color_with_mode)
+        self.replace_color_format_combo.currentIndexChanged.connect(rebuild_replace_color_fields)
+        rebuild_replace_color_fields()
+        self.fill_color_component_edits(self.replace_color_format_combo.currentText(), self.replace_color_find_edits, selected_bytes)
+
+        def pick_replace_color(target_edits):
+            picker = self.get_theme_color_dialog(parent=dialog)
+            if picker.exec_() == QDialog.Accepted:
+                color = picker.selectedColor()
+                values = {"R": color.red(), "G": color.green(), "B": color.blue(), "A": color.alpha()}
+                for label in self.color_formats()[self.replace_color_format_combo.currentText()]:
+                    if label in values:
+                        self.set_component_edit_value(target_edits[label], values[label])
+
+        replace_color_pick_find_btn.clicked.connect(lambda: pick_replace_color(self.replace_color_find_edits))
+        replace_color_pick_with_btn.clicked.connect(lambda: pick_replace_color(self.replace_color_with_edits))
+        color_layout.addStretch()
+        color_tab.setLayout(color_layout)
+        tab_widget.addTab(color_tab, "Color")
+
+        # --- Vector Tab ---
+        vector_tab = QWidget()
+        vector_layout = QVBoxLayout()
+        vector_layout.setContentsMargins(10, 10, 10, 10)
+        vector_top = QHBoxLayout()
+        self.replace_vector_mode_btn = QPushButton("Value")
+        self.replace_vector_mode_btn.setCheckable(True)
+        self.replace_vector_mode_btn.setMaximumWidth(80)
+        self.replace_vector_endian_btn = QPushButton("LE")
+        self.replace_vector_endian_btn.setCheckable(True)
+        self.replace_vector_endian_btn.setMaximumWidth(50)
+        self.replace_vector_shape_combo = QComboBox()
+        self.replace_vector_shape_combo.addItems(list(self.vector_shapes().keys()))
+        self.replace_vector_type_combo = QComboBox()
+        self.replace_vector_type_combo.addItems(list(self.vector_component_types("LE").keys()))
+        vector_top.addWidget(QLabel("Find:"))
+        vector_top.addWidget(self.replace_vector_mode_btn)
+        vector_top.addWidget(self.replace_vector_endian_btn)
+        vector_top.addWidget(QLabel("Shape:"))
+        vector_top.addWidget(self.replace_vector_shape_combo)
+        vector_top.addWidget(QLabel("Type:"))
+        vector_top.addWidget(self.replace_vector_type_combo)
+        vector_layout.addLayout(vector_top)
+        self.replace_vector_find_grid = QGridLayout()
+        vector_layout.addLayout(self.replace_vector_find_grid)
+        self.replace_vector_find_edits = {}
+        replace_vector_label = QLabel("Replace with:")
+        replace_vector_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        vector_layout.addWidget(replace_vector_label)
+        vector_replace_mode = QHBoxLayout()
+        self.replace_vector_with_mode_btn = QPushButton("Fixed")
+        self.replace_vector_with_mode_btn.setCheckable(True)
+        self.replace_vector_with_mode_btn.setMaximumWidth(80)
+        vector_replace_mode.addWidget(QLabel("Mode:"))
+        vector_replace_mode.addWidget(self.replace_vector_with_mode_btn)
+        vector_replace_mode.addStretch()
+        vector_layout.addLayout(vector_replace_mode)
+        self.replace_vector_with_grid = QGridLayout()
+        vector_layout.addLayout(self.replace_vector_with_grid)
+        self.replace_vector_with_edits = {}
+
+        def rebuild_replace_vector_fields():
+            for grid in (self.replace_vector_find_grid, self.replace_vector_with_grid):
+                while grid.count():
+                    item = grid.takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
+            self.replace_vector_find_edits = {}
+            self.replace_vector_with_edits = {}
+            labels = self.vector_shapes()[self.replace_vector_shape_combo.currentText()]
+            find_range = self.replace_vector_mode_btn.isChecked()
+            replace_random = self.replace_vector_with_mode_btn.isChecked()
+            self.add_component_set_to_grid(self.replace_vector_find_grid, labels, find_range, "any", self.replace_vector_find_edits, columns=2, width=72)
+            self.add_component_set_to_grid(self.replace_vector_with_grid, labels, replace_random, "keep", self.replace_vector_with_edits, columns=2, width=72)
+            self.fill_vector_component_edits(
+                self.replace_vector_shape_combo.currentText(),
+                self.replace_vector_type_combo.currentText(),
+                "BE" if self.replace_vector_endian_btn.isChecked() else "LE",
+                self.replace_vector_find_edits,
+                selected_bytes
+            )
+
+        def toggle_replace_vector_mode():
+            self.replace_vector_mode_btn.setText("Range" if self.replace_vector_mode_btn.isChecked() else "Value")
+            rebuild_replace_vector_fields()
+
+        def toggle_replace_vector_with_mode():
+            self.replace_vector_with_mode_btn.setText("Rand." if self.replace_vector_with_mode_btn.isChecked() else "Fixed")
+            rebuild_replace_vector_fields()
+
+        def toggle_replace_vector_endian():
+            self.replace_vector_endian_btn.setText("BE" if self.replace_vector_endian_btn.isChecked() else "LE")
+            rebuild_replace_vector_fields()
+
+        self.replace_vector_mode_btn.clicked.connect(toggle_replace_vector_mode)
+        self.replace_vector_with_mode_btn.clicked.connect(toggle_replace_vector_with_mode)
+        self.replace_vector_endian_btn.clicked.connect(toggle_replace_vector_endian)
+        self.replace_vector_shape_combo.currentIndexChanged.connect(rebuild_replace_vector_fields)
+        self.replace_vector_type_combo.currentIndexChanged.connect(rebuild_replace_vector_fields)
+        rebuild_replace_vector_fields()
+        self.fill_vector_component_edits(
+            self.replace_vector_shape_combo.currentText(),
+            self.replace_vector_type_combo.currentText(),
+            "BE" if self.replace_vector_endian_btn.isChecked() else "LE",
+            self.replace_vector_find_edits,
+            selected_bytes
+        )
+        vector_layout.addStretch()
+        vector_tab.setLayout(vector_layout)
+        tab_widget.addTab(vector_tab, "Vector")
+
+        main_layout.addWidget(tab_widget)
+
+        # Store current tab widget reference
+        self.replace_tab_widget = tab_widget
+
+        # Search direction and range options
+        direction_range_layout = QHBoxLayout()
+
+        # Direction group box (left side)
+        direction_group = QGroupBox("Replace direction")
+        direction_group.setMaximumHeight(74)
+        direction_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        direction_group_layout = QHBoxLayout()
+        direction_group_layout.setContentsMargins(8, 10, 8, 4)
+        direction_group_layout.setAlignment(Qt.AlignVCenter)
+
+        radio_style = """
+            QRadioButton {
+                color: white;
+                spacing: 5px;
+            }
+            QRadioButton::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 8px;
+                border: 2px solid #666;
+                background: #333;
+            }
+            QRadioButton::indicator:checked {
+                background: #2196F3;
+                border-color: #2196F3;
+            }
+            QRadioButton::indicator:hover {
+                border-color: #888;
+            }
+        """
 
         self.replace_all_radio = QRadioButton("All")
-        options_layout.addWidget(self.replace_all_radio)
+        self.replace_all_radio.setStyleSheet(radio_style)
+        direction_group_layout.addWidget(self.replace_all_radio)
 
-        options_group.setLayout(options_layout)
-        layout.addWidget(options_group)
+        self.replace_forward_radio = QRadioButton("Forward")
+        self.replace_forward_radio.setChecked(True)
+        self.replace_forward_radio.setStyleSheet(radio_style)
+        direction_group_layout.addWidget(self.replace_forward_radio)
+
+        self.replace_backward_radio = QRadioButton("Backward")
+        self.replace_backward_radio.setStyleSheet(radio_style)
+        direction_group_layout.addWidget(self.replace_backward_radio)
+
+        self.replace_range_radio = QRadioButton("Range")
+        self.replace_range_radio.setStyleSheet(radio_style)
+        direction_group_layout.addWidget(self.replace_range_radio)
+
+        direction_group.setLayout(direction_group_layout)
+        direction_range_layout.addWidget(direction_group)
+
+        # Offset Range group box (right side)
+        range_group = QGroupBox("Offset Range")
+        range_group.setMaximumHeight(74)
+        range_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        range_group_layout = QHBoxLayout()
+        range_group_layout.setContentsMargins(8, 10, 8, 4)
+        range_group_layout.setAlignment(Qt.AlignVCenter)
+
+        self.replace_range_min_edit = QLineEdit()
+        self.replace_range_min_edit.setPlaceholderText("Min (hex)")
+        self.replace_range_min_edit.setMaximumWidth(100)
+        self.replace_range_min_edit.setEnabled(False)
+        range_group_layout.addWidget(self.replace_range_min_edit)
+
+        self.replace_range_max_edit = QLineEdit()
+        self.replace_range_max_edit.setPlaceholderText("Max (hex)")
+        self.replace_range_max_edit.setMaximumWidth(100)
+        self.replace_range_max_edit.setEnabled(False)
+        range_group_layout.addWidget(self.replace_range_max_edit)
+
+        range_group.setLayout(range_group_layout)
+        direction_range_layout.addWidget(range_group)
+
+        # Connect range radio to enable/disable range inputs
+        def toggle_range_inputs():
+            enabled = self.replace_range_radio.isChecked()
+            self.replace_range_min_edit.setEnabled(enabled)
+            self.replace_range_max_edit.setEnabled(enabled)
+
+        self.replace_range_radio.toggled.connect(toggle_range_inputs)
+
+        main_layout.addLayout(direction_range_layout)
 
         # Buttons
         button_layout = QHBoxLayout()
         button_layout.addStretch()
 
         replace_btn = QPushButton("Replace")
+        replace_btn.setDefault(True)
         replace_btn.clicked.connect(lambda: self.perform_replace(dialog))
         button_layout.addWidget(replace_btn)
 
-        close_btn = QPushButton("Close")
+        close_btn = QPushButton("Cancel")
         close_btn.clicked.connect(dialog.close)
         button_layout.addWidget(close_btn)
 
-        layout.addLayout(button_layout)
+        main_layout.addLayout(button_layout)
 
-        dialog.setLayout(layout)
+        dialog.setLayout(main_layout)
         dialog.show()
 
     def perform_replace(self, dialog):
         if self.current_tab_index < 0:
             return
 
-        # Get search and replace patterns
-        find_text = self.replace_find_edit.text()
-        replace_text = self.replace_with_edit.text()
+        current_tab = self.replace_tab_widget.currentIndex()
 
-        if not find_text:
-            QMessageBox.warning(dialog, "Error", "Please enter search pattern")
-            return
+        # Get find and replace patterns based on active tab
+        if current_tab == 0:  # Text-string
+            find_text = self.replace_text_find_edit.text()
+            replace_text = self.replace_text_with_edit.text()
 
-        # Parse patterns based on search type
-        is_hex = self.replace_type_btn.isChecked()
+            if not find_text:
+                QMessageBox.warning(dialog, "Error", "Please enter search text")
+                return
 
-        try:
-            if is_hex:
-                # Parse hex patterns
+            case_sensitive = self.replace_text_case_sensitive.isChecked()
+            encoding = self.replace_text_encoding_combo.currentText()
+            codec = self.get_text_encoding(encoding)
+
+            try:
+                find_pattern = find_text.encode(codec)
+                replace_pattern = replace_text.encode(codec)
+            except (UnicodeEncodeError, LookupError) as e:
+                QMessageBox.warning(dialog, "Error", f"Cannot encode text with {encoding}: {str(e)}")
+                return
+
+        elif current_tab == 1:  # Hex-values
+            find_text = self.replace_hex_find_edit.text()
+            replace_text = self.replace_hex_with_edit.text()
+
+            if not find_text:
+                QMessageBox.warning(dialog, "Error", "Please enter search pattern")
+                return
+
+            try:
                 find_pattern = bytes.fromhex(find_text.replace(' ', '').replace('0x', ''))
                 replace_pattern = bytes.fromhex(replace_text.replace(' ', '').replace('0x', ''))
+            except ValueError as e:
+                QMessageBox.warning(dialog, "Error", f"Invalid hex pattern: {str(e)}")
+                return
+
+        elif current_tab == 2:  # Data type
+            import struct
+            import random
+
+            dtype = self.replace_datatype_combo.currentText()
+            dt_info = self.parse_datatype(dtype)
+            if not dt_info:
+                QMessageBox.warning(dialog, "Error", f"Invalid data type: {dtype}")
+                return
+
+            fmt, size, is_float = dt_info
+
+            # Determine search mode (Value or Range)
+            is_range = self.replace_datatype_mode_btn.isChecked()
+
+            # Get search criteria
+            if is_range:
+                min_text = self.replace_datatype_min_edit.text()
+                max_text = self.replace_datatype_max_edit.text()
+                if not min_text or not max_text:
+                    QMessageBox.warning(dialog, "Error", "Please enter min and max values for range search")
+                    return
+                try:
+                    search_min = float(min_text) if is_float else int(min_text)
+                    search_max = float(max_text) if is_float else int(max_text)
+                except ValueError:
+                    QMessageBox.warning(dialog, "Error", "Invalid min/max values")
+                    return
             else:
-                # Use text patterns (decoded)
-                find_pattern = find_text.encode('utf-8')
-                replace_pattern = replace_text.encode('utf-8')
-        except ValueError as e:
-            QMessageBox.warning(dialog, "Error", f"Invalid pattern format: {str(e)}")
+                value_text = self.replace_datatype_value_edit.text()
+                if not value_text:
+                    QMessageBox.warning(dialog, "Error", "Please enter search value")
+                    return
+                try:
+                    search_value = float(value_text) if is_float else int(value_text)
+                except ValueError:
+                    QMessageBox.warning(dialog, "Error", "Invalid search value")
+                    return
+
+            # Get replacement mode (Fixed or Random)
+            is_random_replace = self.replace_datatype_with_mode_btn.isChecked()
+
+            if is_random_replace:
+                replace_min_text = self.replace_datatype_with_min_edit.text()
+                replace_max_text = self.replace_datatype_with_max_edit.text()
+                if not replace_min_text or not replace_max_text:
+                    QMessageBox.warning(dialog, "Error", "Please enter min and max values for random replacement")
+                    return
+                try:
+                    replace_min = float(replace_min_text) if is_float else int(replace_min_text)
+                    replace_max = float(replace_max_text) if is_float else int(replace_max_text)
+                except ValueError:
+                    QMessageBox.warning(dialog, "Error", "Invalid replacement min/max values")
+                    return
+            else:
+                replace_value_text = self.replace_datatype_with_edit.text()
+                if not replace_value_text:
+                    QMessageBox.warning(dialog, "Error", "Please enter replacement value")
+                    return
+                try:
+                    replace_value = float(replace_value_text) if is_float else int(replace_value_text)
+                except ValueError:
+                    QMessageBox.warning(dialog, "Error", "Invalid replacement value")
+                    return
+
+            # Search for matching values in the data
+            current_file = self.open_files[self.current_tab_index]
+            data = current_file.file_data
+
+            # Determine search direction
+            if self.replace_forward_radio.isChecked():
+                start_pos = self.cursor_position if self.cursor_position is not None else 0
+                if self.selection_start is not None:
+                    start_pos = min(self.selection_start, self.selection_end)
+                search_start = start_pos
+                search_end = len(data)
+            elif self.replace_backward_radio.isChecked():
+                end_pos = self.cursor_position if self.cursor_position is not None else len(data)
+                if self.selection_start is not None:
+                    end_pos = min(self.selection_start, self.selection_end)
+                search_start = 0
+                search_end = end_pos
+            else:  # All
+                search_start = 0
+                search_end = len(data)
+
+            # Find all matching values
+            matches = []
+            pos = search_start
+            while pos <= search_end - size:
+                try:
+                    value = struct.unpack(fmt, data[pos:pos+size])[0]
+                    if is_range:
+                        if search_min <= value <= search_max:
+                            matches.append(pos)
+                    else:
+                        if value == search_value:
+                            matches.append(pos)
+                except:
+                    pass
+                pos += 1
+
+            if not matches:
+                QMessageBox.information(dialog, "Replace", "No matches found")
+                return
+
+            # Confirm replacement
+            reply = QMessageBox.question(
+                dialog,
+                "Confirm Replace",
+                f"Replace {len(matches)} occurrence(s)?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+            # Perform replacement
+            self.save_undo_state()
+
+            data = bytearray(current_file.file_data)
+            for pos in matches:
+                # Generate replacement value
+                if is_random_replace:
+                    if is_float:
+                        new_value = random.uniform(replace_min, replace_max)
+                    else:
+                        new_value = random.randint(replace_min, replace_max)
+                else:
+                    new_value = replace_value
+
+                # Pack and write the new value
+                try:
+                    packed = struct.pack(fmt, new_value)
+                    for i, byte in enumerate(packed):
+                        data[pos + i] = byte
+                        current_file.replaced_bytes.add(pos + i)
+                except:
+                    pass
+
+            # Update file data
+            current_file.file_data = bytes(data)
+            current_file.modified = True
+            self.display_hex(preserve_scroll=True)
+            self.update_tab_title(self.current_tab_index)
+
+            QMessageBox.information(dialog, "Replace", f"Replaced {len(matches)} occurrence(s)")
+            dialog.close()
+            return
+
+        elif current_tab in (3, 4):  # Color / Vector
+            import random
+            current_file = self.open_files[self.current_tab_index]
+            data = bytearray(current_file.file_data)
+
+            if current_tab == 3:
+                fmt_name = self.replace_color_format_combo.currentText()
+                labels = self.color_formats()[fmt_name]
+                size = len(labels)
+                is_range = self.replace_color_mode_btn.isChecked()
+                is_random_replace = self.replace_color_with_mode_btn.isChecked()
+                try:
+                    criteria = self.parse_component_criteria(labels, self.replace_color_find_edits, is_range, is_float=False)
+                except ValueError:
+                    QMessageBox.warning(dialog, "Error", "Invalid color find value/range")
+                    return
+
+                def read_values(pos):
+                    return list(data[pos:pos + size])
+
+                def build_replacement(old_values):
+                    values = list(old_values)
+                    for index, label in enumerate(labels):
+                        if is_random_replace:
+                            mn_edit, mx_edit = self.replace_color_with_edits[label]
+                            mn_text, mx_text = mn_edit.text().strip(), mx_edit.text().strip()
+                            if mn_text == "" and mx_text == "":
+                                continue
+                            mn = int(mn_text, 0)
+                            mx = int(mx_text, 0)
+                            values[index] = max(0, min(255, random.randint(min(mn, mx), max(mn, mx))))
+                        else:
+                            text = self.replace_color_with_edits[label].text().strip()
+                            if text == "":
+                                continue
+                            values[index] = max(0, min(255, int(text, 0)))
+                    return bytes(values)
+
+            else:
+                shape = self.replace_vector_shape_combo.currentText()
+                component_type = self.replace_vector_type_combo.currentText()
+                endian = "BE" if self.replace_vector_endian_btn.isChecked() else "LE"
+                labels = self.vector_shapes()[shape]
+                fmt, component_size, is_float = self.vector_component_types(endian)[component_type]
+                size = component_size * len(labels)
+                is_range = self.replace_vector_mode_btn.isChecked()
+                is_random_replace = self.replace_vector_with_mode_btn.isChecked()
+                try:
+                    criteria = self.parse_component_criteria(labels, self.replace_vector_find_edits, is_range, is_float=is_float)
+                except ValueError:
+                    QMessageBox.warning(dialog, "Error", "Invalid vector find value/range")
+                    return
+
+                def read_values(pos):
+                    return [
+                        struct.unpack(fmt, data[pos + i * component_size:pos + (i + 1) * component_size])[0]
+                        for i in range(len(labels))
+                    ]
+
+                def build_replacement(old_values):
+                    out = bytearray()
+                    for index, label in enumerate(labels):
+                        value = old_values[index]
+                        if is_random_replace:
+                            mn_edit, mx_edit = self.replace_vector_with_edits[label]
+                            mn_text, mx_text = mn_edit.text().strip(), mx_edit.text().strip()
+                            if mn_text != "" or mx_text != "":
+                                mn = float(mn_text) if is_float else int(mn_text, 0)
+                                mx = float(mx_text) if is_float else int(mx_text, 0)
+                                value = random.uniform(min(mn, mx), max(mn, mx)) if is_float else random.randint(min(mn, mx), max(mn, mx))
+                        else:
+                            text = self.replace_vector_with_edits[label].text().strip()
+                            if text != "":
+                                value = float(text) if is_float else int(text, 0)
+                        out.extend(struct.pack(fmt, value if is_float else int(round(float(value)))))
+                    return bytes(out)
+
+            if self.replace_forward_radio.isChecked():
+                search_start = self.cursor_position if self.cursor_position is not None else 0
+                if self.selection_start is not None:
+                    search_start = min(self.selection_start, self.selection_end)
+                search_end = len(data)
+            elif self.replace_backward_radio.isChecked():
+                search_start = 0
+                search_end = self.cursor_position if self.cursor_position is not None else len(data)
+                if self.selection_start is not None:
+                    search_end = min(self.selection_start, self.selection_end)
+            elif self.replace_range_radio.isChecked():
+                try:
+                    search_start = int(self.replace_range_min_edit.text().strip(), 16)
+                    search_end = int(self.replace_range_max_edit.text().strip(), 16)
+                except ValueError:
+                    QMessageBox.warning(dialog, "Error", "Invalid hex values for offset range")
+                    return
+            else:
+                search_start = 0
+                search_end = len(data)
+
+            matches = []
+            for pos in range(search_start, max(search_start, search_end - size + 1)):
+                try:
+                    values = read_values(pos)
+                except Exception:
+                    continue
+                if self.component_values_match(values, criteria, is_range):
+                    matches.append((pos, values))
+
+            if not matches:
+                QMessageBox.information(dialog, "Replace", "No matches found")
+                return
+
+            reply = QMessageBox.question(dialog, "Confirm Replace", f"Replace {len(matches)} occurrence(s)?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+
+            self.save_undo_state()
+            for pos, old_values in matches:
+                packed = build_replacement(old_values)
+                data[pos:pos + size] = packed
+                current_file.replaced_bytes.update(range(pos, pos + size))
+            current_file.file_data = data
+            current_file.modified = True
+            current_file.pattern_highlights_dirty = True
+            self.display_hex(preserve_scroll=True)
+            self.update_tab_title(self.current_tab_index)
+            QMessageBox.information(dialog, "Replace", f"Replaced {len(matches)} occurrence(s)")
+            dialog.close()
             return
 
         current_file = self.open_files[self.current_tab_index]
@@ -6996,6 +10703,25 @@ class HexEditorQt(QMainWindow):
                 end_pos = min(self.selection_start, self.selection_end)
             search_start = 0
             search_end = end_pos
+        elif self.replace_range_radio.isChecked():
+            # Use custom range
+            try:
+                min_text = self.replace_range_min_edit.text().strip()
+                max_text = self.replace_range_max_edit.text().strip()
+
+                if not min_text or not max_text:
+                    QMessageBox.warning(dialog, "Error", "Please enter both min and max offset values")
+                    return
+
+                search_start = int(min_text, 16)
+                search_end = int(max_text, 16)
+
+                if search_start < 0 or search_end > len(data) or search_start >= search_end:
+                    QMessageBox.warning(dialog, "Error", "Invalid offset range")
+                    return
+            except ValueError:
+                QMessageBox.warning(dialog, "Error", "Invalid hex values for offset range")
+                return
         else:  # All
             search_start = 0
             search_end = len(data)
@@ -7359,6 +11085,7 @@ class HexEditorQt(QMainWindow):
                 "end": subfield.end,
                 "data_type": subfield.data_type,
                 "endian": subfield.endian,
+                "overlay_pointer": getattr(subfield, "overlay_pointer", False),
                 "subfields": self._serialize_subfields(subfield.subfields) if subfield.subfields else []
             }
             serialized.append(subfield_dict)
@@ -7376,9 +11103,36 @@ class HexEditorQt(QMainWindow):
                 subfield_data["data_type"],
                 subfield_data["endian"]
             )
+            subfield.overlay_pointer = subfield_data.get("overlay_pointer", False)
             subfield.subfields = self._deserialize_subfields(subfield_data.get("subfields", []))
             subfields.append(subfield)
         return subfields
+
+    def get_json_save_state(self, tab_index=None):
+        """Return JSON-saveable annotation state for a tab."""
+        if tab_index is None:
+            tab_index = self.current_tab_index
+        if tab_index < 0 or tab_index >= len(self.open_files):
+            return {}
+
+        current_file = self.open_files[tab_index]
+        current_fields = [
+            field for field in self.fields_widget.fields
+            if hasattr(self, 'fields_widget') and field.tab_index == tab_index
+        ] if hasattr(self, 'fields_widget') else []
+
+        return {
+            "highlights": bool(current_file.byte_highlights or current_file.pattern_highlights),
+            "pointers": bool(hasattr(self, 'signature_widget') and self.signature_widget.pointers),
+            "pattern_labels": bool(current_file.pattern_labels),
+            "delimiters": bool(self.hidden_delimiters),
+            "fields": bool(current_fields),
+            "current_fields": current_fields,
+        }
+
+    def has_json_save_data(self, tab_index=None):
+        state = self.get_json_save_state(tab_index)
+        return any(state.get(key, False) for key in ("highlights", "pointers", "pattern_labels", "delimiters", "fields"))
 
     def save_json(self):
         if self.current_tab_index < 0:
@@ -7388,11 +11142,13 @@ class HexEditorQt(QMainWindow):
         current_file = self.open_files[self.current_tab_index]
 
         # Check if there's anything to save
-        has_highlights = current_file.byte_highlights or current_file.pattern_highlights
-        has_pointers = hasattr(self, 'signature_widget') and self.signature_widget.pointers
-        has_pattern_labels = current_file.pattern_labels
-        has_delimiters = bool(self.hidden_delimiters)
-        has_fields = hasattr(self, 'fields_widget') and self.fields_widget.fields
+        json_state = self.get_json_save_state(self.current_tab_index)
+        has_highlights = json_state.get("highlights", False)
+        has_pointers = json_state.get("pointers", False)
+        has_pattern_labels = json_state.get("pattern_labels", False)
+        has_delimiters = json_state.get("delimiters", False)
+        current_fields = json_state.get("current_fields", [])
+        has_fields = json_state.get("fields", False)
 
         if not has_highlights and not has_pointers and not has_pattern_labels and not has_delimiters and not has_fields:
             QMessageBox.information(self, "No Data", "No highlights, pointers, pattern labels, hidden delimiters, or fields to save")
@@ -7573,9 +11329,9 @@ class HexEditorQt(QMainWindow):
                     highlights_data["hidden_delimiters"] = self.hidden_delimiters
 
                 # Add fields section if selected
-                if selected.get('fields', False) and hasattr(self, 'fields_widget') and self.fields_widget.fields:
+                if selected.get('fields', False) and current_fields:
                     fields_data = []
-                    for field in self.fields_widget.fields:
+                    for field in current_fields:
                         field_dict = {
                             "label": field.label,
                             "start": field.start,
@@ -7721,14 +11477,17 @@ class HexEditorQt(QMainWindow):
                 # Load fields
                 fields_count = 0
                 if "fields" in json_data and hasattr(self, 'fields_widget'):
-                    self.fields_widget.fields.clear()
+                    self.fields_widget.fields = [
+                        field for field in self.fields_widget.fields
+                        if field.tab_index != self.current_tab_index
+                    ]
                     for field_data in json_data["fields"]:
                         from datainspect.fields import Field
                         field = Field(
                             field_data["label"],
                             field_data["start"],
                             field_data["end"],
-                            field_data["tab_index"]
+                            self.current_tab_index
                         )
                         field.subfields = self._deserialize_subfields(field_data.get("subfields", []))
                         self.fields_widget.fields.append(field)
@@ -7980,16 +11739,11 @@ class HexEditorQt(QMainWindow):
     def show_calculator_window(self):
         dialog = QDialog(self, Qt.Window)
         dialog.setWindowTitle("Hex Calculator")
-        dialog.setMinimumSize(550, 650)
+        dialog.setMinimumSize(480, 520)
         dialog.setModal(False)
 
-        # Apply theme stylesheet - use Light or Dark theme based on current theme brightness
-        if self.is_dark_theme():
-            base_theme_name = "Dark"
-        else:
-            base_theme_name = "Light"
-        style = get_theme_stylesheet(base_theme_name)
-        dialog.setStyleSheet(style)
+        dialog.setStyleSheet(get_theme_stylesheet(self.current_theme))
+        QTimer.singleShot(0, lambda: apply_native_titlebar_theme(dialog, self.system_uses_dark_titlebar()))
 
         self.auxiliary_windows.append(dialog)
 
@@ -8036,8 +11790,7 @@ class HexEditorQt(QMainWindow):
         inspector_fields = {}
 
         def add_inspector_row(label_text):
-            # Get base theme colors (Light or Dark based on current theme brightness)
-            theme_colors = get_theme_colors(base_theme_name)
+            theme_colors = get_theme_colors(self.current_theme)
             inspector_bg = theme_colors.get('inspector_bg', theme_colors.get('background', '#1a1a1a'))
             menubar_bg = theme_colors.get('menubar_bg', theme_colors.get('background', '#1a1a1a'))
             border_color = theme_colors.get('border', '#3a3a3a')
@@ -8449,22 +12202,17 @@ class HexEditorQt(QMainWindow):
         dialog = QDialog(self, Qt.Window)
         dialog.setWindowTitle("Color Picker")
         dialog.resize(500, 650)
-        dialog.setMinimumSize(450, 600)
+        dialog.setMinimumSize(420, 520)
         dialog.setModal(False)
 
         # Track this window
         self.auxiliary_windows.append(dialog)
 
-        # Apply theme stylesheet - use Light or Dark theme based on current theme brightness
-        if self.is_dark_theme():
-            base_theme_name = "Dark"
-        else:
-            base_theme_name = "Light"
-        style = get_theme_stylesheet(base_theme_name)
-        dialog.setStyleSheet(style)
+        dialog.setStyleSheet(get_theme_stylesheet(self.current_theme))
+        QTimer.singleShot(0, lambda: apply_native_titlebar_theme(dialog, self.system_uses_dark_titlebar()))
 
-        # Get base theme colors for additional styling
-        theme = get_theme_colors(base_theme_name)
+        # Get active theme colors for additional styling
+        theme = get_theme_colors(self.current_theme)
 
         # Apply additional theme styling specific to color picker
         additional_style = dialog.styleSheet() + f"""
@@ -8814,13 +12562,17 @@ class HexEditorQt(QMainWindow):
         dialog.setMinimumSize(1400, 900)
         dialog.resize(1400, 900)
 
-        # Apply theme stylesheet - use Light or Dark theme based on current theme brightness
-        if self.is_dark_theme():
-            base_theme_name = "Dark"
-        else:
-            base_theme_name = "Light"
-        style = get_theme_stylesheet(base_theme_name)
-        dialog.setStyleSheet(style)
+        dialog.setStyleSheet(get_theme_stylesheet(self.current_theme))
+        QTimer.singleShot(0, lambda: apply_native_titlebar_theme(dialog, self.system_uses_dark_titlebar()))
+        theme_colors = get_theme_colors(self.current_theme)
+        compare_surfaces = get_theme_surface_colors(theme_colors)
+        compare_bg = theme_colors.get('background', '#1e1e1e')
+        compare_editor_bg = compare_surfaces.get("control", compare_bg)
+        compare_fg = theme_colors.get('editor_fg', theme_colors.get('foreground', '#d4d4d4'))
+        compare_header_fg = theme_colors.get('foreground', compare_fg)
+        compare_border = theme_colors.get('border', '#555555')
+        compare_grid = theme_colors.get('grid_line', compare_border)
+        compare_offset_fg = compare_fg
 
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 10, 10, 10)
@@ -8860,7 +12612,7 @@ class HexEditorQt(QMainWindow):
 
         # File 2
         file2_layout = QVBoxLayout()
-        file2_label = QLabel("File 2 (Read-Only Reference):")
+        file2_label = QLabel("File 2:")
         file2_label.setFont(QFont("Arial", 9, QFont.Bold))
         file2_layout.addWidget(file2_label)
 
@@ -8909,6 +12661,11 @@ class HexEditorQt(QMainWindow):
         toggle_highlight_share_btn.setFont(QFont("Arial", 8))
         controls_layout.addWidget(toggle_highlight_share_btn)
 
+        sync_click_check = QCheckBox("Sync offset on click")
+        sync_click_check.setChecked(True)
+        sync_click_check.setFont(QFont("Arial", 8))
+        controls_layout.addWidget(sync_click_check)
+
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
 
@@ -8917,6 +12674,7 @@ class HexEditorQt(QMainWindow):
 
         # File 1 display (editable)
         file1_container = QWidget()
+        file1_container.setStyleSheet(f"QWidget {{ background-color: {compare_bg}; color: {compare_fg}; }}")
         file1_container_layout = QVBoxLayout()
         file1_container_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -8924,6 +12682,7 @@ class HexEditorQt(QMainWindow):
         file1_header_layout.setContentsMargins(0, 0, 0, 0)
         file1_display_label = QLabel("File 1 - Editable")
         file1_display_label.setFont(QFont("Arial", 9, QFont.Bold))
+        file1_display_label.setStyleSheet(f"color: {compare_header_fg};")
         file1_header_layout.addWidget(file1_display_label)
         file1_container_layout.addLayout(file1_header_layout)
 
@@ -8935,18 +12694,20 @@ class HexEditorQt(QMainWindow):
         file1_offset_header.setMinimumWidth(100)
         file1_offset_header.setMaximumWidth(100)
         file1_offset_header.setAlignment(Qt.AlignCenter)
+        file1_offset_header.setStyleSheet(f"color: {compare_header_fg};")
         file1_headers.addWidget(file1_offset_header)
 
         file1_hex_header = QLabel("Hex Bytes")
         file1_hex_header.setFont(QFont("Courier", 8, QFont.Bold))
         file1_hex_header.setAlignment(Qt.AlignCenter)
+        file1_hex_header.setStyleSheet(f"color: {compare_header_fg};")
         file1_headers.addWidget(file1_hex_header)
 
         file1_text_header = QLabel("Decoded Text")
         file1_text_header.setFont(QFont("Courier", 8, QFont.Bold))
         file1_text_header.setMinimumWidth(150)
-        file1_text_header.setMaximumWidth(150)
         file1_text_header.setAlignment(Qt.AlignCenter)
+        file1_text_header.setStyleSheet(f"color: {compare_header_fg};")
         file1_headers.addWidget(file1_text_header)
 
         file1_container_layout.addLayout(file1_headers)
@@ -8955,20 +12716,34 @@ class HexEditorQt(QMainWindow):
         file1_display.setFont(QFont("Courier", 10))
         file1_display.setReadOnly(True)
         file1_display.setMinimumHeight(500)
-        file1_container_layout.addWidget(file1_display, 1)
+        file1_display.setLineWrapMode(QTextEdit.NoWrap)
+        file1_display.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        file1_display.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        file1_display.setStyleSheet(f"QTextEdit {{ background-color: {compare_editor_bg}; color: {compare_fg}; border: 1px solid {compare_border}; }}")
+        file1_display_row = QHBoxLayout()
+        file1_display_row.setContentsMargins(0, 0, 0, 0)
+        file1_display_row.setSpacing(0)
+        file1_display_row.addWidget(file1_display, 1)
+        file1_compare_scrollbar = QScrollBar(Qt.Vertical)
+        file1_compare_scrollbar.setSingleStep(1)
+        file1_display_row.addWidget(file1_compare_scrollbar)
+        file1_container_layout.addLayout(file1_display_row, 1)
+        file1_separator_overlay = CompareSeparatorOverlay(file1_display, compare_grid)
 
         file1_container.setLayout(file1_container_layout)
         compare_splitter.addWidget(file1_container)
 
         # File 2 display (read-only)
         file2_container = QWidget()
+        file2_container.setStyleSheet(f"QWidget {{ background-color: {compare_bg}; color: {compare_fg}; }}")
         file2_container_layout = QVBoxLayout()
         file2_container_layout.setContentsMargins(0, 0, 0, 0)
 
         file2_header_layout = QHBoxLayout()
         file2_header_layout.setContentsMargins(0, 0, 0, 0)
-        file2_display_label = QLabel("File 2 - Read-Only Reference")
+        file2_display_label = QLabel("File 2 - Editable if Open")
         file2_display_label.setFont(QFont("Arial", 9, QFont.Bold))
+        file2_display_label.setStyleSheet(f"color: {compare_header_fg};")
         file2_header_layout.addWidget(file2_display_label)
         file2_container_layout.addLayout(file2_header_layout)
 
@@ -8980,18 +12755,20 @@ class HexEditorQt(QMainWindow):
         file2_offset_header.setMinimumWidth(100)
         file2_offset_header.setMaximumWidth(100)
         file2_offset_header.setAlignment(Qt.AlignCenter)
+        file2_offset_header.setStyleSheet(f"color: {compare_header_fg};")
         file2_headers.addWidget(file2_offset_header)
 
         file2_hex_header = QLabel("Hex Bytes")
         file2_hex_header.setFont(QFont("Courier", 8, QFont.Bold))
         file2_hex_header.setAlignment(Qt.AlignCenter)
+        file2_hex_header.setStyleSheet(f"color: {compare_header_fg};")
         file2_headers.addWidget(file2_hex_header)
 
         file2_text_header = QLabel("Decoded Text")
         file2_text_header.setFont(QFont("Courier", 8, QFont.Bold))
         file2_text_header.setMinimumWidth(150)
-        file2_text_header.setMaximumWidth(150)
         file2_text_header.setAlignment(Qt.AlignCenter)
+        file2_text_header.setStyleSheet(f"color: {compare_header_fg};")
         file2_headers.addWidget(file2_text_header)
 
         file2_container_layout.addLayout(file2_headers)
@@ -9001,23 +12778,48 @@ class HexEditorQt(QMainWindow):
         file2_display.setReadOnly(True)
         file2_display.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         file2_display.setMinimumHeight(500)
-        file2_container_layout.addWidget(file2_display, 1)
+        file2_display.setLineWrapMode(QTextEdit.NoWrap)
+        file2_display.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        file2_display.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        file2_display.setStyleSheet(f"QTextEdit {{ background-color: {compare_editor_bg}; color: {compare_fg}; border: 1px solid {compare_border}; }}")
+        file2_display_row = QHBoxLayout()
+        file2_display_row.setContentsMargins(0, 0, 0, 0)
+        file2_display_row.setSpacing(0)
+        file2_display_row.addWidget(file2_display, 1)
+        file2_compare_scrollbar = QScrollBar(Qt.Vertical)
+        file2_compare_scrollbar.setSingleStep(1)
+        file2_display_row.addWidget(file2_compare_scrollbar)
+        file2_container_layout.addLayout(file2_display_row, 1)
+        file2_separator_overlay = CompareSeparatorOverlay(file2_display, compare_grid)
+
+        def update_compare_separator_positions():
+            char_width = max(1, file1_display.fontMetrics().horizontalAdvance("0"))
+            offset_separator_x = int(11.25 * char_width)
+            decoded_separator_x = int(61 * char_width)
+            file1_separator_overlay.set_positions(offset_separator_x, decoded_separator_x)
+            file2_separator_overlay.set_positions(offset_separator_x, decoded_separator_x)
+
+        file1_compare_scrollbar.valueChanged.connect(lambda _value: file1_separator_overlay.refresh())
+        file2_compare_scrollbar.valueChanged.connect(lambda _value: file2_separator_overlay.refresh())
 
         file2_container.setLayout(file2_container_layout)
         compare_splitter.addWidget(file2_container)
 
-        layout.addWidget(compare_splitter, 1)
+        compare_area_layout = QHBoxLayout()
+        compare_area_layout.setContentsMargins(0, 0, 0, 0)
+        compare_area_layout.setSpacing(4)
+        compare_area_layout.addWidget(compare_splitter, 1)
 
-        # Scroll sync: file2 follows file1, but file2 can scroll independently
-        syncing = [False]
+        compare_nav_scrollbar = QScrollBar(Qt.Vertical)
+        compare_nav_scrollbar.setSingleStep(1)
+        compare_nav_scrollbar.setPageStep(100)
+        compare_nav_scrollbar.setVisible(False)
+        compare_area_layout.addWidget(compare_nav_scrollbar)
+        layout.addLayout(compare_area_layout, 1)
 
-        def sync_file1_to_file2(value):
-            if not syncing[0]:
-                syncing[0] = True
-                file2_display.verticalScrollBar().setValue(value)
-                syncing[0] = False
-
-        file1_display.verticalScrollBar().valueChanged.connect(sync_file1_to_file2)
+        compare_status_label = QLabel("Ready")
+        compare_status_label.setFont(QFont("Arial", 8))
+        layout.addWidget(compare_status_label)
 
         # Store data for comparison
         file1_original_data = None
@@ -9027,18 +12829,47 @@ class HexEditorQt(QMainWindow):
         current_style_swapped = False
         comp_cursor_position = None
         comp_cursor_nibble = 0
+        file1_top_row = 0
+        file2_top_row = 0
+        compare_visible_rows = 160
+        differences_mask = bytearray()
+        original_differences_mask = bytearray()
+        diff_count = 0
+        compare_scroll_syncing = [False]
+        active_compare_side = [1]
 
-        def format_comparison_view(data, differences_set, show_red_diff, original_data_for_edit_check=None, reference_data=None, cursor_pos=None, cursor_nibble=0, user_highlights=None, original_differences_set=None):
-            html = '<pre style="font-family: Courier; line-height: 1.4;">'
+        def build_diff_mask(data_a, data_b):
+            max_len = max(len(data_a), len(data_b))
+            mask = bytearray(max_len)
+            count = 0
+            for i in range(max_len):
+                byte1 = data_a[i] if i < len(data_a) else None
+                byte2 = data_b[i] if i < len(data_b) else None
+                if byte1 != byte2:
+                    mask[i] = 1
+                    count += 1
+            return mask, count
+
+        def format_comparison_view(data, differences, show_red_diff, original_data_for_edit_check=None, reference_data=None, cursor_pos=None, cursor_nibble=0, user_highlights=None, original_differences=None, start_row=0, row_count=None, shared_total_rows=None):
+            html_parts = [f'<pre style="font-family: Courier; line-height: 1.25; color: {compare_fg}; background-color: {compare_editor_bg};">']
 
             bytes_per_row = 16
-            for row_start in range(0, len(data), bytes_per_row):
+            total_rows = shared_total_rows if shared_total_rows is not None else (len(data) + bytes_per_row - 1) // bytes_per_row
+            if row_count is None:
+                row_count = total_rows
+            end_row = min(total_rows, start_row + row_count)
+
+            if start_row > 0:
+                html_parts.append(f'<span style="color: {compare_offset_fg};">... {start_row:,} row(s) above ...</span>\n')
+
+            for row in range(start_row, end_row):
+                row_start = row * bytes_per_row
                 row_end = min(row_start + bytes_per_row, len(data))
                 row_data = data[row_start:row_end]
 
                 # Offset
                 offset_str = f"0x{row_start:08X}"
-                html += f'<span style="color: #888;">{offset_str}</span>  '
+                html_parts.append(f'<span style="color: {compare_offset_fg};">{offset_str}</span>  ')
 
                 # Hex bytes
                 for i, byte in enumerate(row_data):
@@ -9061,23 +12892,23 @@ class HexEditorQt(QMainWindow):
                             r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
                             bg_color = f'rgba({r}, {g}, {b}, 0.25)'
 
-                    if original_data_for_edit_check and reference_data and original_differences_set is not None:
+                    if original_data_for_edit_check and reference_data and original_differences is not None:
                         # Check if this byte was edited INSIDE Compare Data (after snapshot)
                         if offset < len(original_data_for_edit_check) and byte != original_data_for_edit_check[offset]:
                             # Byte was edited inside Compare Data
                             if offset < len(reference_data) and byte == reference_data[offset]:
                                 # Edited to match File 2 - green
                                 color = '#00AA00'
-                            elif offset in original_differences_set:
+                            elif offset < len(original_differences) and original_differences[offset]:
                                 # Was different at snapshot (including pre-existing edits) - keep red
                                 color = '#FF0000'
                             else:
                                 # Was matching at snapshot, edited to differ - show as blue (new edit)
                                 color = '#0066FF'
-                        elif offset in differences_set and show_red_diff:
+                        elif offset < len(differences) and differences[offset] and show_red_diff:
                             # Not edited in Compare Data, but different - show as red
                             color = '#FF0000'
-                    elif offset in differences_set and show_red_diff:
+                    elif offset < len(differences) and differences[offset] and show_red_diff:
                         color = '#FF0000'
 
                     # Format the byte with highlighting and per-nibble bold
@@ -9091,32 +12922,32 @@ class HexEditorQt(QMainWindow):
                         if color:
                             # Keep color but add background highlight
                             if cursor_nibble == 0:
-                                html += f'<span style="color: {color}; background-color: {cursor_bg};"><b>{first_nibble}</b>{second_nibble}</span> '
+                                html_parts.append(f'<span style="color: {color}; background-color: {cursor_bg};"><b>{first_nibble}</b>{second_nibble}</span> ')
                             else:
-                                html += f'<span style="color: {color}; background-color: {cursor_bg};">{first_nibble}<b>{second_nibble}</b></span> '
+                                html_parts.append(f'<span style="color: {color}; background-color: {cursor_bg};">{first_nibble}<b>{second_nibble}</b></span> ')
                         else:
                             # No color, just highlight and bold
                             if cursor_nibble == 0:
-                                html += f'<span style="background-color: {cursor_bg};"><b>{first_nibble}</b>{second_nibble}</span> '
+                                html_parts.append(f'<span style="background-color: {cursor_bg};"><b>{first_nibble}</b>{second_nibble}</span> ')
                             else:
-                                html += f'<span style="background-color: {cursor_bg};">{first_nibble}<b>{second_nibble}</b></span> '
+                                html_parts.append(f'<span style="background-color: {cursor_bg};">{first_nibble}<b>{second_nibble}</b></span> ')
                     elif bg_color:
                         # User highlight background
                         if color:
-                            html += f'<span style="color: {color}; background-color: {bg_color}; font-weight: bold;">{hex_str}</span> '
+                            html_parts.append(f'<span style="color: {color}; background-color: {bg_color}; font-weight: bold;">{hex_str}</span> ')
                         else:
-                            html += f'<span style="background-color: {bg_color};">{hex_str}</span> '
+                            html_parts.append(f'<span style="background-color: {bg_color};">{hex_str}</span> ')
                     elif color:
-                        html += f'<span style="color: {color}; font-weight: bold;">{hex_str}</span> '
+                        html_parts.append(f'<span style="color: {color}; font-weight: bold;">{hex_str}</span> ')
                     else:
-                        html += f'{hex_str} '
+                        html_parts.append(f'{hex_str} ')
 
                 # Padding for incomplete rows
                 padding = bytes_per_row - len(row_data)
-                html += '   ' * padding
+                html_parts.append('   ' * padding)
 
                 # Decoded text
-                html += ' | '
+                html_parts.append('   ')
                 for i, byte in enumerate(row_data):
                     offset = row_start + i
                     # Control characters (0x00-0x1F, 0x7F-0x9F) shown as dots
@@ -9138,79 +12969,79 @@ class HexEditorQt(QMainWindow):
                             r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
                             bg_color = f'rgba({r}, {g}, {b}, 0.25)'
 
-                    if original_data_for_edit_check and reference_data and original_differences_set is not None:
+                    if original_data_for_edit_check and reference_data and original_differences is not None:
                         # Check if this byte was edited INSIDE Compare Data (after snapshot)
                         if offset < len(original_data_for_edit_check) and byte != original_data_for_edit_check[offset]:
                             # Byte was edited inside Compare Data
                             if offset < len(reference_data) and byte == reference_data[offset]:
                                 # Edited to match File 2 - green
                                 color = '#00AA00'
-                            elif offset in original_differences_set:
+                            elif offset < len(original_differences) and original_differences[offset]:
                                 # Was different at snapshot (including pre-existing edits) - keep red
                                 color = '#FF0000'
                             else:
                                 # Was matching at snapshot, edited to differ - show as blue (new edit)
                                 color = '#0066FF'
-                        elif offset in differences_set and show_red_diff:
+                        elif offset < len(differences) and differences[offset] and show_red_diff:
                             # Not edited in Compare Data, but different - show as red
                             color = '#FF0000'
-                    elif offset in differences_set and show_red_diff:
+                    elif offset < len(differences) and differences[offset] and show_red_diff:
                         color = '#FF0000'
 
-                    # Format the character
+                    # Format the character. Escape printable bytes like 0x3C ('<')
+                    # so QTextEdit does not treat decoded data as HTML markup.
+                    safe_char = html.escape(char)
                     if is_cursor:
                         # Highlight and bold the character at cursor position
                         cursor_bg = '#404040' if self.is_dark_theme() else '#C8DCFF'
                         if color:
-                            html += f'<span style="color: {color}; background-color: {cursor_bg}; font-weight: bold;">{char}</span>'
+                            html_parts.append(f'<span style="color: {color}; background-color: {cursor_bg}; font-weight: bold;">{safe_char}</span>')
                         else:
-                            html += f'<span style="background-color: {cursor_bg}; font-weight: bold;">{char}</span>'
+                            html_parts.append(f'<span style="background-color: {cursor_bg}; font-weight: bold;">{safe_char}</span>')
                     elif bg_color:
                         # User highlight background
                         if color:
-                            html += f'<span style="color: {color}; background-color: {bg_color}; font-weight: bold;">{char}</span>'
+                            html_parts.append(f'<span style="color: {color}; background-color: {bg_color}; font-weight: bold;">{safe_char}</span>')
                         else:
-                            html += f'<span style="background-color: {bg_color};">{char}</span>'
+                            html_parts.append(f'<span style="background-color: {bg_color};">{safe_char}</span>')
                     elif color:
-                        html += f'<span style="color: {color}; font-weight: bold;">{char}</span>'
+                        html_parts.append(f'<span style="color: {color}; font-weight: bold;">{safe_char}</span>')
                     else:
-                        html += char
+                        html_parts.append(safe_char)
 
-                html += '\n'
+                html_parts.append('\n')
 
-            html += '</pre>'
-            return html
+            if end_row < total_rows:
+                html_parts.append(f'<span style="color: {compare_offset_fg};">... {total_rows - end_row:,} row(s) below ...</span>\n')
+
+            html_parts.append('</pre>')
+            return ''.join(html_parts)
 
         def update_comparison_display():
+            nonlocal file1_top_row, file2_top_row, compare_visible_rows
             if file1_current_data is None or file2_data is None:
                 return
 
-            # Save scroll positions independently
-            file1_scrollbar = file1_display.verticalScrollBar()
-            file2_scrollbar = file2_display.verticalScrollBar()
-            file1_scroll_pos = file1_scrollbar.value()
-            file2_scroll_pos = file2_scrollbar.value()
+            # External scrollbars are full-file row navigators. QTextEdit's own
+            # document scrollbar only covers the currently rendered window.
+            file1_scrollbar = file1_compare_scrollbar
+            file2_scrollbar = file2_compare_scrollbar
 
-            # Find differences between current and original
-            differences = set()
-            original_differences = set()
             max_len = max(len(file1_current_data), len(file2_data))
-
-            for i in range(max_len):
-                byte1 = file1_current_data[i] if i < len(file1_current_data) else None
-                byte2 = file2_data[i] if i < len(file2_data) else None
-
-                if byte1 != byte2:
-                    differences.add(i)
-
-            # Track differences at the time Compare Data was opened (snapshot)
-            max_len_snap = max(len(file1_snapshot_data), len(file2_data))
-            for i in range(max_len_snap):
-                snap_byte1 = file1_snapshot_data[i] if i < len(file1_snapshot_data) else None
-                byte2 = file2_data[i] if i < len(file2_data) else None
-
-                if snap_byte1 != byte2:
-                    original_differences.add(i)
+            total_rows = max(1, (max_len + 15) // 16)
+            file1_rows = max(1, (len(file1_current_data) + 15) // 16)
+            file2_rows = max(1, (len(file2_data) + 15) // 16)
+            line_height = max(1, file1_display.fontMetrics().height())
+            viewport_rows = max(1, file1_display.viewport().height() // line_height)
+            compare_visible_rows = max(80, min(180, viewport_rows + 60))
+            visible_rows = min(compare_visible_rows, total_rows)
+            file1_top_row = max(0, min(file1_top_row, max(0, file1_rows - 1)))
+            file2_top_row = max(0, min(file2_top_row, max(0, file2_rows - 1)))
+            compare_nav_scrollbar.blockSignals(True)
+            compare_nav_scrollbar.setRange(0, max(0, total_rows - 1))
+            compare_nav_scrollbar.setPageStep(max(1, visible_rows))
+            compare_nav_scrollbar.setValue(file1_top_row)
+            compare_nav_scrollbar.blockSignals(False)
 
             # Determine which highlights to use
             file1_highlights = None
@@ -9229,18 +13060,47 @@ class HexEditorQt(QMainWindow):
                         file2_highlights = file_tab.byte_highlights
 
             # Display both files with red differences on both sides and cursor highlighting
-            file1_html = format_comparison_view(file1_current_data, differences, True, file1_snapshot_data, file2_data, comp_cursor_position, comp_cursor_nibble, file1_highlights, original_differences)
-            file2_html = format_comparison_view(file2_data, differences, True, cursor_pos=comp_cursor_position, cursor_nibble=comp_cursor_nibble, user_highlights=file2_highlights)
+            file1_html = format_comparison_view(file1_current_data, differences_mask, True, file1_snapshot_data, file2_data, comp_cursor_position, comp_cursor_nibble, file1_highlights, original_differences_mask, file1_top_row, visible_rows, total_rows)
+            file2_html = format_comparison_view(file2_data, differences_mask, True, cursor_pos=comp_cursor_position, cursor_nibble=comp_cursor_nibble, user_highlights=file2_highlights, start_row=file2_top_row, row_count=visible_rows, shared_total_rows=total_rows)
 
+            file1_display.setUpdatesEnabled(False)
+            file2_display.setUpdatesEnabled(False)
             file1_display.setHtml(file1_html)
             file2_display.setHtml(file2_html)
+            file1_display.setUpdatesEnabled(True)
+            file2_display.setUpdatesEnabled(True)
+            compare_scroll_syncing[0] = True
+            for scrollbar, rows, top_row in (
+                (file1_scrollbar, file1_rows, file1_top_row),
+                (file2_scrollbar, file2_rows, file2_top_row),
+            ):
+                if hasattr(scrollbar, "isSliderDown") and scrollbar.isSliderDown():
+                    # During click-drag, do not rewrite range/page/value. Qt will
+                    # recalculate the thumb geometry and make it jump under the mouse.
+                    continue
+                side_visible_rows = min(visible_rows, rows)
+                scrollbar.setRange(0, max(0, rows - 1))
+                scrollbar.setPageStep(max(1, side_visible_rows))
+                scrollbar.setSingleStep(1)
+                scrollbar.setValue(top_row)
+            file1_display.verticalScrollBar().setValue(0)
+            file2_display.verticalScrollBar().setValue(0)
+            file1_display.horizontalScrollBar().setValue(0)
+            file2_display.horizontalScrollBar().setValue(0)
+            compare_scroll_syncing[0] = False
+            update_compare_separator_positions()
 
-            # Restore scroll positions independently
-            file1_scrollbar.setValue(file1_scroll_pos)
-            file2_scrollbar.setValue(file2_scroll_pos)
+            update_compare_separator_positions()
+            QTimer.singleShot(0, update_compare_separator_positions)
+            file1_shown_end = min(file1_rows, file1_top_row + min(visible_rows, file1_rows))
+            file2_shown_end = min(file2_rows, file2_top_row + min(visible_rows, file2_rows))
+            compare_status_label.setText(
+                f"Differences: {diff_count:,} | File 1 rows {file1_top_row + 1:,}-{file1_shown_end:,}/{file1_rows:,} | File 2 rows {file2_top_row + 1:,}-{file2_shown_end:,}/{file2_rows:,}"
+            )
 
         def compare_files():
-            nonlocal file1_original_data, file2_data, file1_current_data, file1_snapshot_data, comp_cursor_position, comp_cursor_nibble
+            nonlocal file1_original_data, file2_data, file1_current_data, file1_snapshot_data
+            nonlocal comp_cursor_position, comp_cursor_nibble, differences_mask, original_differences_mask, diff_count, file1_top_row, file2_top_row
 
             path1 = file1_edit.text()
             path2 = file2_edit.text()
@@ -9286,6 +13146,10 @@ class HexEditorQt(QMainWindow):
 
                 comp_cursor_position = 0
                 comp_cursor_nibble = 0
+                file1_top_row = 0
+                file2_top_row = 0
+                differences_mask, diff_count = build_diff_mask(file1_current_data, file2_data)
+                original_differences_mask, _ = build_diff_mask(file1_snapshot_data, file2_data)
                 update_comparison_display()
 
             except Exception as e:
@@ -9308,10 +13172,72 @@ class HexEditorQt(QMainWindow):
 
             update_comparison_display()
 
+        def set_compare_top_row(row):
+            nonlocal file1_top_row, file2_top_row
+            if file1_current_data is None or file2_data is None:
+                return
+            file1_rows = max(1, (len(file1_current_data) + 15) // 16)
+            max_row = max(0, file1_rows - 1)
+            file1_top_row = max(0, min(row, max_row))
+            update_comparison_display()
+
+        compare_nav_scrollbar.valueChanged.connect(set_compare_top_row)
+
+        def set_compare_side_top(side, row):
+            nonlocal file1_top_row, file2_top_row
+            if file1_current_data is None or file2_data is None:
+                return
+            if side == 1:
+                rows = max(1, (len(file1_current_data) + 15) // 16)
+                file1_top_row = max(0, min(row, max(0, rows - 1)))
+            else:
+                rows = max(1, (len(file2_data) + 15) // 16)
+                file2_top_row = max(0, min(row, max(0, rows - 1)))
+            update_comparison_display()
+
+        def compare_scrollbar_changed(side, value):
+            if compare_scroll_syncing[0]:
+                return
+            set_compare_side_top(side, value)
+
+        file1_compare_scrollbar.valueChanged.connect(lambda value: compare_scrollbar_changed(1, value))
+        file2_compare_scrollbar.valueChanged.connect(lambda value: compare_scrollbar_changed(2, value))
+        file1_compare_scrollbar.sliderReleased.connect(update_comparison_display)
+        file2_compare_scrollbar.sliderReleased.connect(update_comparison_display)
+
+        def compare_wheel(side, event):
+            steps = event.angleDelta().y() // 120
+            if steps == 0:
+                steps = 1 if event.angleDelta().y() > 0 else -1
+            top_row = file1_top_row if side == 1 else file2_top_row
+            set_compare_side_top(side, top_row - (steps * 4))
+            event.accept()
+
+        file1_display.wheelEvent = lambda event: compare_wheel(1, event)
+        file2_display.wheelEvent = lambda event: compare_wheel(2, event)
+
+        def ensure_compare_cursor_visible():
+            nonlocal file1_top_row, file2_top_row
+            if comp_cursor_position is None:
+                return
+            cursor_row = comp_cursor_position // 16
+            margin = 20
+            if active_compare_side[0] == 2:
+                if cursor_row < file2_top_row + margin:
+                    file2_top_row = max(0, cursor_row - margin)
+                elif cursor_row >= file2_top_row + compare_visible_rows - margin:
+                    file2_top_row = max(0, cursor_row - compare_visible_rows + margin + 1)
+            else:
+                if cursor_row < file1_top_row + margin:
+                    file1_top_row = max(0, cursor_row - margin)
+                elif cursor_row >= file1_top_row + compare_visible_rows - margin:
+                    file1_top_row = max(0, cursor_row - compare_visible_rows + margin + 1)
+
         def handle_file1_click(event):
-            nonlocal comp_cursor_position, comp_cursor_nibble
+            nonlocal comp_cursor_position, comp_cursor_nibble, file2_top_row
             if file1_current_data is None:
                 return
+            active_compare_side[0] = 1
 
             cursor = file1_display.cursorForPosition(event.pos())
             text = file1_display.toPlainText()
@@ -9326,33 +13252,35 @@ class HexEditorQt(QMainWindow):
             # Parse offset
             try:
                 line_full = text.split('\n')[len(lines) - 1] if len(lines) <= len(text.split('\n')) else ""
-                if '|' in line_full:
-                    offset_part = line_full.split('|')[0].strip().split()[0]
-                    row_offset = int(offset_part, 16)
+                offset_part = line_full[:12].strip().split()[0]
+                row_offset = int(offset_part, 16)
 
-                    # Find column
-                    col_in_line = len(current_line)
-                    hex_start_col = 12
+                # Find column
+                col_in_line = len(current_line)
+                hex_start_col = 12
+                hex_end_col = hex_start_col + (16 * 3) - 1
 
-                    if col_in_line >= hex_start_col:
-                        hex_col = col_in_line - hex_start_col
-                        byte_col = hex_col // 3
-                        nibble_col = (hex_col % 3)
+                if hex_start_col <= col_in_line <= hex_end_col:
+                    hex_col = col_in_line - hex_start_col
+                    byte_col = hex_col // 3
+                    nibble_col = (hex_col % 3)
 
-                        comp_cursor_position = row_offset + byte_col
-                        comp_cursor_nibble = 0 if nibble_col == 0 else 1
+                    comp_cursor_position = row_offset + byte_col
+                    comp_cursor_nibble = 0 if nibble_col == 0 else 1
 
-                        if comp_cursor_position >= len(file1_current_data):
-                            comp_cursor_position = len(file1_current_data) - 1
+                    if comp_cursor_position >= len(file1_current_data):
+                        comp_cursor_position = len(file1_current_data) - 1
 
-                        # Update display to show bold cursor
-                        update_comparison_display()
+                    if sync_click_check.isChecked():
+                        file2_top_row = file1_top_row
+                    update_comparison_display()
             except:
                 pass
 
         def handle_file1_key(event):
-            nonlocal comp_cursor_position, comp_cursor_nibble
-            if file1_current_data is None or comp_cursor_position is None:
+            nonlocal comp_cursor_position, comp_cursor_nibble, diff_count
+            nonlocal file1_current_data, file2_data
+            if file1_current_data is None or file2_data is None or comp_cursor_position is None:
                 return
 
             key = event.key()
@@ -9361,10 +13289,15 @@ class HexEditorQt(QMainWindow):
             if Qt.Key_0 <= key <= Qt.Key_9 or Qt.Key_A <= key <= Qt.Key_F:
                 char = event.text().upper()
                 if char in '0123456789ABCDEF':
-                    if comp_cursor_position >= len(file1_current_data):
+                    editing_side = active_compare_side[0]
+                    target_data = file2_data if editing_side == 2 else file1_current_data
+                    other_data = file1_current_data if editing_side == 2 else file2_data
+                    target_path = file2_edit.text() if editing_side == 2 else file1_edit.text()
+
+                    if comp_cursor_position >= len(target_data):
                         return
 
-                    old_value = file1_current_data[comp_cursor_position]
+                    old_value = target_data[comp_cursor_position]
                     nibble_value = int(char, 16)
 
                     if comp_cursor_nibble == 0:
@@ -9374,23 +13307,35 @@ class HexEditorQt(QMainWindow):
 
                     # Save the position of the byte we're editing before moving cursor
                     edited_position = comp_cursor_position
-                    file1_current_data[edited_position] = new_value
+                    was_different = edited_position < len(differences_mask) and differences_mask[edited_position]
+                    target_data[edited_position] = new_value
+                    if edited_position < len(differences_mask):
+                        now_different = (
+                            edited_position >= len(other_data) or
+                            target_data[edited_position] != other_data[edited_position]
+                        )
+                        if was_different and not now_different:
+                            differences_mask[edited_position] = 0
+                            diff_count = max(0, diff_count - 1)
+                        elif not was_different and now_different:
+                            differences_mask[edited_position] = 1
+                            diff_count += 1
 
                     # Move cursor
                     if comp_cursor_nibble == 0:
                         comp_cursor_nibble = 1
                     else:
                         comp_cursor_nibble = 0
-                        if comp_cursor_position < len(file1_current_data) - 1:
+                        if comp_cursor_position < len(target_data) - 1:
                             comp_cursor_position += 1
 
+                    ensure_compare_cursor_visible()
                     update_comparison_display()
 
-                    # Update main editor if this is the current file
-                    if self.current_tab_index >= 0:
-                        current_file = self.open_files[self.current_tab_index]
-                        if current_file.file_path == file1_edit.text():
-                            current_file.file_data = bytearray(file1_current_data)
+                    # Update the matching open editor tab if this file is open.
+                    for tab_index, current_file in enumerate(self.open_files):
+                        if current_file.file_path == target_path:
+                            current_file.file_data = bytearray(target_data)
                             current_file.modified = True
                             # Mark the edited byte as replaced (red) if it differs from original
                             if edited_position not in current_file.inserted_bytes:
@@ -9403,12 +13348,15 @@ class HexEditorQt(QMainWindow):
                                         # Byte matches original - remove all markings
                                         current_file.replaced_bytes.discard(edited_position)
                                         current_file.modified_bytes.discard(edited_position)
-                            self.display_hex()
+                            if tab_index == self.current_tab_index:
+                                self.display_hex()
+                            break
 
         def handle_file2_click(event):
-            nonlocal comp_cursor_position, comp_cursor_nibble
+            nonlocal comp_cursor_position, comp_cursor_nibble, file1_top_row
             if file2_data is None:
                 return
+            active_compare_side[0] = 2
 
             cursor = file2_display.cursorForPosition(event.pos())
             text = file2_display.toPlainText()
@@ -9423,10 +13371,7 @@ class HexEditorQt(QMainWindow):
             # Parse offset
             try:
                 line_full = text.split('\n')[len(lines) - 1] if len(lines) <= len(text.split('\n')) else ""
-                if '|' not in line_full:
-                    return
-
-                offset_part = line_full.split('|')[0].strip().split()[0]
+                offset_part = line_full[:12].strip().split()[0]
                 row_offset = int(offset_part, 16)
 
                 # Find column - need to get the actual character at cursor position
@@ -9465,15 +13410,8 @@ class HexEditorQt(QMainWindow):
                 if comp_cursor_position >= len(file2_data):
                     comp_cursor_position = len(file2_data) - 1
 
-                # Scroll file1 to match the clicked line in file2
-                # Get file2's current scroll position
-                file2_scroll = file2_display.verticalScrollBar().value()
-
-                # Temporarily disable sync to prevent recursion
-                syncing[0] = True
-                file1_display.verticalScrollBar().setValue(file2_scroll)
-                syncing[0] = False
-
+                if sync_click_check.isChecked():
+                    file1_top_row = file2_top_row
                 update_comparison_display()
             except:
                 pass
@@ -9481,6 +13419,8 @@ class HexEditorQt(QMainWindow):
         file1_display.clicked.connect(handle_file1_click)
         file2_display.clicked.connect(handle_file2_click)
         dialog.keyPressEvent = handle_file1_key
+        file1_display.keyPressEvent = handle_file1_key
+        file2_display.keyPressEvent = handle_file1_key
 
         compare_btn.clicked.connect(compare_files)
         refresh_btn.clicked.connect(compare_files)
@@ -9493,18 +13433,41 @@ class HexEditorQt(QMainWindow):
         dialog.setLayout(layout)
         dialog.exec_()
 
+    def next_backup_path(self, original_path):
+        """Return backups/<filename>.bak, backups/<filename>.bak2, etc. without overwriting."""
+        directory = os.path.dirname(original_path)
+        filename = os.path.basename(original_path)
+        backup_dir = os.path.join(directory, "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        first_path = os.path.join(backup_dir, filename + ".bak")
+        if not os.path.exists(first_path):
+            return first_path
+
+        index = 2
+        while True:
+            candidate = os.path.join(backup_dir, f"{filename}.bak{index}")
+            if not os.path.exists(candidate):
+                return candidate
+            index += 1
+
+    def create_file_backup(self, original_path):
+        """Create a versioned backup beside the original file and return its path."""
+        import shutil
+        backup_path = self.next_backup_path(original_path)
+        shutil.copy2(original_path, backup_path)
+        return backup_path
+
     def save_file(self):
         if self.current_tab_index < 0:
             return
 
         current_file = self.open_files[self.current_tab_index]
         original_path = current_file.file_path
-        backup_path = original_path + ".bak"
 
         try:
             # Create backup of original file
-            import shutil
-            shutil.copy2(original_path, backup_path)
+            backup_path = self.create_file_backup(original_path)
 
             # Overwrite original file with modified data
             with open(original_path, 'wb') as f:
@@ -9514,9 +13477,13 @@ class HexEditorQt(QMainWindow):
             current_file.modified_bytes.clear()
             current_file.inserted_bytes.clear()
             current_file.replaced_bytes.clear()
+            if hasattr(current_file, "mmap_original_bytes"):
+                current_file.mmap_original_bytes.clear()
+            if current_file.original_data is not None:
+                current_file.original_data = bytearray(current_file.file_data)
             self.display_hex()
 
-            QMessageBox.information(self, "Success", f"File saved successfully!\nBackup created: {os.path.basename(backup_path)}")
+            QMessageBox.information(self, "Success", f"File saved successfully!\nBackup created: {backup_path}")
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save: {str(e)}")
@@ -9525,20 +13492,20 @@ class HexEditorQt(QMainWindow):
         if len(self.open_files) == 0:
             return
 
-        import shutil
         saved_count = 0
         failed_files = []
+        backup_paths = []
 
         for file_tab in self.open_files:
             if not file_tab.modified:
                 continue
 
             original_path = file_tab.file_path
-            backup_path = original_path + ".bak"
 
             try:
                 # Create backup of original file
-                shutil.copy2(original_path, backup_path)
+                backup_path = self.create_file_backup(original_path)
+                backup_paths.append(backup_path)
 
                 # Overwrite original file with modified data
                 with open(original_path, 'wb') as f:
@@ -9547,6 +13514,11 @@ class HexEditorQt(QMainWindow):
                 file_tab.modified = False
                 file_tab.modified_bytes.clear()
                 file_tab.inserted_bytes.clear()
+                file_tab.replaced_bytes.clear()
+                if hasattr(file_tab, "mmap_original_bytes"):
+                    file_tab.mmap_original_bytes.clear()
+                if file_tab.original_data is not None:
+                    file_tab.original_data = bytearray(file_tab.file_data)
                 saved_count += 1
 
             except Exception as e:
@@ -9560,18 +13532,23 @@ class HexEditorQt(QMainWindow):
             error_msg = f"Saved {saved_count} file(s).\n\nFailed to save:\n" + "\n".join(failed_files)
             QMessageBox.warning(self, "Save All - Partial Success", error_msg)
         elif saved_count > 0:
-            QMessageBox.information(self, "Success", f"All {saved_count} file(s) saved successfully!\nBackups created for each file.")
+            backup_summary = "\n".join(backup_paths[:5])
+            if len(backup_paths) > 5:
+                backup_summary += f"\n...and {len(backup_paths) - 5} more"
+            QMessageBox.information(self, "Success", f"All {saved_count} file(s) saved successfully!\nBackups created:\n{backup_summary}")
         else:
             QMessageBox.information(self, "Info", "No files needed saving.")
 
     def showEvent(self, event):
         """Handle window show event to detect correct screen on startup."""
         super().showEvent(event)
+        self.apply_system_titlebar_theme()
 
         # Connect to screen change events (windowHandle is now available)
         if not self.screen_change_connected and self.windowHandle():
             self.windowHandle().screenChanged.connect(self.on_screen_changed)
             self.screen_change_connected = True
+            self._last_screen = self.screen()
 
         # Recalculate hex column width now that we know which screen we're on
         new_width = self.get_hex_column_width()
@@ -9611,6 +13588,10 @@ class HexEditorQt(QMainWindow):
             self.edit_box_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
         if hasattr(self, 'boundary_overlay') and hasattr(self, 'hex_display'):
             self.boundary_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
+        if hasattr(self, 'highlight_underline_overlay') and hasattr(self, 'hex_display'):
+            self.highlight_underline_overlay.setGeometry(0, 0, self.hex_column_width, self.hex_display.height())
+        if hasattr(self, 'pane_separator_overlay') and hasattr(self, 'hex_ascii_container'):
+            self.pane_separator_overlay.refresh()
 
         # Update search overlay position when window resizes (overlay spans hex and ASCII at bottom)
         if hasattr(self, 'results_overlay') and self.results_overlay is not None and self.results_overlay.isVisible():
@@ -9625,7 +13606,6 @@ class HexEditorQt(QMainWindow):
         # Update signature pointer overlays when window resizes
         if hasattr(self, 'signature_overlays') and self.signature_overlays:
             self.update_signature_overlays()
-
     def toggle_notes(self):
         if self.notes_window is None:
             self.notes_window = NotesWindow(self, self)
@@ -9688,9 +13668,10 @@ class HexEditorQt(QMainWindow):
                 category_themes = theme_categories[category]
                 for theme_name in sorted(category_themes.keys()):
                     item = QListWidgetItem(f"  {theme_name}")
-                    item.setData(Qt.UserRole, theme_name)  # Store actual theme name
+                    theme_id = f"builtin:{theme_name}"
+                    item.setData(Qt.UserRole, theme_id)
                     theme_list.addItem(item)
-                    if theme_name == self.current_theme:
+                    if self.current_theme in (theme_name, theme_id):
                         theme_list.setCurrentItem(item)
 
         # Add separator if there are custom themes
@@ -9704,9 +13685,10 @@ class HexEditorQt(QMainWindow):
             # Add custom themes
             for theme_name in sorted(custom_themes.keys()):
                 item = QListWidgetItem(f"  {theme_name} (Custom)")
-                item.setData(Qt.UserRole, theme_name)  # Store actual theme name
+                theme_id = f"custom:{theme_name}"
+                item.setData(Qt.UserRole, theme_id)
                 theme_list.addItem(item)
-                if theme_name == self.current_theme:
+                if self.current_theme == theme_id:
                     theme_list.setCurrentItem(item)
 
         layout.addWidget(theme_list)
@@ -9730,15 +13712,13 @@ class HexEditorQt(QMainWindow):
         def edit_selected_theme():
             current_item = theme_list.currentItem()
             if current_item:
-                theme_name = current_item.data(Qt.UserRole)
-                if not theme_name:
-                    theme_name = current_item.text()
+                theme_id = current_item.data(Qt.UserRole)
+                theme_name = theme_id.split(":", 1)[1] if isinstance(theme_id, str) and ":" in theme_id else (theme_id or current_item.text()).strip()
 
                 # Only allow editing custom themes
-                if theme_name in custom_themes:
-                    self.show_custom_theme_editor(theme_name)
-                    dialog.close()
-                    self.show_theme_selector()
+                if isinstance(theme_id, str) and theme_id.startswith("custom:"):
+                    dialog.close()  # Close before opening editor
+                    self.show_custom_theme_editor(theme_id)
                 else:
                     QMessageBox.information(dialog, "Info",
                         "You can only edit custom themes. To create a new theme based on this one, "
@@ -9746,6 +13726,19 @@ class HexEditorQt(QMainWindow):
 
         edit_custom_button.clicked.connect(edit_selected_theme)
         custom_button_layout.addWidget(edit_custom_button)
+
+        delete_theme_button = QPushButton("Delete")
+        delete_theme_button.clicked.connect(lambda: self.delete_selected_custom_theme(theme_list, dialog))
+        custom_button_layout.addWidget(delete_theme_button)
+
+        import_themes_button = QPushButton("Import")
+        import_themes_button.clicked.connect(lambda: [self.import_custom_themes(dialog)])
+        custom_button_layout.addWidget(import_themes_button)
+
+        export_themes_button = QPushButton("Export")
+        export_themes_button.clicked.connect(lambda: self.export_selected_custom_theme(theme_list))
+        custom_button_layout.addWidget(export_themes_button)
+
         custom_button_layout.addStretch()
 
         layout.addLayout(custom_button_layout)
@@ -9759,11 +13752,11 @@ class HexEditorQt(QMainWindow):
             current_item = theme_list.currentItem()
             if current_item and current_item.flags() != Qt.NoItemFlags:
                 # Get the actual theme name
-                theme_name = current_item.data(Qt.UserRole)
-                if not theme_name:
-                    theme_name = current_item.text()
+                theme_id = current_item.data(Qt.UserRole)
+                if not theme_id:
+                    theme_id = current_item.text().strip()
 
-                self.current_theme = theme_name
+                self.current_theme = theme_id
                 self.apply_theme()
                 self.save_settings()
                 dialog.accept()
@@ -9786,23 +13779,224 @@ class HexEditorQt(QMainWindow):
 
         dialog.show()
 
+    def import_custom_themes(self, parent_dialog=None):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Theme", "", "Theme Files (*.json *.zip);;JSON Files (*.json);;Zip Files (*.zip);;All Files (*)")
+        if not path:
+            return
+        try:
+            name, theme = self.read_single_theme_export(path)
+            if not isinstance(theme, dict):
+                raise ValueError("Theme file must contain one theme object")
+
+            custom_themes = load_custom_themes()
+            safe_name = name or str(theme.get("name", "Imported Theme")).strip() or "Imported Theme"
+            for key in THEME_IMAGE_KEYS:
+                image_path = str(theme.get(key, "") or "")
+                if image_path and not os.path.isfile(image_path):
+                    theme[key] = ""
+            custom_themes[safe_name] = theme
+            custom_themes[safe_name]["name"] = safe_name
+
+            if not save_custom_themes(custom_themes):
+                raise ValueError("Could not save imported themes")
+            QMessageBox.information(self, "Import Complete", f"Imported theme '{safe_name}'.")
+            if parent_dialog is not None:
+                parent_dialog.close()
+                self.show_theme_selector()
+        except Exception as exc:
+            QMessageBox.warning(self, "Import Failed", str(exc))
+
+    def delete_selected_custom_theme(self, theme_list, parent_dialog=None):
+        current_item = theme_list.currentItem() if theme_list is not None else None
+        if not current_item:
+            QMessageBox.warning(self, "No Theme Selected", "Select one custom theme to delete.")
+            return
+        theme_id = current_item.data(Qt.UserRole)
+        if not isinstance(theme_id, str) or not theme_id.startswith("custom:"):
+            QMessageBox.warning(self, "Custom Theme Required", "Select one custom theme to delete.")
+            return
+
+        theme_name = theme_id.split(":", 1)[1]
+        custom_themes = load_custom_themes()
+        if theme_name not in custom_themes:
+            QMessageBox.warning(self, "Theme Not Found", f"Custom theme '{theme_name}' was not found.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Delete custom theme '{theme_name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        del custom_themes[theme_name]
+        if not save_custom_themes(custom_themes):
+            QMessageBox.warning(self, "Error", "Failed to delete theme.")
+            return
+
+        if self.current_theme == f"custom:{theme_name}":
+            self.current_theme = "Dark"
+            self.apply_theme()
+            self.save_settings()
+
+        QMessageBox.information(self, "Deleted", f"Theme '{theme_name}' deleted.")
+        if parent_dialog is not None:
+            parent_dialog.close()
+            self.show_theme_selector()
+
+    def theme_image_paths(self, theme):
+        paths = {}
+        for key in THEME_IMAGE_KEYS:
+            path = str(theme.get(key, "") or "")
+            if path and os.path.isfile(path):
+                paths[key] = path
+        return paths
+
+    def sanitized_theme_for_export(self, theme, asset_paths=None):
+        exported = json.loads(json.dumps(theme))
+        for key in THEME_IMAGE_KEYS:
+            if asset_paths and key in asset_paths:
+                exported[key] = asset_paths[key]
+            elif key in exported:
+                exported[key] = ""
+        return exported
+
+    def read_single_theme_export(self, path):
+        extracted_assets = []
+        if path.lower().endswith(".zip"):
+            with zipfile.ZipFile(path, "r") as zf:
+                json_name = "theme.json" if "theme.json" in zf.namelist() else None
+                if json_name is None:
+                    json_files = [name for name in zf.namelist() if name.lower().endswith(".json")]
+                    if not json_files:
+                        raise ValueError("Theme zip does not contain a JSON theme file")
+                    json_name = json_files[0]
+                data = json.loads(zf.read(json_name).decode("utf-8"))
+
+                if isinstance(data, dict) and "theme" in data:
+                    name = str(data.get("name", "")).strip()
+                    theme = data["theme"]
+                else:
+                    name, theme = self.parse_single_theme_data(data)
+
+                safe_name = safe_export_filename(name or theme.get("name", "Imported Theme"), "").replace(".", "_")
+                asset_root = os.path.join(IMPORTED_THEME_ASSETS_DIR, safe_name)
+                os.makedirs(asset_root, exist_ok=True)
+                for key in THEME_IMAGE_KEYS:
+                    rel_path = str(theme.get(key, "") or "")
+                    if not rel_path or os.path.isabs(rel_path):
+                        continue
+                    normalized = rel_path.replace("\\", "/")
+                    if not normalized.startswith("assets/"):
+                        continue
+                    member = normalized
+                    if member not in zf.namelist():
+                        continue
+                    file_name = os.path.basename(member)
+                    target = os.path.join(asset_root, file_name)
+                    with zf.open(member) as src, open(target, "wb") as dst:
+                        dst.write(src.read())
+                    theme[key] = target
+                    extracted_assets.append(target)
+                return name, theme
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return self.parse_single_theme_data(data)
+
+    def parse_single_theme_data(self, data):
+        if isinstance(data, dict) and "theme" in data:
+            return str(data.get("name", "")).strip(), data["theme"]
+        if isinstance(data, dict) and "themes" in data:
+            themes = data["themes"]
+            if not isinstance(themes, dict) or len(themes) != 1:
+                raise ValueError("Import one theme at a time")
+            name, theme = next(iter(themes.items()))
+            return str(name).strip(), theme
+        if isinstance(data, dict):
+            if "name" in data and "foreground" in data:
+                return str(data.get("name", "")).strip(), data
+            if len(data) == 1:
+                name, theme = next(iter(data.items()))
+                return str(name).strip(), theme
+        raise ValueError("Theme file must contain one theme object")
+
+    def export_selected_custom_theme(self, theme_list):
+        current_item = theme_list.currentItem() if theme_list is not None else None
+        if not current_item:
+            QMessageBox.warning(self, "No Theme Selected", "Select one custom theme to export.")
+            return
+        theme_id = current_item.data(Qt.UserRole)
+        if not isinstance(theme_id, str) or not theme_id.startswith("custom:"):
+            QMessageBox.warning(self, "Custom Theme Required", "Select one custom theme to export.")
+            return
+        theme_name = theme_id.split(":", 1)[1]
+        custom_themes = load_custom_themes()
+        theme = custom_themes.get(theme_name)
+        if not theme:
+            QMessageBox.warning(self, "Theme Not Found", f"Custom theme '{theme_name}' was not found.")
+            return
+
+        image_paths = self.theme_image_paths(theme)
+        bundle_images = False
+        if image_paths:
+            reply = QMessageBox.question(
+                self,
+                "Bundle Theme Images?",
+                "This theme uses image or GIF backgrounds.\n\n"
+                "Exporting plain JSON will remove local file paths for privacy.\n"
+                "Do you want to bundle copies of the images into a zip instead?",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes
+            )
+            if reply == QMessageBox.Cancel:
+                return
+            bundle_images = reply == QMessageBox.Yes
+
+        extension = ".zip" if bundle_images else ".json"
+        filter_text = "Zip Files (*.zip);;All Files (*)" if bundle_images else "JSON Files (*.json);;All Files (*)"
+        path, _ = QFileDialog.getSaveFileName(self, "Export Theme", safe_export_filename(theme_name, extension), filter_text)
+        if not path:
+            return
+        try:
+            if bundle_images:
+                asset_paths = {}
+                used_names = set()
+                for key, source in image_paths.items():
+                    base = os.path.basename(source)
+                    stem, ext = os.path.splitext(base)
+                    safe_base = safe_export_filename(stem, ext or os.path.splitext(source)[1])
+                    counter = 2
+                    while safe_base.lower() in used_names:
+                        safe_base = safe_export_filename(f"{stem}_{counter}", ext)
+                        counter += 1
+                    used_names.add(safe_base.lower())
+                    asset_paths[key] = f"assets/{safe_base}"
+                exported_theme = self.sanitized_theme_for_export(theme, asset_paths)
+                with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    zf.writestr("theme.json", json.dumps({"name": theme_name, "theme": exported_theme}, indent=2))
+                    for key, source in image_paths.items():
+                        zf.write(source, asset_paths[key])
+            else:
+                exported_theme = self.sanitized_theme_for_export(theme)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump({"name": theme_name, "theme": exported_theme}, f, indent=2)
+            QMessageBox.information(self, "Export Complete", f"Exported theme '{theme_name}'.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Export Failed", str(exc))
+
     def show_custom_theme_editor(self, theme_name=None):
         """Show custom theme editor dialog"""
+        # Store original theme for restoration if cancelled
+        original_theme = self.current_theme
+
         editor = CustomThemeEditor(self, theme_name)
 
-        # Connect live preview to apply theme in real-time
-        def preview_theme(theme):
-            # Temporarily apply theme for preview
-            temp_theme_name = "__preview__"
-
-            # Get all themes (includes built-in and custom)
-            all_themes = get_all_themes()
-            all_themes[temp_theme_name] = theme
-
-            self.current_theme = temp_theme_name
-            self.apply_theme()
-
-        editor.themeChanged.connect(preview_theme)
+        # Note: Live preview is now handled directly in CustomThemeEditor.apply_theme_live()
+        # No need to connect signals here anymore
 
         if editor.exec_() == QDialog.Accepted:
             # User clicked Apply - save and apply the theme
@@ -9811,13 +14005,25 @@ class HexEditorQt(QMainWindow):
 
             # Load and update custom themes
             custom_themes = load_custom_themes()
+            if getattr(editor, "original_custom_name", None) and editor.original_custom_name != theme_name:
+                custom_themes.pop(editor.original_custom_name, None)
+            if getattr(editor, "_temporary_live_storage", False):
+                custom_themes.pop(getattr(editor, "_live_storage_name", ""), None)
             custom_themes[theme_name] = custom_theme
             save_custom_themes(custom_themes)
 
             # Apply the new theme
-            self.current_theme = theme_name
+            self.current_theme = f"custom:{theme_name}"
             self.apply_theme()
             self.save_settings()
+        else:
+            if getattr(editor, "_temporary_live_storage", False):
+                custom_themes = load_custom_themes()
+                custom_themes.pop(getattr(editor, "_live_storage_name", ""), None)
+                save_custom_themes(custom_themes)
+            # User cancelled - restore original theme
+            self.current_theme = original_theme
+            self.apply_theme()
 
     def show_debug_window(self):
         """Show debugging console window"""
@@ -9838,19 +14044,18 @@ class HexEditorQt(QMainWindow):
         """Show About dialog with application information"""
         dialog = QDialog(self)
         dialog.setWindowTitle("About")
-        dialog.setMinimumSize(500, 400)
-        dialog.setMaximumSize(500, 400)
+        dialog.setMinimumSize(320, 260)
 
         # Apply current theme to dialog
         dialog.setStyleSheet(get_theme_stylesheet(self.current_theme))
 
         main_layout = QVBoxLayout()
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(15)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(8)
 
         # Title
         title_label = QLabel("RxD Hex Editor")
-        title_font = QFont("Arial", 18, QFont.Bold)
+        title_font = QFont("Arial", 15, QFont.Bold)
         title_label.setFont(title_font)
         title_label.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(title_label)
@@ -9866,13 +14071,13 @@ class HexEditorQt(QMainWindow):
             tagline_label.setStyleSheet("color: #666;")
         main_layout.addWidget(tagline_label)
 
-        main_layout.addSpacing(10)
+        main_layout.addSpacing(4)
 
         # Developer section
         dev_frame = QWidget()
         dev_layout = QVBoxLayout()
-        dev_layout.setContentsMargins(20, 10, 20, 10)
-        dev_layout.setSpacing(5)
+        dev_layout.setContentsMargins(12, 6, 12, 6)
+        dev_layout.setSpacing(3)
 
         dev_label = QLabel("Main Developer: Akira Ryuzaki")
         dev_font = QFont("Arial", 9)
@@ -9897,10 +14102,10 @@ class HexEditorQt(QMainWindow):
             dev_frame.setStyleSheet("QWidget { background-color: #f5f5f5; border: 1px solid #ccc; border-radius: 5px; }")
         main_layout.addWidget(dev_frame)
 
-        main_layout.addSpacing(10)
+        main_layout.addSpacing(4)
 
         # Version section
-        version_label = QLabel("Version: 1.0.0.0 (Initial Build)")
+        version_label = QLabel("Version: 3.0.0.0")
         version_font = QFont("Arial", 9)
         version_label.setFont(version_font)
         version_label.setAlignment(Qt.AlignCenter)
@@ -9921,7 +14126,7 @@ class HexEditorQt(QMainWindow):
             copyright_label.setStyleSheet("color: #666;")
         main_layout.addWidget(copyright_label)
 
-        main_layout.addSpacing(5)
+        main_layout.addSpacing(2)
 
         # Link
         link_label = QLabel('<a href="https://digitzaki.github.io/">https://digitzaki.github.io/</a>')
@@ -9934,8 +14139,6 @@ class HexEditorQt(QMainWindow):
         else:
             link_label.setStyleSheet("color: #0066cc;")
         main_layout.addWidget(link_label)
-
-        main_layout.addStretch()
 
         # Close button
         button_layout = QHBoxLayout()
@@ -9961,25 +14164,64 @@ class HexEditorQt(QMainWindow):
         brightness = (bg_rgb[0] + bg_rgb[1] + bg_rgb[2]) / 3
         return brightness < 128
 
+    def system_uses_dark_titlebar(self):
+        """Return the Windows app theme preference when available."""
+        if sys.platform != "win32":
+            return self.is_dark_theme()
+
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+            ) as key:
+                apps_use_light, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                return apps_use_light == 0
+        except Exception:
+            return self.is_dark_theme()
+
+    def apply_system_titlebar_theme(self):
+        """Make the native Windows title bar follow the system dark/light theme in PyQt5."""
+        apply_native_titlebar_theme(self, self.system_uses_dark_titlebar())
+
+    def is_valid_theme_id(self, theme):
+        """Return True when a saved built-in/custom theme reference can be resolved."""
+        if not isinstance(theme, str) or not theme:
+            return False
+
+        if theme.startswith("custom:"):
+            custom_name = theme.split(":", 1)[1]
+            return custom_name in load_custom_themes()
+
+        if theme.startswith("builtin:"):
+            builtin_name = theme.split(":", 1)[1]
+            return any(builtin_name in category for category in THEMES.values())
+
+        return any(theme in category for category in THEMES.values()) or theme in load_custom_themes()
+
+    def normalize_theme_id(self, theme):
+        """Preserve saved custom IDs while normalizing explicit built-in IDs."""
+        if isinstance(theme, str) and theme.startswith("builtin:"):
+            return theme.split(":", 1)[1]
+        return theme
+
     def load_theme_preference(self):
         """Load saved theme preference from settings file"""
-        settings_file = os.path.join(os.path.expanduser("~"), ".hex_editor_settings.json")
+        settings_file = SETTINGS_PATH
         try:
             if os.path.exists(settings_file):
                 with open(settings_file, 'r') as f:
                     settings = json.load(f)
                     theme = settings.get('theme', 'Dark')
-                    # Validate theme exists (check both built-in and custom themes)
-                    all_themes = get_all_themes()
-                    if theme in all_themes:
-                        return theme
+                    if self.is_valid_theme_id(theme):
+                        return self.normalize_theme_id(theme)
         except Exception as e:
             print(f"Error loading theme preference: {e}")
         return "Dark"
 
     def load_settings(self):
         """Load all saved settings from settings file"""
-        settings_file = os.path.join(os.path.expanduser("~"), ".hex_editor_settings.json")
+        settings_file = SETTINGS_PATH
         try:
             if os.path.exists(settings_file):
                 with open(settings_file, 'r') as f:
@@ -9987,9 +14229,8 @@ class HexEditorQt(QMainWindow):
 
                     # Load theme
                     theme = settings.get('theme', 'Dark')
-                    all_themes = get_all_themes()
-                    if theme in all_themes:
-                        self.current_theme = theme
+                    if self.is_valid_theme_id(theme):
+                        self.current_theme = self.normalize_theme_id(theme)
 
                     # Load segment size
                     segment_size = settings.get('segment_size', 0)
@@ -10005,7 +14246,7 @@ class HexEditorQt(QMainWindow):
 
     def save_theme_preference(self):
         """Save current theme preference to settings file"""
-        settings_file = os.path.join(os.path.expanduser("~"), ".hex_editor_settings.json")
+        settings_file = SETTINGS_PATH
         try:
             settings = {}
             # Load existing settings if file exists
@@ -10024,7 +14265,7 @@ class HexEditorQt(QMainWindow):
 
     def save_settings(self):
         """Save all settings to settings file"""
-        settings_file = os.path.join(os.path.expanduser("~"), ".hex_editor_settings.json")
+        settings_file = SETTINGS_PATH
         try:
             settings = {}
             # Load existing settings if file exists
@@ -10054,17 +14295,62 @@ class HexEditorQt(QMainWindow):
 
         # Apply gradient or image backgrounds to the entire editor (central widget)
         if hasattr(self, 'central_widget'):
+            app_bg_image = theme_colors.get('app_bg_image', '')
+            hex_bytes_image = theme_colors.get('hex_bytes_bg_image', '')
             if theme_colors.get('gradient', False):
                 gradient_colors = theme_colors.get('gradient_colors', [])
                 self.central_widget.set_gradient_colors(gradient_colors)
-                # Also apply gradient to hex display for editor background
+                self.central_widget.set_background_image(None)
+                # Only use the gradient in the hex pane when the pane does not
+                # have its own image. Pane images must stay above app backgrounds.
                 if hasattr(self, 'hex_display'):
-                    self.hex_display.set_gradient_colors(gradient_colors)
+                    self.hex_display.set_gradient_colors(None if hex_bytes_image else gradient_colors)
+            elif app_bg_image:
+                self.central_widget.set_gradient_colors(None)
+                self.central_widget.set_background_image(
+                    app_bg_image,
+                    theme_colors.get('app_bg_tint_color', '#000000'),
+                    theme_colors.get('app_bg_tint_opacity', 0.0),
+                    theme_colors.get('app_bg_fit', 'fill'),
+                    theme_colors.get('app_bg_gif_quality', 'optimized')
+                )
+                if hasattr(self, 'hex_display'):
+                    self.hex_display.set_gradient_colors(None)
             else:
                 self.central_widget.set_gradient_colors(None)
+                self.central_widget.set_background_image(None)
                 # Clear hex display gradient
                 if hasattr(self, 'hex_display'):
                     self.hex_display.set_gradient_colors(None)
+
+        # Apply background images if specified in theme
+        hex_bytes_image = theme_colors.get('hex_bytes_bg_image', '')
+        if hex_bytes_image and hasattr(self, 'hex_display'):
+            hex_tint_color = theme_colors.get('hex_bytes_tint_color', '#000000')
+            hex_tint_opacity = theme_colors.get('hex_bytes_tint_opacity', 0.0)
+            self.hex_display.set_background_image(hex_bytes_image, hex_tint_color, hex_tint_opacity, theme_colors.get('hex_bytes_fit', 'fill'), theme_colors.get('hex_bytes_gif_quality', 'optimized'))
+        elif hasattr(self, 'hex_display'):
+            self.hex_display.set_background_image(None)
+
+        # Apply offset/ASCII background image if specified
+        offset_ascii_image = theme_colors.get('offset_ascii_bg_image', '')
+        if offset_ascii_image:
+            offset_tint_color = theme_colors.get('offset_ascii_tint_color', '#000000')
+            offset_tint_opacity = theme_colors.get('offset_ascii_tint_opacity', 0.0)
+            if hasattr(self, 'offset_display'):
+                self.offset_display.set_background_image(offset_ascii_image, offset_tint_color, offset_tint_opacity, theme_colors.get('offset_ascii_fit', 'fill'), theme_colors.get('offset_ascii_gif_quality', 'optimized'))
+            if hasattr(self, 'ascii_display'):
+                self.ascii_display.set_background_image(offset_ascii_image, offset_tint_color, offset_tint_opacity, theme_colors.get('offset_ascii_fit', 'fill'), theme_colors.get('offset_ascii_gif_quality', 'optimized'))
+        else:
+            if hasattr(self, 'offset_display'):
+                self.offset_display.set_background_image(None)
+            if hasattr(self, 'ascii_display'):
+                self.ascii_display.set_background_image(None)
+
+        # Inspector uses theme colors only; image backgrounds are limited to editor panes.
+        if hasattr(self, 'inspector_widget'):
+            inspector_bg = get_theme_surface_colors(theme_colors).get("surface", theme_colors.get('inspector_bg', theme_colors.get('background', '#1a1a1a')))
+            self.inspector_widget.setStyleSheet(f"QWidget#inspector_widget {{ background-color: {inspector_bg}; }}")
 
         # Get grid line color (with fallback to border for backward compatibility)
         grid_line_color = theme_colors.get('grid_line', theme_colors['border'])
@@ -10098,7 +14384,7 @@ class HexEditorQt(QMainWindow):
             self.hex_header.setStyleSheet(f"{bg_style}border-right: 1px solid {grid_line_color}; border-bottom: 1px solid {grid_line_color}; padding: 4px 0px 4px 4px; margin: 0px;")
         if hasattr(self, 'ascii_header'):
             bg_style = f"background-color: {semi_transparent_bg}; " if semi_transparent_bg else ""
-            self.ascii_header.setStyleSheet(f"{bg_style}border-left: 2px solid {grid_line_color}; border-right: 1px solid {grid_line_color}; border-bottom: 1px solid {grid_line_color}; padding: 4px 0px 4px 4px; margin: 0px;")
+            self.ascii_header.setStyleSheet(f"{bg_style}border-left: 2px solid {grid_line_color}; border-right: 2px solid {grid_line_color}; border-bottom: 1px solid {grid_line_color}; padding: 4px 0px 4px 4px; margin: 0px;")
         if hasattr(self, 'offset_display'):
             bg_style = f"background-color: {semi_transparent_bg}; " if semi_transparent_bg else ""
             self.offset_display.setStyleSheet(f"{bg_style}border-right: 2px solid {grid_line_color}; padding: 2px;")
@@ -10107,26 +14393,23 @@ class HexEditorQt(QMainWindow):
             self.hex_display.setStyleSheet(f"{bg_style}border-right: 1px solid {grid_line_color}; padding: 2px 0px 2px 4px;")
         if hasattr(self, 'ascii_display'):
             bg_style = f"background-color: {semi_transparent_bg}; " if semi_transparent_bg else ""
-            self.ascii_display.setStyleSheet(f"{bg_style}border-left: 2px solid {grid_line_color}; border-right: 1px solid {grid_line_color}; padding: 2px 4px;")
+            self.ascii_display.setStyleSheet(f"{bg_style}border-left: 2px solid {grid_line_color}; border-right: 2px solid {grid_line_color}; padding: 2px 4px;")
+        if hasattr(self, 'pane_separator_overlay'):
+            self.pane_separator_overlay.refresh()
 
         # Update custom scrollbar theme
         if hasattr(self, 'hex_nav_scrollbar'):
             self.hex_nav_scrollbar.set_theme_colors(theme_colors)
+        if hasattr(self, 'directory_bar'):
+            self.apply_directory_bar_theme()
 
         # Update inspector resize handle theme
         if hasattr(self, 'inspector_resize_handle'):
             self.inspector_resize_handle.setStyleSheet(f"background-color: {theme_colors['border']};")
 
-        # Update inspector widget background to use inspector_bg (so images don't go over it)
-        if hasattr(self, 'inspector_widget'):
-            # Use inspector_bg if available, otherwise fall back to background
-            inspector_bg = theme_colors.get('inspector_bg', theme_colors.get('background', '#1a1a1a'))
-            self.inspector_widget.setStyleSheet(f"QWidget#inspector_widget {{ background-color: {inspector_bg}; }}")
-
         # Update endian button theme
         if hasattr(self, 'endian_btn'):
-            # For Matrix theme, use dark text on bright buttons for better readability
-            button_text_color = "#000000" if self.current_theme == "Matrix" else theme_colors['foreground']
+            button_text_color = theme_colors.get('button_text', theme_colors.get('foreground', '#ffffff'))
             self.endian_btn.setStyleSheet(f"""
                 QPushButton {{
                     background-color: {theme_colors['button_bg']};
@@ -10177,6 +14460,20 @@ class HexEditorQt(QMainWindow):
 
         # Style with triangular arrow symbols ◀ ▶
         self.right_panel_tabs.setStyleSheet(f"""
+            QTabWidget#right_panel_tabs::pane {{
+                border: none;
+            }}
+            QTabWidget#right_panel_tabs QTabBar::tab {{
+                background-color: {bg_color};
+                color: {foreground_color};
+                padding: 8px 14px;
+                margin: 0px;
+                border: none;
+                border-bottom: 2px solid transparent;
+            }}
+            QTabWidget#right_panel_tabs QTabBar::tab:selected {{
+                border-bottom: 2px solid {pressed_color};
+            }}
             QTabBar::scroller {{
                 width: 60px;
                 background-color: {scroller_bg};
@@ -10209,11 +14506,156 @@ class HexEditorQt(QMainWindow):
             QTabBar QToolButton::right-arrow {{
                 image: none;
             }}
+            QTabBar QToolButton::menu-indicator {{
+                image: none;
+                width: 0px;
+            }}
         """)
 
         # Set arrow button text using a delayed call to ensure buttons exist
         from PyQt5.QtCore import QTimer
         QTimer.singleShot(10, self._update_arrow_button_text)
+
+        if hasattr(self, 'right_panel_tab_nav'):
+            self.right_panel_tab_nav.setStyleSheet(f"""
+                QToolButton {{
+                    background-color: {bg_color};
+                    border: 1px solid {theme_colors.get('border', '#3e3e42')};
+                    border-radius: 2px;
+                    color: {foreground_color};
+                    min-width: 18px;
+                    max-width: 18px;
+                    min-height: 22px;
+                    max-height: 22px;
+                    padding: 0px;
+                }}
+                QToolButton:hover {{
+                    background-color: {hover_color};
+                }}
+                QToolButton:pressed {{
+                    background-color: {pressed_color};
+                    border-color: {pressed_color};
+                }}
+            """)
+
+    def setup_right_panel_tab_nav(self):
+        """Add compact tab navigation buttons that change tabs directly."""
+        nav_widget = QWidget()
+        nav_layout = QHBoxLayout()
+        nav_layout.setContentsMargins(1, 1, 1, 1)
+        nav_layout.setSpacing(1)
+
+        self.right_panel_tab_prev_btn = QToolButton()
+        self.right_panel_tab_prev_btn.setText("<")
+        self.right_panel_tab_prev_btn.setToolTip("Previous inspector tab")
+        self.right_panel_tab_prev_btn.clicked.connect(self._scroll_tabs_left)
+        nav_layout.addWidget(self.right_panel_tab_prev_btn)
+
+        self.right_panel_tab_next_btn = QToolButton()
+        self.right_panel_tab_next_btn.setText(">")
+        self.right_panel_tab_next_btn.setToolTip("Next inspector tab")
+        self.right_panel_tab_next_btn.clicked.connect(self._scroll_tabs_right)
+        nav_layout.addWidget(self.right_panel_tab_next_btn)
+
+        nav_widget.setLayout(nav_layout)
+        self.right_panel_tab_nav = nav_widget
+        self.right_panel_tabs.setCornerWidget(nav_widget, Qt.TopRightCorner)
+        self.update_right_panel_tab_nav_state()
+
+    def _setup_tab_scroll_buttons(self):
+        """Setup custom behavior for tab scroll buttons to smoothly navigate through tabs"""
+        if not hasattr(self, 'right_panel_tabs'):
+            return
+
+        try:
+            tab_bar = self.right_panel_tabs.tabBar()
+            if tab_bar:
+                for button in tab_bar.findChildren(QToolButton):
+                    # Disconnect default behavior
+                    try:
+                        button.clicked.disconnect()
+                    except:
+                        pass
+
+                    # Connect custom behavior based on arrow type
+                    if button.arrowType() == Qt.LeftArrow:
+                        button.clicked.connect(self._scroll_tabs_left)
+                        button.setText("◀")
+                        button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+                        button.setToolTip("Scroll tabs left")
+                    elif button.arrowType() == Qt.RightArrow:
+                        button.clicked.connect(self._scroll_tabs_right)
+                        button.setText("▶")
+                        button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+                        button.setToolTip("Scroll tabs right")
+        except Exception:
+            pass
+
+    def _setup_tab_scroll_buttons(self):
+        """Replace native tab scroller arrows with clean text buttons."""
+        if not hasattr(self, 'right_panel_tabs'):
+            return
+
+        try:
+            tab_bar = self.right_panel_tabs.tabBar()
+            if not tab_bar:
+                return
+
+            for button in tab_bar.findChildren(QToolButton):
+                arrow_type = button.arrowType()
+                direction = button.property("tabScrollDirection")
+                if arrow_type == Qt.LeftArrow or direction == "left":
+                    button.setProperty("tabScrollDirection", "left")
+                    button.setArrowType(Qt.NoArrow)
+                    try:
+                        button.clicked.disconnect()
+                    except Exception:
+                        pass
+                    button.clicked.connect(self._scroll_tabs_left)
+                    button.setText("<")
+                    button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+                    button.setToolTip("Scroll tabs left")
+                elif arrow_type == Qt.RightArrow or direction == "right":
+                    button.setProperty("tabScrollDirection", "right")
+                    button.setArrowType(Qt.NoArrow)
+                    try:
+                        button.clicked.disconnect()
+                    except Exception:
+                        pass
+                    button.clicked.connect(self._scroll_tabs_right)
+                    button.setText(">")
+                    button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+                    button.setToolTip("Scroll tabs right")
+        except Exception:
+            pass
+
+    def _scroll_tabs_left(self):
+        """Move to the previous inspector tab."""
+        if not hasattr(self, 'right_panel_tabs'):
+            return
+
+        current_idx = self.right_panel_tabs.currentIndex()
+        tab_count = self.right_panel_tabs.count()
+
+        if tab_count <= 1:
+            return
+
+        new_idx = max(0, current_idx - 1)
+        self.right_panel_tabs.setCurrentIndex(new_idx)
+
+    def _scroll_tabs_right(self):
+        """Move to the next inspector tab."""
+        if not hasattr(self, 'right_panel_tabs'):
+            return
+
+        current_idx = self.right_panel_tabs.currentIndex()
+        tab_count = self.right_panel_tabs.count()
+
+        if tab_count <= 1:
+            return
+
+        new_idx = min(tab_count - 1, current_idx + 1)
+        self.right_panel_tabs.setCurrentIndex(new_idx)
 
     def _update_arrow_button_text(self):
         """Update the arrow button text to show < and > symbols"""
@@ -10232,6 +14674,32 @@ class HexEditorQt(QMainWindow):
                     elif button.arrowType() == Qt.RightArrow:
                         button.setText("▶")  # U+25B6 Black Right-Pointing Triangle
                         button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        except Exception:
+            pass
+
+    def _update_arrow_button_text(self):
+        """Keep tab scroller buttons as text-only arrows."""
+        if not hasattr(self, 'right_panel_tabs'):
+            return
+
+        try:
+            tab_bar = self.right_panel_tabs.tabBar()
+            if not tab_bar:
+                return
+
+            for button in tab_bar.findChildren(QToolButton):
+                direction = button.property("tabScrollDirection")
+                arrow_type = button.arrowType()
+                if direction == "left" or arrow_type == Qt.LeftArrow:
+                    button.setProperty("tabScrollDirection", "left")
+                    button.setArrowType(Qt.NoArrow)
+                    button.setText("<")
+                    button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+                elif direction == "right" or arrow_type == Qt.RightArrow:
+                    button.setProperty("tabScrollDirection", "right")
+                    button.setArrowType(Qt.NoArrow)
+                    button.setText(">")
+                    button.setToolButtonStyle(Qt.ToolButtonTextOnly)
         except Exception:
             pass
 
@@ -10291,8 +14759,69 @@ class HexEditorQt(QMainWindow):
         except Exception as e:
             print(f"Error updating edit box overlay: {e}")
 
+    def refresh_visible_byte_row(self, byte_offset):
+        """Refresh only the rendered row containing byte_offset after a byte edit."""
+        if self.current_tab_index < 0 or byte_offset is None:
+            return False
+
+        current_file = self.open_files[self.current_tab_index]
+        if byte_offset < self.rendered_start_byte or byte_offset >= self.rendered_end_byte:
+            return False
+
+        row = byte_offset // self.bytes_per_row
+        rendered_start_row = self.rendered_start_byte // self.bytes_per_row
+        block_index = row - rendered_start_row
+        if block_index < 0:
+            return False
+
+        row_start = row * self.bytes_per_row
+        row_data = current_file.file_data[row_start:row_start + self.bytes_per_row]
+
+        hex_row = "  " + bytes(row_data).hex(" ").upper()
+        if hex_row != "  ":
+            hex_row += " "
+        if len(row_data) < self.bytes_per_row:
+            hex_row += "   " * (self.bytes_per_row - len(row_data))
+        hex_row = hex_row.rstrip()
+
+        ascii_row = ''.join(self._ascii_chars[byte] for byte in row_data)
+        if len(row_data) < self.bytes_per_row:
+            ascii_row += " " * (self.bytes_per_row - len(row_data))
+
+        def replace_block_text(edit, text_value):
+            block = edit.document().findBlockByNumber(block_index)
+            if not block.isValid():
+                return False
+            cursor = QTextCursor(block)
+            cursor.movePosition(QTextCursor.StartOfBlock)
+            cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+            old_state = edit.blockSignals(True)
+            edit.setUpdatesEnabled(False)
+            try:
+                cursor.setCharFormat(QTextCharFormat())
+                cursor.insertText(text_value, QTextCharFormat())
+            finally:
+                edit.setUpdatesEnabled(True)
+                edit.blockSignals(old_state)
+            return True
+
+        if not replace_block_text(self.hex_display, hex_row):
+            return False
+        replace_block_text(self.ascii_display, ascii_row)
+
+        current_file._formatting_dirty = True
+        self.apply_hex_formatting(current_file, clear_existing=False)
+        self.update_edit_box_overlay()
+        self.update_visible_overlays(self.hex_display.verticalScrollBar().value())
+        return True
+
     def keyPressEvent(self, event):
-        print(f"keyPressEvent: cursor_pos={self.cursor_position}, tab={self.current_tab_index}, key={event.key()}, text={event.text()}")
+        debug_keypress = getattr(self, 'debug_keypress', False)
+        def key_debug(message):
+            if debug_keypress:
+                print(message)
+
+        key_debug(f"keyPressEvent: cursor_pos={self.cursor_position}, tab={self.current_tab_index}, key={event.key()}, text={event.text()}")
 
         if self.cursor_position is None or self.current_tab_index < 0:
             super().keyPressEvent(event)
@@ -10343,7 +14872,7 @@ class HexEditorQt(QMainWindow):
                         # Update edit box visual
                         self.update_edit_box_overlay()
 
-                        print(f"Edit box activated for column selection: {sel_start} to {sel_end}")
+                        key_debug(f"Edit box activated for column selection: {sel_start} to {sel_end}")
                     else:
                         # Regular drag selection - move cursor to start, no edit box
                         # Clear selection so cursor can advance normally
@@ -10351,28 +14880,29 @@ class HexEditorQt(QMainWindow):
                         self.cursor_nibble = 0
                         self.selection_start = None
                         self.selection_end = None
-                        print(f"Regular drag selection: moved cursor to start {sel_start}, clearing highlight")
+                        key_debug(f"Regular drag selection: moved cursor to start {sel_start}, clearing highlight")
                 elif self.selection_start == self.selection_end:
                     # Single click selection - clear it so it doesn't show highlight
                     self.selection_start = None
                     self.selection_end = None
-                    print(f"Single click: clearing highlight")
+                    key_debug("Single click: clearing highlight")
 
             # Check if we're within edit box boundaries (if edit box is active)
             if self.edit_box_active:
                 if self.cursor_position < self.edit_box_start or self.cursor_position > self.edit_box_end:
-                    print(f"Cursor {self.cursor_position} outside edit box [{self.edit_box_start}, {self.edit_box_end}], ignoring input")
+                    key_debug(f"Cursor {self.cursor_position} outside edit box [{self.edit_box_start}, {self.edit_box_end}], ignoring input")
                     return
 
             # Check boundary constraints (if enabled)
             if self.boundary_enabled:
                 current_col = self.cursor_position % self.bytes_per_row
                 if current_col < self.boundary_start_col or current_col > self.boundary_end_col:
-                    print(f"Cursor at col {current_col} outside boundaries [{self.boundary_start_col}, {self.boundary_end_col}], ignoring input")
+                    key_debug(f"Cursor at col {current_col} outside boundaries [{self.boundary_start_col}, {self.boundary_end_col}], ignoring input")
                     return
 
-            print(f"Editing byte at {self.cursor_position}: nibble={self.cursor_nibble}")
+            key_debug(f"Editing byte at {self.cursor_position}: nibble={self.cursor_nibble}")
             if self.cursor_position < len(current_file.file_data):
+                edited_position = self.cursor_position
                 # Save for undo on first nibble of each byte
                 if self.cursor_nibble == 0:
                     self.save_undo_state()
@@ -10387,16 +14917,18 @@ class HexEditorQt(QMainWindow):
                     new_hex = hex_str[0] + text
 
                 new_byte = int(new_hex, 16)
-                current_file.file_data[self.cursor_position] = new_byte
+                current_file.set_byte(self.cursor_position, new_byte)
 
                 # Mark as modified only if the byte differs from the original
                 if self.cursor_position not in current_file.inserted_bytes:
-                    if self.cursor_position < len(current_file.original_data):
-                        if new_byte != current_file.original_data[self.cursor_position]:
-                            current_file.modified_bytes.add(self.cursor_position)
-                        else:
-                            # Byte matches original, remove from modified set if present
-                            current_file.modified_bytes.discard(self.cursor_position)
+                    original_byte = current_file.get_original_byte(self.cursor_position)
+                    if original_byte is not None and new_byte != original_byte:
+                        current_file.modified_bytes.add(self.cursor_position)
+                    else:
+                        # Byte matches original, remove from modified set if present
+                        current_file.modified_bytes.discard(self.cursor_position)
+                        if hasattr(current_file, "edits"):
+                            current_file.edits.pop(self.cursor_position, None)
 
                 # Check if any bytes are actually modified
                 current_file.modified = len(current_file.modified_bytes) > 0 or len(current_file.inserted_bytes) > 0
@@ -10422,7 +14954,7 @@ class HexEditorQt(QMainWindow):
                         self.edit_box_active = False
                         if hasattr(self, 'edit_box_overlay'):
                             self.edit_box_overlay.clear_edit_box()
-                        print(f"Edit box deactivated after completing last byte at {self.cursor_position}")
+                        key_debug(f"Edit box deactivated after completing last byte at {self.cursor_position}")
                         # Clear selection
                         self.selection_start = None
                         self.selection_end = None
@@ -10441,7 +14973,7 @@ class HexEditorQt(QMainWindow):
                             # If we would go past the edit box end, wrap back to start
                             elif next_pos > self.edit_box_end:
                                 next_pos = self.edit_box_start
-                                print(f"Edit box: wrapped from end {self.edit_box_end} to start {self.edit_box_start}")
+                                key_debug(f"Edit box: wrapped from end {self.edit_box_end} to start {self.edit_box_start}")
 
                         # Handle wrapping within boundaries
                         elif self.boundary_enabled:
@@ -10452,12 +14984,20 @@ class HexEditorQt(QMainWindow):
                             if current_col == self.boundary_end_col:
                                 # Wrap to start column of next row
                                 next_pos = (current_row + 1) * self.bytes_per_row + self.boundary_start_col
-                                print(f"Boundary wrap: at end col {self.boundary_end_col}, wrapping to next row pos {next_pos}")
+                                key_debug(f"Boundary wrap: at end col {self.boundary_end_col}, wrapping to next row pos {next_pos}")
 
                         self.cursor_position = next_pos
 
-                self.display_hex(preserve_scroll=True)
-                self.scroll_to_offset(self.cursor_position)
+                cursor_still_rendered = self.rendered_start_byte <= self.cursor_position < self.rendered_end_byte
+                if self.refresh_visible_byte_row(edited_position) and cursor_still_rendered:
+                    self.update_cursor_highlight(refresh_formatting=False)
+                    if hasattr(self, 'data_inspector'):
+                        QTimer.singleShot(0, self.data_inspector.update)
+                else:
+                    self.display_hex(preserve_scroll=True, update_side_panels=False, apply_formatting=False)
+                    self.scroll_to_offset(self.cursor_position)
+                    if hasattr(self, 'data_inspector'):
+                        QTimer.singleShot(0, self.data_inspector.update)
                 self.update_status()
 
         # Handle arrow keys
@@ -10469,7 +15009,7 @@ class HexEditorQt(QMainWindow):
                 new_pos = self.cursor_position - 1
                 # Check edit box boundaries
                 if self.edit_box_active and new_pos < self.edit_box_start:
-                    print(f"Left arrow blocked by edit box boundary")
+                    key_debug("Left arrow blocked by edit box boundary")
                     new_pos = self.cursor_position
                 # Check boundary constraints (wrap to end of previous row if needed)
                 elif self.boundary_enabled:
@@ -10483,7 +15023,7 @@ class HexEditorQt(QMainWindow):
                             new_pos = self.cursor_position  # Stay at current position
                 self.cursor_position = new_pos
                 self.cursor_nibble = 1
-            print(f"Left arrow: {old_pos} -> {self.cursor_position}, nibble={self.cursor_nibble}")
+            key_debug(f"Left arrow: {old_pos} -> {self.cursor_position}, nibble={self.cursor_nibble}")
             self.display_hex(preserve_scroll=True)
             self.scroll_to_offset(self.cursor_position)
             self.update_status()
@@ -10496,7 +15036,7 @@ class HexEditorQt(QMainWindow):
                 new_pos = self.cursor_position + 1
                 # Check edit box boundaries
                 if self.edit_box_active and new_pos > self.edit_box_end:
-                    print(f"Right arrow blocked by edit box boundary")
+                    key_debug("Right arrow blocked by edit box boundary")
                     new_pos = self.cursor_position
                 # Check boundary constraints (wrap to start of next row if needed)
                 elif self.boundary_enabled:
@@ -10510,7 +15050,7 @@ class HexEditorQt(QMainWindow):
                             new_pos = self.cursor_position  # Stay at current position
                 self.cursor_position = new_pos
                 self.cursor_nibble = 0
-            print(f"Right arrow: {old_pos} -> {self.cursor_position}, nibble={self.cursor_nibble}")
+            key_debug(f"Right arrow: {old_pos} -> {self.cursor_position}, nibble={self.cursor_nibble}")
             self.display_hex(preserve_scroll=True)
             self.scroll_to_offset(self.cursor_position)
             self.update_status()
@@ -10521,16 +15061,16 @@ class HexEditorQt(QMainWindow):
                 new_pos = self.cursor_position - self.bytes_per_row
                 # Check edit box boundaries
                 if self.edit_box_active and new_pos < self.edit_box_start:
-                    print(f"Up arrow blocked by edit box boundary")
+                    key_debug("Up arrow blocked by edit box boundary")
                     new_pos = self.cursor_position
                 # Check boundary constraints (keep within column range)
                 elif self.boundary_enabled:
                     new_col = new_pos % self.bytes_per_row
                     if new_col < self.boundary_start_col or new_col > self.boundary_end_col:
-                        print(f"Up arrow would move outside column boundaries, staying in place")
+                        key_debug("Up arrow would move outside column boundaries, staying in place")
                         new_pos = self.cursor_position
                 self.cursor_position = new_pos
-            print(f"Up arrow: {old_pos} -> {self.cursor_position}")
+            key_debug(f"Up arrow: {old_pos} -> {self.cursor_position}")
             self.display_hex(preserve_scroll=True)
             self.scroll_to_offset(self.cursor_position)
             self.update_status()
@@ -10541,16 +15081,16 @@ class HexEditorQt(QMainWindow):
                 new_pos = self.cursor_position + self.bytes_per_row
                 # Check edit box boundaries
                 if self.edit_box_active and new_pos > self.edit_box_end:
-                    print(f"Down arrow blocked by edit box boundary")
+                    key_debug("Down arrow blocked by edit box boundary")
                     new_pos = self.cursor_position
                 # Check boundary constraints (keep within column range)
                 elif self.boundary_enabled:
                     new_col = new_pos % self.bytes_per_row
                     if new_col < self.boundary_start_col or new_col > self.boundary_end_col:
-                        print(f"Down arrow would move outside column boundaries, staying in place")
+                        key_debug("Down arrow would move outside column boundaries, staying in place")
                         new_pos = self.cursor_position
                 self.cursor_position = new_pos
-            print(f"Down arrow: {old_pos} -> {self.cursor_position}")
+            key_debug(f"Down arrow: {old_pos} -> {self.cursor_position}")
             self.display_hex(preserve_scroll=True)
             self.scroll_to_offset(self.cursor_position)
             self.update_status()
@@ -10569,40 +15109,10 @@ class HexEditorQt(QMainWindow):
     def dropEvent(self, event):
         files = [url.toLocalFile() for url in event.mimeData().urls()]
         for file_path in files:
-            if os.path.isfile(file_path):
-                try:
-                    # Check file size first
-                    file_size = os.path.getsize(file_path)
-                    max_size = 100 * 1024 * 1024  # 100 MB limit
-
-                    if file_size > max_size:
-                        reply = QMessageBox.question(
-                            self,
-                            "Large File Warning",
-                            f"This file is {file_size / (1024 * 1024):.1f} MB. "
-                            f"Loading files larger than {max_size / (1024 * 1024):.0f} MB may cause performance issues.\n\n"
-                            "Do you want to continue?",
-                            QMessageBox.Yes | QMessageBox.No,
-                            QMessageBox.No
-                        )
-                        if reply == QMessageBox.No:
-                            continue
-
-                    with open(file_path, 'rb') as f:
-                        file_data = f.read()
-
-                    file_tab = FileTab(file_path, file_data)
-                    self.open_files.append(file_tab)
-
-                    tab_name = os.path.basename(file_path)
-                    tab_widget = QWidget()
-                    self.tab_widget.addTab(tab_widget, tab_name)
-                    self.tab_widget.setCurrentIndex(len(self.open_files) - 1)
-
-                    self.display_hex()
-
-                except Exception as e:
-                    QMessageBox.critical(self, "Error", f"Failed to open file {file_path}: {str(e)}")
+            if os.path.isdir(file_path):
+                self.load_directory_listing(file_path)
+            elif os.path.isfile(file_path):
+                self.open_file_path(file_path)
 
     def schedule_snapshot(self):
         """Schedule a snapshot creation after user stops editing (debounce)"""
@@ -10780,20 +15290,20 @@ class HexEditorQt(QMainWindow):
     def moveEvent(self, event):
         """Handle window move events to detect screen changes"""
         super().moveEvent(event)
+        if getattr(self, '_applying_screen_change', False):
+            return
 
         # Get the screen the window is currently on
         current_screen = self.screen()
 
         # Store the screen for comparison
-        if not hasattr(self, '_last_screen'):
+        if self._last_screen is None:
             self._last_screen = current_screen
         elif self._last_screen != current_screen:
-            # Screen changed, refresh display and update window size
+            # Screen changed, adjust window size after a short delay to avoid geometry conflicts
             self._last_screen = current_screen
-            self.on_screen_changed(current_screen)
-            self.update_window_size_for_screen()
-            if self.current_tab_index >= 0:
-                self.display_hex()
+            self._pending_screen = current_screen
+            self.screen_change_timer.start(220)
 
     def closeEvent(self, event):
         """Close all auxiliary windows when main window closes"""
@@ -10818,6 +15328,22 @@ class HexEditorQt(QMainWindow):
                 event.ignore()
                 return
 
+        if self.has_json_save_data():
+            QApplication.beep()
+            reply = QMessageBox.question(
+                self,
+                "Unsaved Annotations",
+                "This file has annotations that are saved through Options > Save JSON.\n\n"
+                "Save highlights, scans, pointers, fields, delimiters, and related annotation data now?",
+                QMessageBox.Ok | QMessageBox.Cancel,
+                QMessageBox.Ok
+            )
+
+            if reply == QMessageBox.Ok:
+                event.ignore()
+                self.save_json()
+                return
+
         # Save all settings
         self.save_settings()
 
@@ -10840,12 +15366,41 @@ class HexEditorQt(QMainWindow):
         event.accept()
 
 
+def qt_message_handler(mode, context, message):
+    """Custom Qt message handler to suppress specific warnings"""
+    # Suppress OpenType font warnings
+    if "OpenType support missing" in message:
+        return
+    # Suppress unknown property warnings
+    if "Unknown property" in message:
+        return
+    # Print other messages normally
+    if mode == QtCore.QtDebugMsg:
+        print(f"Debug: {message}")
+    elif mode == QtCore.QtWarningMsg:
+        print(f"Warning: {message}")
+    elif mode == QtCore.QtCriticalMsg:
+        print(f"Critical: {message}")
+    elif mode == QtCore.QtFatalMsg:
+        print(f"Fatal: {message}")
+
 def main():
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("RxD.HexEditor")
+        except Exception:
+            pass
+
+    # Install custom message handler to suppress font warnings
+    QtCore.qInstallMessageHandler(qt_message_handler)
+
     # Enable DPI scaling for proper handling across different monitors
-    QApplication.setAttribute(Qt.AA_DisableHighDpiScaling, True)
-    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    QApplication.setAttribute(Qt.AA_DisableHighDpiScaling, False)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, False)
 
     app = QApplication(sys.argv)
+    if os.path.exists(APP_ICON_PATH):
+        app.setWindowIcon(QIcon(APP_ICON_PATH))
     app.setStyle('Fusion')
 
     window = HexEditorQt()
@@ -10855,4 +15410,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
