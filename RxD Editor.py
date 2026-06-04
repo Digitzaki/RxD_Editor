@@ -217,17 +217,17 @@ def compact_dialog_stylesheet(parent=None):
     selection_bg = theme.get("selection_bg", theme.get("button_bg", "#990000"))
     selection_fg = theme.get("selection_fg", dialog_fg)
     return f"""
-        QDialog {{
+        QDialog, QMessageBox {{
             background-color: {dialog_bg};
             color: {dialog_fg};
             font-family: Arial;
             font-size: 9pt;
         }}
-        QDialog QWidget {{
+        QDialog QWidget, QMessageBox QWidget {{
             background-color: {dialog_bg};
             color: {dialog_fg};
         }}
-        QDialog QLabel {{
+        QDialog QLabel, QMessageBox QLabel {{
             background-color: transparent;
             color: {dialog_fg};
             font-size: 9pt;
@@ -236,7 +236,7 @@ def compact_dialog_stylesheet(parent=None):
             font-size: 10pt;
             font-weight: bold;
         }}
-        QDialog QPushButton {{
+        QDialog QPushButton, QMessageBox QPushButton {{
             background-color: {theme.get('button_bg', '#990000')};
             color: {button_text};
             border: none;
@@ -246,10 +246,10 @@ def compact_dialog_stylesheet(parent=None):
             min-height: 20px;
             font-size: 9pt;
         }}
-        QDialog QPushButton:hover {{
+        QDialog QPushButton:hover, QMessageBox QPushButton:hover {{
             background-color: {theme.get('button_hover', '#b00000')};
         }}
-        QDialog QPushButton:disabled {{
+        QDialog QPushButton:disabled, QMessageBox QPushButton:disabled {{
             background-color: {theme.get('button_disabled', '#444444')};
             color: #777777;
         }}
@@ -379,6 +379,11 @@ class ThemedMessageBox(_BaseQMessageBox):
         box.setFont(QFont("Arial", 9))
         compact_dialog_layouts(box.layout())
         box.setStyleSheet(compact_dialog_stylesheet(parent))
+        for button in box.buttons():
+            button.setFont(QFont("Arial", 9))
+            button.setMinimumSize(54, 20)
+            button.setMaximumSize(70, 22)
+            button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         dark = parent.system_uses_dark_titlebar() if hasattr(parent, "system_uses_dark_titlebar") else None
         QTimer.singleShot(0, lambda: apply_native_titlebar_theme(box, dark))
         return box.exec_()
@@ -519,6 +524,7 @@ class FileTab:
         self.search_results = []  # Store current search results: list of (offset, length) tuples
         self.search_result_sets = []  # Named result sets for the search results overlay
         self.active_search_result_set = -1
+        self.active_search_result = None  # Currently clicked search result: (offset, length)
 
         self._highlight_cache = {}
         self._highlight_cache_version = 0
@@ -1586,7 +1592,7 @@ class SmartPasteDialog(QDialog):
         button_layout.addWidget(ok_button)
 
         cancel_button = QPushButton("Cancel")
-        cancel_button.setMinimumWidth(80)
+        cancel_button.setMinimumWidth(84)
         cancel_button.clicked.connect(self.reject)
         button_layout.addWidget(cancel_button)
 
@@ -4047,7 +4053,7 @@ class HexEditorQt(QMainWindow):
             if self.cursor_position < len(current_file.file_data) - 1:
                 self.cursor_position += 1
 
-        self.display_hex()
+        self.display_hex(preserve_scroll=True)
         self.update_cursor_highlight()
         self.data_inspector.update()
 
@@ -4073,7 +4079,7 @@ class HexEditorQt(QMainWindow):
         if self.cursor_position < len(current_file.file_data) - 1:
             self.cursor_position += 1
 
-        self.display_hex()
+        self.display_hex(preserve_scroll=True)
         self.update_cursor_highlight()
         self.data_inspector.update()
 
@@ -5326,12 +5332,19 @@ class HexEditorQt(QMainWindow):
         else:
             search_result_format.setBackground(QColor(255, 200, 0, 100))  # Bright yellow/orange with opacity
 
+        active_search_result_format = QTextCharFormat()
+        active_search_result_format.setBackground(QColor(33, 150, 243, 150))
+        active_search_result_format.setForeground(QColor(theme_colors.get('editor_fg', theme_colors.get('foreground', '#ffffff'))))
+        active_search_result_format.setFontWeight(QFont.Bold)
+
         # Format for selection
         selection_format = QTextCharFormat()
-        if self.is_dark_theme():
-            selection_format.setBackground(QColor(100, 100, 150))
-        else:
-            selection_format.setBackground(QColor(173, 216, 230))
+        selection_color = QColor(theme_colors.get('selection_bg', theme_colors.get('button_bg', '#6496c8')))
+        if not selection_color.isValid():
+            selection_color = QColor(100, 100, 150) if self.is_dark_theme() else QColor(173, 216, 230)
+        if selection_color.alpha() == 255:
+            selection_color.setAlpha(145)
+        selection_format.setBackground(selection_color)
 
         def get_positions(byte_index):
             # Calculate row relative to the rendered window, not absolute file position
@@ -5371,6 +5384,16 @@ class HexEditorQt(QMainWindow):
             if start < end:
                 visible_search_bytes.update(range(start, end))
         bytes_to_format.update(visible_search_bytes)
+
+        active_search_bytes = set()
+        active_result = getattr(current_file, "active_search_result", None)
+        if active_result:
+            active_offset, active_length = active_result
+            start = max(active_offset, visible_start)
+            end = min(active_offset + active_length, visible_end)
+            if start < end:
+                active_search_bytes.update(range(start, end))
+        bytes_to_format.update(active_search_bytes)
 
         # Add cursor position
         if self.cursor_position is not None:
@@ -5418,7 +5441,7 @@ class HexEditorQt(QMainWindow):
             if byte_index in current_file.byte_highlights:
                 highlight_info = current_file.byte_highlights[byte_index]
                 highlight_color = QColor(highlight_info["color"])
-                highlight_color.setAlpha(80)
+                highlight_color.setAlpha(60)
 
                 user_highlight_format = QTextCharFormat()
                 if highlight_info.get("underline", False):
@@ -5448,6 +5471,15 @@ class HexEditorQt(QMainWindow):
                 ascii_cursor.setPosition(ascii_pos)
                 ascii_cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 1)
                 ascii_cursor.mergeCharFormat(search_result_format)
+
+            if byte_index in active_search_bytes:
+                hex_cursor.setPosition(hex_pos)
+                hex_cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 2)
+                hex_cursor.mergeCharFormat(active_search_result_format)
+
+                ascii_cursor.setPosition(ascii_pos)
+                ascii_cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 1)
+                ascii_cursor.mergeCharFormat(active_search_result_format)
 
             # Apply color for modified bytes (higher priority, overrides search results)
             if byte_index in current_file.modified_bytes:
@@ -6850,7 +6882,7 @@ class HexEditorQt(QMainWindow):
 
         self.offset_header.setText(labels[self.offset_mode])
         self.hex_header.setText(self.build_hex_header())
-        self.display_hex()
+        self.display_hex(preserve_scroll=True)
 
     def save_undo_state(self):
         if self.current_tab_index < 0:
@@ -6903,7 +6935,7 @@ class HexEditorQt(QMainWindow):
         current_file.modified = len(state['modified_bytes']) > 0 or len(state['inserted_bytes']) > 0 or len(current_file.replaced_bytes) > 0
         current_file.pattern_highlights_dirty = True  # Mark pattern highlights for reapplication after undo
 
-        self.display_hex()
+        self.display_hex(preserve_scroll=True)
 
     def redo(self):
         if not self.redo_stack or self.current_tab_index < 0:
@@ -6933,7 +6965,7 @@ class HexEditorQt(QMainWindow):
         current_file.modified = len(state['modified_bytes']) > 0 or len(state['inserted_bytes']) > 0 or len(current_file.replaced_bytes) > 0
         current_file.pattern_highlights_dirty = True  # Mark pattern highlights for reapplication after redo
 
-        self.display_hex()
+        self.display_hex(preserve_scroll=True)
 
     def show_file_size_warning(self, parent, num_bytes, is_increase):
         """Show file size change warning with checkbox to ignore future warnings"""
@@ -8907,6 +8939,7 @@ class HexEditorQt(QMainWindow):
         """Close search results overlay and clear highlights"""
         if self.current_tab_index >= 0 and self.current_tab_index < len(self.open_files):
             self.open_files[self.current_tab_index].search_results = []
+            self.open_files[self.current_tab_index].active_search_result = None
             self.display_hex(preserve_scroll=True)
         if hasattr(self, 'results_overlay') and self.results_overlay:
             self.results_overlay.hide()
@@ -9115,6 +9148,7 @@ class HexEditorQt(QMainWindow):
         result_set = sets[index]
         current_file.active_search_result_set = index
         current_file.search_results = list(result_set.get("results", []))
+        current_file.active_search_result = None
         self.set_search_results_title(result_set.get("title"))
         self.clear_search_results_layout()
 
@@ -9133,6 +9167,8 @@ class HexEditorQt(QMainWindow):
             if len(results) > 100:
                 self.add_search_result_label(f"Showing first 100 of {len(results)} results")
             first_pos = results[0][0]
+            first_length = results[0][1] if len(results[0]) > 1 else 1
+            current_file.active_search_result = (first_pos, first_length)
             self.cursor_position = first_pos
             self.cursor_nibble = 0
         else:
@@ -9317,6 +9353,7 @@ class HexEditorQt(QMainWindow):
             self.search_results_layout.itemAt(i).widget().setParent(None)
 
         current_file.search_results = []
+        current_file.active_search_result = None
 
         # For component/range searches, we already have matches_list
         if ((current_tab == 2 and self.datatype_mode_btn.isChecked()) or current_tab in (3, 4)):
@@ -9339,6 +9376,7 @@ class HexEditorQt(QMainWindow):
                         else:
                             self.show_search_result(pos, original_data[pos:pos + size], original_data)
                         current_file.search_results = [(pos, size)]
+                        current_file.active_search_result = (pos, size)
                         self.cursor_position = pos
                         self.cursor_nibble = 0
                         self.display_hex()
@@ -9359,6 +9397,7 @@ class HexEditorQt(QMainWindow):
                         else:
                             self.show_search_result(pos, original_data[pos:pos + size], original_data)
                         current_file.search_results = [(pos, size)]
+                        current_file.active_search_result = (pos, size)
                         self.cursor_position = pos
                         self.cursor_nibble = 0
                         self.display_hex()
@@ -9416,6 +9455,7 @@ class HexEditorQt(QMainWindow):
                 if pos != -1:
                     self.show_search_result(pos, pattern, original_data)
                     current_file.search_results = [(pos, len(pattern))]
+                    current_file.active_search_result = (pos, len(pattern))
                     self.cursor_position = pos
                     self.cursor_nibble = 0
                     self.display_hex()
@@ -9430,6 +9470,7 @@ class HexEditorQt(QMainWindow):
                 if pos != -1:
                     self.show_search_result(pos, pattern, original_data)
                     current_file.search_results = [(pos, len(pattern))]
+                    current_file.active_search_result = (pos, len(pattern))
                     self.cursor_position = pos
                     self.cursor_nibble = 0
                     self.display_hex()
@@ -9738,7 +9779,7 @@ class HexEditorQt(QMainWindow):
         result_label.setTextFormat(Qt.RichText)
 
         if clickable:
-            result_label.mousePressEvent = lambda event, p=pos: self.goto_search_result(p)
+            result_label.mousePressEvent = lambda event, p=pos, s=size: self.goto_search_result(p, s)
             result_label.setCursor(Qt.PointingHandCursor)
             result_label.setStyleSheet("text-decoration: underline;")
 
@@ -9774,7 +9815,7 @@ class HexEditorQt(QMainWindow):
         result_label.setTextFormat(Qt.RichText)
 
         if clickable:
-            result_label.mousePressEvent = lambda event, p=pos: self.goto_search_result(p)
+            result_label.mousePressEvent = lambda event, p=pos, s=len(pattern): self.goto_search_result(p, s)
             result_label.setCursor(Qt.PointingHandCursor)
             result_label.setStyleSheet("text-decoration: underline;")
 
@@ -9787,7 +9828,15 @@ class HexEditorQt(QMainWindow):
         label.setFont(QFont("Arial", 7))
         self.search_results_layout.addWidget(label)
 
-    def goto_search_result(self, pos):
+    def goto_search_result(self, pos, length=None):
+        if self.current_tab_index >= 0:
+            current_file = self.open_files[self.current_tab_index]
+            if length is None:
+                for result_pos, result_len in current_file.search_results:
+                    if result_pos == pos:
+                        length = result_len
+                        break
+            current_file.active_search_result = (pos, max(1, int(length or 1)))
         self.cursor_position = pos
         self.cursor_nibble = 0
         # Update display first

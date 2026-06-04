@@ -306,10 +306,9 @@ class DataInspector:
         self.editor.tab_widget.setTabText(self.editor.current_tab_index, tab_text)
         if defer_refresh:
             self.editor.display_hex(preserve_scroll=True, update_side_panels=False)
-            self._schedule_update()
         else:
-            self.editor.display_hex()
-            self._schedule_update()
+            self.editor.display_hex(preserve_scroll=True)
+        self._schedule_update()
 
     def _apply_dialog_titlebar(self, dialog):
         if sys.platform != "win32":
@@ -1569,7 +1568,7 @@ class DataInspector:
             self.editor.tab_widget.setTabText(self.editor.current_tab_index, tab_text)
 
             # Refresh display
-            self.editor.display_hex()
+            self.editor.display_hex(preserve_scroll=True)
             self.update()
 
         except Exception as e:
